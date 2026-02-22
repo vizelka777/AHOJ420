@@ -29,11 +29,29 @@ sudo docker-compose logs -f --tail=200
 ```
 
 ## Environment
-Used in `docker-compose.yml`:
+Core variables:
 - `POSTGRES_URL=postgres://ahoj:password@postgres:5432/ahoj420?sslmode=disable`
-- `REDIS_ADDR=redis:6379`
+- `REDIS_ADDR=redis:6379` (required, OIDC auth state/codes are in Redis)
 - `RP_ID=ahoj420.eu`
 - `RP_ORIGIN=https://ahoj420.eu`
+- `SESSION_TTL_MINUTES=60`
+
+OIDC mode:
+- `AHOJ_ENV=dev|prod` (default: `dev`)
+
+Required in `prod`:
+- `OIDC_PRIVKEY_PATH=/run/secrets/oidc_private_key.pem` (no ephemeral fallback in prod)
+- `OIDC_CRYPTO_KEY=<at least 32 bytes>` (no insecure default in prod)
+- one of:
+  - `OIDC_CLIENTS_JSON='[...]'`
+  - `OIDC_CLIENTS_FILE=/run/secrets/oidc_clients.json`
+
+Optional for key rotation:
+- `OIDC_KEY_ID=key-current`
+- `OIDC_PREV_PRIVKEY_PATH=/run/secrets/oidc_private_key_prev.pem`
+- `OIDC_PREV_KEY_ID=key-prev`
+
+If `AHOJ_ENV=dev` and key/crypto key are missing, ephemeral values are generated and tokens/cookies become invalid after restart.
 
 ## Caddy
 Example (current):
@@ -98,4 +116,38 @@ CREATE TABLE credentials (
 - WebAuthn requires HTTPS and correct RP ID/Origin.
 - Avoid exposing Postgres/Redis to the internet.
 - For production, disable backend port 8080 and keep only Caddy (80/443).
+- Public OIDC clients must use PKCE (`S256`) and no client secret.
 
+## OIDC Clients Config
+Clients are loaded from `OIDC_CLIENTS_JSON` or `OIDC_CLIENTS_FILE` (JSON array).
+
+Example public client (`client2`) with PKCE:
+```json
+[
+  {
+    "id": "client2",
+    "redirect_uris": ["https://houbamzdar.cz/callback2.html"],
+    "confidential": false,
+    "require_pkce": true,
+    "auth_method": "none",
+    "grant_types": ["authorization_code"],
+    "response_types": ["code"]
+  }
+]
+```
+
+Example confidential client:
+```json
+[
+  {
+    "id": "postman",
+    "redirect_uris": ["https://oauth.pstmn.io/v1/callback"],
+    "confidential": true,
+    "secrets": ["secret"],
+    "require_pkce": true,
+    "auth_method": "basic",
+    "grant_types": ["authorization_code"],
+    "response_types": ["code"]
+  }
+]
+```

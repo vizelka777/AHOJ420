@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"time"
@@ -22,51 +21,45 @@ import (
 )
 
 func main() {
-	// 1. Config
 	pgURL := os.Getenv("POSTGRES_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
 
-	// 2. Database
 	db, err := sql.Open("postgres", pgURL)
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
 	defer db.Close()
-    
-    // Simple schema migration on startup (for now)
-    schema, err := os.ReadFile("internal/store/schema.sql")
-    if err == nil {
-        if _, err := db.Exec(string(schema)); err != nil {
-            log.Printf("Schema init error (might be already existing): %v", err)
-        }
-    }
 
-	// 3. Redis
-    rdb := redis.NewClient(&redis.Options{
-        Addr: redisAddr,
-    })
-    if _, err := rdb.Ping(context.Background()).Result(); err != nil {
-        log.Fatalf("Failed to connect to Redis: %v", err)
-    }
+	schema, err := os.ReadFile("internal/store/schema.sql")
+	if err == nil {
+		if _, execErr := db.Exec(string(schema)); execErr != nil {
+			log.Printf("Schema init error (might be already existing): %v", execErr)
+		}
+	}
 
-    // 5. Services
-    userStore := store.New(db)
-    
-    // Initialize OIDC
-    oidcProvider, err := mp.NewProvider("https://ahoj420.eu", userStore, rdb)
-    if err != nil {
-        log.Fatalf("Failed to init OIDC: %v", err)
-    }
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	if _, err := rdb.Ping(context.Background()).Result(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
 
-    authService, err := auth.New(userStore, rdb, oidcProvider)
-    if err != nil {
-        log.Fatalf("Failed to init auth: %v", err)
-    }
+	userStore := store.New(db)
+	oidcProvider, err := mp.NewProvider("https://ahoj420.eu", userStore, rdb)
+	if err != nil {
+		log.Fatalf("Failed to init OIDC: %v", err)
+	}
+	authService, err := auth.New(userStore, rdb, oidcProvider)
+	if err != nil {
+		log.Fatalf("Failed to init auth: %v", err)
+	}
 
-	// 4. Server
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"https://ahoj420.eu", "https://houbamzdar.cz"},
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization},
+	}))
 	e.Use(middleware.SecureWithConfig(middleware.SecureConfig{
 		XSSProtection:      "1; mode=block",
 		ContentTypeNosniff: "nosniff",
@@ -80,17 +73,14 @@ func main() {
 	}))
 
 	sensitiveLimiter := middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(rate.Limit(3)))
+	oidcHandler := echo.WrapHandler(oidcProvider)
 
 	e.Static("/static", "web/static")
-
-	e.GET("/", func(c echo.Context) error {
-		return c.File("web/templates/index.html")
-	})
+	e.GET("/", func(c echo.Context) error { return c.File("web/templates/index.html") })
 	e.GET("/robots.txt", func(c echo.Context) error {
 		return c.String(http.StatusOK, "User-agent: *\nDisallow: /\n")
 	})
 
-	// Auth Routes
 	e.GET("/auth/register/begin", authService.BeginRegistration, sensitiveLimiter)
 	e.POST("/auth/register/finish", authService.FinishRegistration, sensitiveLimiter)
 	e.GET("/auth/login/begin", authService.BeginLogin, sensitiveLimiter)
@@ -101,57 +91,71 @@ func main() {
 	e.GET("/auth/profile", authService.GetProfile)
 	e.POST("/auth/profile", authService.UpdateProfile)
 
-	// Recovery Routes
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
 	e.GET("/auth/recovery/verify", authService.VerifyRecovery, sensitiveLimiter)
 
-	// OIDC Routes
-	e.Any("/.well-known/openid-configuration", echo.WrapHandler(oidcProvider))
-	e.Any("/jwks", echo.WrapHandler(oidcProvider))
-	e.POST("/token", echo.WrapHandler(oidcProvider), sensitiveLimiter)
-	e.GET("/userinfo", echo.WrapHandler(oidcProvider))
+	e.Any("/.well-known/openid-configuration", oidcHandler)
+	e.Any("/keys", oidcHandler)
+	e.Any("/jwks", rewriteOIDCPath(oidcProvider, "/keys"))
+	e.Any("/oauth/token", oidcHandler, sensitiveLimiter)
+	e.Any("/token", rewriteOIDCPath(oidcProvider, "/oauth/token"), sensitiveLimiter)
+	e.Any("/userinfo", oidcHandler)
 
-	// Authorization Endpoint
-	authorizeHandler := echo.WrapHandler(oidcProvider)
 	e.GET("/authorize", func(c echo.Context) error {
 		if userID, ok := authService.SessionUserID(c); ok {
-			recorder := httptest.NewRecorder()
-			oidcProvider.ServeHTTP(recorder, c.Request())
-
-			if recorder.Code >= 300 && recorder.Code < 400 {
-				if loc := recorder.Header().Get("Location"); loc != "" {
-					if u, err := url.Parse(loc); err == nil {
-						if authReqID := u.Query().Get("auth_request_id"); authReqID != "" {
-							if err := oidcProvider.SetAuthRequestDone(authReqID, userID); err == nil {
-								return c.Redirect(http.StatusFound, "/authorize/callback?id="+url.QueryEscape(authReqID))
-							}
-						}
-					}
-				}
+			if authService.InRecoveryMode(c) {
+				return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
 			}
-
-			for k, values := range recorder.Header() {
-				for _, v := range values {
-					c.Response().Header().Add(k, v)
-				}
-			}
-			c.Response().WriteHeader(recorder.Code)
-			_, _ = c.Response().Write(recorder.Body.Bytes())
-			return nil
+			req := c.Request().WithContext(mp.WithUserID(c.Request().Context(), userID))
+			c.SetRequest(req)
+			return oidcHandler(c)
 		}
-		return authorizeHandler(c)
+
+		c.Response().Before(func() {
+			if c.Response().Status < 300 || c.Response().Status >= 400 {
+				return
+			}
+			location := c.Response().Header().Get(echo.HeaderLocation)
+			if location == "" {
+				return
+			}
+			u, err := url.Parse(location)
+			if err != nil {
+				return
+			}
+			authRequestID := u.Query().Get("auth_request_id")
+			if authRequestID == "" {
+				return
+			}
+			c.SetCookie(&http.Cookie{
+				Name:     "oidc_auth_request",
+				Value:    authRequestID,
+				Path:     "/",
+				HttpOnly: true,
+				Secure:   true,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   300,
+			})
+		})
+
+		return oidcHandler(c)
 	})
 
-	// Authorization Callback (after login UI)
 	e.GET("/authorize/callback", func(c echo.Context) error {
 		op.AuthorizeCallback(c.Response(), c.Request(), oidcProvider.OpenIDProvider)
 		return nil
 	})
 
-	e.GET("/auth/oidc/callback", func(c echo.Context) error {
-		return c.String(http.StatusOK, "Callback received")
-	})
-
 	log.Println("Server starting on :8080")
 	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		req := c.Request().Clone(c.Request().Context())
+		req.URL.Path = path
+		req.URL.RawPath = path
+		provider.ServeHTTP(c.Response(), req)
+		return nil
+	}
 }

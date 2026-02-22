@@ -18,20 +18,20 @@ func New(db *sql.DB) *Store {
 }
 
 type User struct {
-	ID               string
-	Email            string
-	DisplayName      string
-	ProfileEmail     string
-	Phone            string
-	ShareProfile     bool
-	EmailVerified    bool
-	PhoneVerified    bool
-	Credentials      []webauthn.Credential
+	ID            string
+	Email         string
+	DisplayName   string
+	ProfileEmail  string
+	Phone         string
+	ShareProfile  bool
+	EmailVerified bool
+	PhoneVerified bool
+	Credentials   []webauthn.Credential
 }
 
 // WebAuthnUser interface implementation
 func (u *User) WebAuthnID() []byte {
-    return []byte(u.ID)
+	return []byte(u.ID)
 }
 
 func (u *User) WebAuthnName() string {
@@ -49,11 +49,11 @@ func (u *User) WebAuthnDisplayName() string {
 }
 
 func (u *User) WebAuthnIcon() string {
-    return ""
+	return ""
 }
 
 func (u *User) WebAuthnCredentials() []webauthn.Credential {
-    return u.Credentials
+	return u.Credentials
 }
 
 func (s *Store) CreateUser(email string) (*User, error) {
@@ -124,14 +124,14 @@ func (s *Store) GetUser(id string) (*User, error) {
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 
-    // 2. Get Credentials
+	// 2. Get Credentials
 	rows, err := s.db.Query(`SELECT id, public_key, sign_count FROM credentials WHERE user_id = $1`, id)
 	if err != nil {
 		return nil, fmt.Errorf("get creds: %w", err)
 	}
 	defer rows.Close()
 
-    for rows.Next() {
+	for rows.Next() {
 		var cred webauthn.Credential
 		var credID, pubKey []byte
 		var signCount int64
@@ -151,41 +151,41 @@ func (s *Store) GetUser(id string) (*User, error) {
 }
 
 func (s *Store) GetUserByEmail(email string) (*User, error) {
-    var id string
-    err := s.db.QueryRow(`SELECT id::text FROM users WHERE email = $1`, email).Scan(&id)
-    if err != nil {
-        return nil, err
-    }
-    return s.GetUser(id)
+	var id string
+	err := s.db.QueryRow(`SELECT id::text FROM users WHERE email = $1`, email).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUser(id)
 }
 
 func (s *Store) GetUserByCredentialID(credID []byte) (*User, error) {
-    var userID string
-    err := s.db.QueryRow(`
+	var userID string
+	err := s.db.QueryRow(`
         SELECT user_id FROM credentials WHERE id = $1
     `, credID).Scan(&userID)
-    if err != nil {
-        return nil, err
-    }
-    return s.GetUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUser(userID)
 }
 
 func (s *Store) AddCredential(userID string, cred *webauthn.Credential) error {
-    _, err := s.db.Exec(`
+	_, err := s.db.Exec(`
         INSERT INTO credentials (id, user_id, public_key, aaguid, sign_count, last_used_at)
         VALUES ($1, $2, $3, $4, $5, NOW())
     `, cred.ID, userID, cred.PublicKey, cred.Authenticator.AAGUID, cred.Authenticator.SignCount)
-    
-    return err
+
+	return err
 }
 
 func (s *Store) UpdateCredential(cred *webauthn.Credential) error {
-    _, err := s.db.Exec(`
+	_, err := s.db.Exec(`
         UPDATE credentials 
         SET sign_count = $1, last_used_at = NOW()
         WHERE id = $2
     `, cred.Authenticator.SignCount, cred.ID)
-    return err
+	return err
 }
 
 func (s *Store) UpdateProfile(userID, displayName, profileEmail, phone string, shareProfile bool) error {

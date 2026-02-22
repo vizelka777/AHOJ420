@@ -4,27 +4,93 @@
 <body>
   <pre id="out"></pre>
   <script>
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get("code");
-    const state = params.get("state");
-    const error = params.get("error");
-    const errorDescription = params.get("error_description");
-    const expectedState = sessionStorage.getItem("oidc_state");
-    const ok = state && expectedState && state === expectedState;
+    const CLIENT_ID = "client2";
+    const REDIRECT_URI = "https://houbamzdar.cz/callback2.html";
+    const TOKEN_ENDPOINT = "https://ahoj420.eu/oauth/token";
+    const out = document.getElementById("out");
 
-    const lines = [];
-    if (error) {
-      lines.push("error: " + error);
-      lines.push("error_description: " + (errorDescription || ""));
-    } else {
-      lines.push("code: " + code);
+    function decodeJwtPayload(token) {
+      try {
+        const part = token.split(".")[1];
+        if (!part) return null;
+        const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+        const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+        const json = atob(b64 + pad);
+        return JSON.parse(json);
+      } catch (_) {
+        return null;
+      }
     }
-    lines.push("state: " + state);
-    lines.push("state_ok: " + ok);
-    lines.push("nonce_saved: " + Boolean(sessionStorage.getItem("oidc_nonce")));
-    lines.push("pkce_verifier_saved: " + Boolean(sessionStorage.getItem("oidc_code_verifier")));
 
-    document.getElementById("out").textContent = lines.join("\n");
+    async function exchangeCode(code, codeVerifier) {
+      const body = new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID,
+        code_verifier: codeVerifier || "",
+      });
+      const res = await fetch(TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+      });
+
+      const raw = await res.text();
+      let data = null;
+      try {
+        data = JSON.parse(raw);
+      } catch (_) {
+        data = { raw };
+      }
+      return { ok: res.ok, status: res.status, data };
+    }
+
+    (async () => {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get("code");
+      const state = params.get("state");
+      const error = params.get("error");
+      const errorDescription = params.get("error_description");
+      const expectedState = sessionStorage.getItem("oidc_state");
+      const codeVerifier = sessionStorage.getItem("oidc_code_verifier");
+      const ok = state && expectedState && state === expectedState;
+
+      const lines = [];
+      if (error) {
+        lines.push("error: " + error);
+        lines.push("error_description: " + (errorDescription || ""));
+      } else {
+        lines.push("code: " + code);
+      }
+      lines.push("state: " + state);
+      lines.push("state_ok: " + ok);
+      lines.push("nonce_saved: " + Boolean(sessionStorage.getItem("oidc_nonce")));
+      lines.push("pkce_verifier_saved: " + Boolean(codeVerifier));
+
+      if (!error && code && ok) {
+        lines.push("");
+        lines.push("token_exchange: started");
+        try {
+          const tokenRes = await exchangeCode(code, codeVerifier);
+          lines.push(`token_http_status: ${tokenRes.status}`);
+          lines.push(`token_ok: ${tokenRes.ok}`);
+          lines.push("token_response: " + JSON.stringify(tokenRes.data, null, 2));
+
+          if (tokenRes.ok && tokenRes.data && tokenRes.data.id_token) {
+            const claims = decodeJwtPayload(tokenRes.data.id_token);
+            lines.push("");
+            lines.push("id_token_claims: " + JSON.stringify(claims, null, 2));
+          }
+        } catch (e) {
+          lines.push("token_exchange_error: " + (e && e.message ? e.message : String(e)));
+        }
+      }
+
+      out.textContent = lines.join("\n");
+    })();
   </script>
 </body>
 </html>

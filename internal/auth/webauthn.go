@@ -1,30 +1,30 @@
 package auth
 
 import (
-    "crypto/rand"
-    "encoding/base64"
-    "encoding/json"
-    "fmt"
-    "net/http"
-    "os"
-    "strconv"
-    "time"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
 
-    "github.com/go-webauthn/webauthn/protocol"
-    "github.com/go-webauthn/webauthn/webauthn"
-    "github.com/labstack/echo/v4"
-    "github.com/redis/go-redis/v9"
-    
-    "github.com/houbamydar/AHOJ420/internal/store"
-    mp "github.com/houbamydar/AHOJ420/internal/oidc"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
+
+	mp "github.com/houbamydar/AHOJ420/internal/oidc"
+	"github.com/houbamydar/AHOJ420/internal/store"
 )
 
 type Service struct {
-    wa       *webauthn.WebAuthn
-    store    *store.Store
-    redis    *redis.Client
-    provider *mp.Provider
-    sessionTTL time.Duration
+	wa         *webauthn.WebAuthn
+	store      *store.Store
+	redis      *redis.Client
+	provider   *mp.Provider
+	sessionTTL time.Duration
 }
 
 type profilePayload struct {
@@ -34,46 +34,51 @@ type profilePayload struct {
 	ShareProfile bool   `json:"share_profile"`
 }
 
+type registrationSession struct {
+	UserID  string               `json:"user_id"`
+	Session webauthn.SessionData `json:"session"`
+}
+
 func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
-    w, err := webauthn.New(&webauthn.Config{
-        RPDisplayName: "Ahoj420 Identity",
-        RPID:          os.Getenv("RP_ID"), // auth.localhost
-        RPOrigins:     []string{os.Getenv("RP_ORIGIN"), "https://auth.localhost"},
-    })
-    if err != nil {
-        return nil, err
-    }
-    ttlMinutes := 60
-    if raw := os.Getenv("SESSION_TTL_MINUTES"); raw != "" {
-        if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-            ttlMinutes = parsed
-        }
-    }
-    return &Service{
-        wa: w,
-        store: s,
-        redis: r,
-        provider: p,
-        sessionTTL: time.Duration(ttlMinutes) * time.Minute,
-    }, nil
+	w, err := webauthn.New(&webauthn.Config{
+		RPDisplayName: "Ahoj420 Identity",
+		RPID:          os.Getenv("RP_ID"), // auth.localhost
+		RPOrigins:     []string{os.Getenv("RP_ORIGIN"), "https://auth.localhost"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	ttlMinutes := 60
+	if raw := os.Getenv("SESSION_TTL_MINUTES"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			ttlMinutes = parsed
+		}
+	}
+	return &Service{
+		wa:         w,
+		store:      s,
+		redis:      r,
+		provider:   p,
+		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
+	}, nil
 }
 
 func newSessionID() (string, error) {
-    b := make([]byte, 32)
-    if _, err := rand.Read(b); err != nil {
-        return "", err
-    }
-    return base64.RawURLEncoding.EncodeToString(b), nil
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func (s *Service) setUserSession(c echo.Context, userID string) error {
+func (s *Service) setUserSessionWithID(c echo.Context, userID string) (string, error) {
 	userSessionID, err := newSessionID()
 	if err != nil {
-		return err
+		return "", err
 	}
 	sessionKey := "sess:" + userSessionID
 	if err := s.redis.Set(c.Request().Context(), sessionKey, userID, s.sessionTTL).Err(); err != nil {
-		return err
+		return "", err
 	}
 	c.SetCookie(&http.Cookie{
 		Name:     "user_session",
@@ -84,119 +89,173 @@ func (s *Service) setUserSession(c echo.Context, userID string) error {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(s.sessionTTL.Seconds()),
 	})
-	return nil
+	return userSessionID, nil
+}
+
+func (s *Service) setUserSession(c echo.Context, userID string) error {
+	_, err := s.setUserSessionWithID(c, userID)
+	return err
+}
+
+func (s *Service) sessionID(c echo.Context) (string, bool) {
+	cookie, err := c.Cookie("user_session")
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	return cookie.Value, true
+}
+
+func (s *Service) isRecoveryMode(c echo.Context) (bool, string) {
+	sessionID, ok := s.sessionID(c)
+	if !ok {
+		return false, ""
+	}
+	_, err := s.redis.Get(c.Request().Context(), "recovery:"+sessionID).Result()
+	if err != nil {
+		return false, sessionID
+	}
+	return true, sessionID
+}
+
+func (s *Service) InRecoveryMode(c echo.Context) bool {
+	on, _ := s.isRecoveryMode(c)
+	return on
+}
+
+func (s *Service) clearRecoveryMode(c echo.Context, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	_ = s.redis.Del(c.Request().Context(), "recovery:"+sessionID).Err()
 }
 
 func (s *Service) BeginRegistration(c echo.Context) error {
-    var user *store.User
-    var err error
+	var user *store.User
+	var err error
 
-    email := c.QueryParam("email")
-    if email != "" {
-        // Normal flow: Create or Get user by email
-        user, err = s.store.CreateUser(email)
-    } else {
-        // Session flow: Check if user is already authenticated (e.g. Recovery)
-        cookie, cookieErr := c.Cookie("user_id")
-        if cookieErr == nil {
-            user, err = s.store.GetUser(cookie.Value)
-        } else {
-            // Anonymous flow: create a new user without email input
-            user, err = s.store.CreateAnonymousUser()
-        }
-    }
+	email := c.QueryParam("email")
+	if email != "" {
+		user, err = s.store.CreateUser(email)
+	} else if userID, ok := s.SessionUserID(c); ok {
+		user, err = s.store.GetUser(userID)
+	} else {
+		user, err = s.store.CreateAnonymousUser()
+	}
 
-    if err != nil || user == nil {
-        return c.String(http.StatusBadRequest, "Registration session invalid")
-    }
+	if err != nil || user == nil {
+		return c.String(http.StatusBadRequest, "Registration session invalid")
+	}
 
-    // Convert credentials to descriptors
-    var exclusions []protocol.CredentialDescriptor
-    for _, cred := range user.Credentials {
-        exclusions = append(exclusions, protocol.CredentialDescriptor{
-            Type: protocol.PublicKeyCredentialType,
-            CredentialID: cred.ID,
-        })
-    }
+	// Convert credentials to descriptors
+	var exclusions []protocol.CredentialDescriptor
+	for _, cred := range user.Credentials {
+		exclusions = append(exclusions, protocol.CredentialDescriptor{
+			Type:         protocol.PublicKeyCredentialType,
+			CredentialID: cred.ID,
+		})
+	}
 
-    // 2. Generate Options
-    options, session, err := s.wa.BeginRegistration(user, 
-        webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
-            ResidentKey: protocol.ResidentKeyRequirementRequired, // For Discoverable Creds later
-            UserVerification: protocol.VerificationRequired,
-        }),
-        webauthn.WithExclusions(exclusions),
-    )
-    if err != nil {
-        return c.String(http.StatusInternalServerError, err.Error())
-    }
+	// 2. Generate Options
+	options, session, err := s.wa.BeginRegistration(user,
+		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+			ResidentKey:      protocol.ResidentKeyRequirementRequired, // For Discoverable Creds later
+			UserVerification: protocol.VerificationRequired,
+		}),
+		webauthn.WithExclusions(exclusions),
+	)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, err.Error())
+	}
 
-    // 3. Store Session in Redis (TTL 5 min)
-    sessionJSON, _ := json.Marshal(session)
-    // Use a simple key strategy: "reg_session:<UserID>" (Simplification: assumes 1 session per user for now)
-    // Better: return a session ID to frontend? no, the frontend just returns the credo.
-    // We can use the Challenge as key? No, we don't have it in the next request yet.
-    // Standard way: Store in a secure cookie or return a SessionID.
-    // For simplicity, let's use a cookie "registration_session".
-    
-    s.redis.Set(c.Request().Context(), "reg_session:"+user.ID, sessionJSON, 5*time.Minute)
-    
-    // Set a cookie so we know who is registering
-    c.SetCookie(&http.Cookie{
-        Name: "user_id",
-        Value: user.ID,
-        Path: "/",
-        HttpOnly: true,
-        Secure: true,
-    })
+	regSessionID, err := newSessionID()
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to create registration session")
+	}
+	payload, err := json.Marshal(registrationSession{
+		UserID:  user.ID,
+		Session: *session,
+	})
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to encode registration session")
+	}
+	regKey := "reg:" + regSessionID
+	if err := s.redis.Set(c.Request().Context(), regKey, payload, 5*time.Minute).Err(); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to store registration session")
+	}
 
-    return c.JSON(http.StatusOK, options)
+	c.SetCookie(&http.Cookie{
+		Name:     "reg_session_id",
+		Value:    regSessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   300,
+	})
+
+	return c.JSON(http.StatusOK, options)
 }
 
 func (s *Service) FinishRegistration(c echo.Context) error {
-    // 1. Get UserID from cookie
-    cookie, err := c.Cookie("user_id")
-    if err != nil {
-        return c.String(http.StatusBadRequest, "Session missing")
-    }
-    userID := cookie.Value
+	regCookie, err := c.Cookie("reg_session_id")
+	if err != nil || regCookie.Value == "" {
+		return c.String(http.StatusBadRequest, "Session missing")
+	}
+	regKey := "reg:" + regCookie.Value
 
-    // 2. Get User & Session
-    user, err := s.store.GetUser(userID)
-    if err != nil {
-        return c.String(http.StatusInternalServerError, "User not found")
-    }
+	sessionBytes, err := s.redis.Get(c.Request().Context(), regKey).Bytes()
+	if err != nil {
+		return c.String(http.StatusBadRequest, "Session expired")
+	}
 
-    sessionJSON, err := s.redis.Get(c.Request().Context(), "reg_session:"+userID).Bytes()
-    if err != nil {
-        return c.String(http.StatusBadRequest, "Session expired")
-    }
+	var reg registrationSession
+	if err := json.Unmarshal(sessionBytes, &reg); err != nil {
+		return c.String(http.StatusInternalServerError, "Session invalid")
+	}
+	_ = s.redis.Del(c.Request().Context(), regKey).Err()
+	c.SetCookie(&http.Cookie{
+		Name:     "reg_session_id",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
 
-    var session webauthn.SessionData
-    if err := json.Unmarshal(sessionJSON, &session); err != nil {
-        return c.String(http.StatusInternalServerError, "Session invalid")
-    }
+	user, err := s.store.GetUser(reg.UserID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "User not found")
+	}
 
-    // 3. Parse and Verify
-    credential, err := s.wa.FinishRegistration(user, session, c.Request())
-    if err != nil {
-        return c.String(http.StatusBadRequest, fmt.Sprintf("Verification failed: %v", err))
-    }
+	credential, err := s.wa.FinishRegistration(user, reg.Session, c.Request())
+	if err != nil {
+		return c.String(http.StatusBadRequest, fmt.Sprintf("Verification failed: %v", err))
+	}
 
-    // 4. Save Credential
-    if err := s.store.AddCredential(user.ID, credential); err != nil {
-        return c.String(http.StatusInternalServerError, "Failed to save credential")
-    }
+	if err := s.store.AddCredential(user.ID, credential); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to save credential")
+	}
 
-	if err := s.setUserSession(c, user.ID); err != nil {
+	if sessionID, ok := s.sessionID(c); ok {
+		s.clearRecoveryMode(c, sessionID)
+	}
+
+	if _, err := s.setUserSessionWithID(c, user.ID); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to create session")
 	}
 
-	redirectURL := ""
-	if authReqID := c.QueryParam("auth_request_id"); authReqID != "" {
-		if err := s.provider.SetAuthRequestDone(authReqID, user.ID); err == nil {
-			redirectURL = "/authorize/callback?id=" + authReqID
+	authReqID := c.QueryParam("auth_request_id")
+	if authReqID == "" {
+		if authCookie, cookieErr := c.Cookie("oidc_auth_request"); cookieErr == nil && authCookie.Value != "" {
+			authReqID = authCookie.Value
 		}
+	}
+
+	redirectURL := ""
+	if authReqID != "" && s.provider.SetAuthRequestDone(authReqID, user.ID) == nil {
+		redirectURL = "/authorize/callback?id=" + authReqID
+		c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
@@ -209,190 +268,196 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 }
 
 func (s *Service) BeginLogin(c echo.Context) error {
-    // 1. Check if email is provided (for non-discoverable login)
-    email := c.QueryParam("email")
-    
-    var user *store.User
-    var err error
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
 
-    if email != "" {
-        user, err = s.store.GetUserByEmail(email)
-        if err != nil {
-            // In a real app, do not return 404 to avoid enumeration, but for now it's fine
-            return c.String(http.StatusNotFound, "User not found")
-        }
-    }
+	// 1. Check if email is provided (for non-discoverable login)
+	email := c.QueryParam("email")
 
-    // 2. Generate Credential Assertion Options
-    // If user is nil, it means we are doing a "Discoverable Credential" flow (empty allow list)
-    var opts []webauthn.LoginOption
-    if user == nil {
-         // Discoverable flow: UserVerification required usually implies we want to know who they are
-         opts = append(opts, webauthn.WithUserVerification(protocol.VerificationRequired))
-    } else {
-         opts = append(opts, webauthn.WithUserVerification(protocol.VerificationPreferred))
-    }
+	var user *store.User
+	var err error
 
-    var options *protocol.CredentialAssertion
-    var session *webauthn.SessionData
+	if email != "" {
+		user, err = s.store.GetUserByEmail(email)
+		if err != nil {
+			// In a real app, do not return 404 to avoid enumeration, but for now it's fine
+			return c.String(http.StatusNotFound, "User not found")
+		}
+	}
 
-    if user == nil {
-        options, session, err = s.wa.BeginDiscoverableLogin(opts...)
-    } else {
-        options, session, err = s.wa.BeginLogin(user, opts...)
-    }
-    if err != nil {
-        return c.String(http.StatusInternalServerError, err.Error())
-    }
+	// 2. Generate Credential Assertion Options
+	// If user is nil, it means we are doing a "Discoverable Credential" flow (empty allow list)
+	var opts []webauthn.LoginOption
+	if user == nil {
+		// Discoverable flow: UserVerification required usually implies we want to know who they are
+		opts = append(opts, webauthn.WithUserVerification(protocol.VerificationRequired))
+	} else {
+		opts = append(opts, webauthn.WithUserVerification(protocol.VerificationPreferred))
+	}
 
-    // 3. Store Session
-    // Use the Challenge from the session data which is always a string
-    requestID := "login_" + session.Challenge
-    
-    // Convert session to JSON
-    sessionJSON, _ := json.Marshal(session)
-    s.redis.Set(c.Request().Context(), requestID, sessionJSON, 5*time.Minute)
+	var options *protocol.CredentialAssertion
+	var session *webauthn.SessionData
 
-    // Return the request ID in a cookie so FinishLogin can find the session
-    c.SetCookie(&http.Cookie{
-        Name: "login_session_id",
-        Value: requestID,
-        Path: "/",
-        HttpOnly: true,
-        Secure: true,
-    })
+	if user == nil {
+		options, session, err = s.wa.BeginDiscoverableLogin(opts...)
+	} else {
+		options, session, err = s.wa.BeginLogin(user, opts...)
+	}
+	if err != nil {
+		return c.String(http.StatusInternalServerError, err.Error())
+	}
 
-    return c.JSON(http.StatusOK, options)
+	requestID := "login_" + session.Challenge
+	sessionJSON, _ := json.Marshal(session)
+	s.redis.Set(c.Request().Context(), requestID, sessionJSON, 5*time.Minute)
+
+	// Return the request ID in a cookie so FinishLogin can find the session
+	c.SetCookie(&http.Cookie{
+		Name:     "login_session_id",
+		Value:    requestID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   300,
+	})
+
+	return c.JSON(http.StatusOK, options)
 }
 
 func (s *Service) FinishLogin(c echo.Context) error {
-    // 1. Get Session ID
-    cookie, err := c.Cookie("login_session_id")
-    if err != nil {
-        return c.String(http.StatusBadRequest, "Session missing")
-    }
-    sessionID := cookie.Value
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
 
-    // 2. Load Session
-    sessionJSON, err := s.redis.Get(c.Request().Context(), sessionID).Bytes()
-    if err != nil {
-        return c.String(http.StatusBadRequest, "Session expired")
-    }
-    
-    var session webauthn.SessionData
-    if err := json.Unmarshal(sessionJSON, &session); err != nil {
-        return c.String(http.StatusInternalServerError, "Session invalid")
-    }
+	// 1. Get Session ID
+	cookie, err := c.Cookie("login_session_id")
+	if err != nil {
+		return c.String(http.StatusBadRequest, "Session missing")
+	}
+	sessionID := cookie.Value
 
-    // 3. Verify Assertion (discoverable vs non-discoverable)
-    var user *store.User
-    var credential *webauthn.Credential
+	// 2. Load Session
+	sessionJSON, err := s.redis.Get(c.Request().Context(), sessionID).Bytes()
+	if err != nil {
+		return c.String(http.StatusBadRequest, "Session expired")
+	}
 
-    if session.UserID == nil {
-        // Discoverable credential flow
-        handler := func(rawID, userHandle []byte) (webauthn.User, error) {
-            var u *store.User
-            var err error
-            if len(userHandle) > 0 {
-                u, err = s.store.GetUser(string(userHandle))
-            } else {
-                // Fallback to credential ID if userHandle is missing
-                u, err = s.store.GetUserByCredentialID(rawID)
-            }
-            if err != nil {
-                return nil, err
-            }
-            user = u
-            return u, nil
-        }
+	var session webauthn.SessionData
+	if err := json.Unmarshal(sessionJSON, &session); err != nil {
+		return c.String(http.StatusInternalServerError, "Session invalid")
+	}
 
-        credential, err = s.wa.FinishDiscoverableLogin(handler, session, c.Request())
-    } else {
-        // Non-discoverable flow: session has user ID
-        user, err = s.store.GetUser(string(session.UserID))
-        if err != nil {
-            return c.String(http.StatusInternalServerError, "User not found")
-        }
-        credential, err = s.wa.FinishLogin(user, session, c.Request())
-    }
+	// 3. Verify Assertion (discoverable vs non-discoverable)
+	var user *store.User
+	var credential *webauthn.Credential
 
-    if err != nil {
-        return c.String(http.StatusBadRequest, fmt.Sprintf("Login failed: %v", err))
-    }
-    if user == nil {
-        return c.String(http.StatusInternalServerError, "User not found")
-    }
+	if session.UserID == nil {
+		// Discoverable credential flow
+		handler := func(rawID, userHandle []byte) (webauthn.User, error) {
+			var u *store.User
+			var err error
+			if len(userHandle) > 0 {
+				u, err = s.store.GetUser(string(userHandle))
+			} else {
+				// Fallback to credential ID if userHandle is missing
+				u, err = s.store.GetUserByCredentialID(rawID)
+			}
+			if err != nil {
+				return nil, err
+			}
+			user = u
+			return u, nil
+		}
 
-    // 5. Update Counters
-    if credential.Authenticator.CloneWarning {
-        fmt.Println("CLONE WARNING for user", user.Email)
-        return c.String(http.StatusForbidden, "Security Alert: Possible credential clone")
-    }
-    
-    if err := s.store.UpdateCredential(credential); err != nil {
-        fmt.Printf("Failed to update credential stats: %v\n", err)
-    }
+		credential, err = s.wa.FinishDiscoverableLogin(handler, session, c.Request())
+	} else {
+		// Non-discoverable flow: session has user ID
+		user, err = s.store.GetUser(string(session.UserID))
+		if err != nil {
+			return c.String(http.StatusInternalServerError, "User not found")
+		}
+		credential, err = s.wa.FinishLogin(user, session, c.Request())
+	}
+
+	if err != nil {
+		return c.String(http.StatusBadRequest, fmt.Sprintf("Login failed: %v", err))
+	}
+	if user == nil {
+		return c.String(http.StatusInternalServerError, "User not found")
+	}
+
+	// 5. Update Counters
+	if credential.Authenticator.CloneWarning {
+		fmt.Println("CLONE WARNING for user", user.Email)
+		return c.String(http.StatusForbidden, "Security Alert: Possible credential clone")
+	}
+
+	if err := s.store.UpdateCredential(credential); err != nil {
+		fmt.Printf("Failed to update credential stats: %v\n", err)
+	}
 
 	if err := s.setUserSession(c, user.ID); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to create session")
 	}
-    
-    // If login is part of OIDC flow, mark auth request as done
-    if authReqID := c.QueryParam("auth_request_id"); authReqID != "" {
-        if err := s.provider.SetAuthRequestDone(authReqID, user.ID); err != nil {
-            return c.String(http.StatusBadRequest, "OIDC auth request invalid")
-        }
-    }
 
-    // OIDC Resume Support
-    // We check if "authRequestID" was extracted from the session or passed by client.
-    // For now, let's look for a cookie set by the Authorize endpoint.
-    authReqID := ""
-    cookie, err = c.Cookie("oidc_auth_request")
-    if err == nil && cookie.Value != "" {
-        authReqID = cookie.Value
-    }
-    
-    redirectURL := "/"
-    if authReqID != "" {
-        // Create an auth request specific callback
-        // We need to tell the Provider that the user is authenticated.
-        // We can do this by redirecting to a callback endpoint that calls `op.VerifyAuthRequest`.
-        // Or simpler: We return the callback URL to the frontend, and frontend redirects there.
-        // The callback URL is `/auth/callback?id=<authReqID>`.
-        redirectURL = fmt.Sprintf("/auth/oidc/callback?id=%s&sub=%s", authReqID, user.ID)
-        
-        // Clear cookie
-        c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
-    }
+	authReqID := c.QueryParam("auth_request_id")
+	if authReqID == "" {
+		if authCookie, cookieErr := c.Cookie("oidc_auth_request"); cookieErr == nil && authCookie.Value != "" {
+			authReqID = authCookie.Value
+		}
+	}
+
+	redirectURL := "/"
+	if authReqID != "" {
+		if err := s.provider.SetAuthRequestDone(authReqID, user.ID); err != nil {
+			return c.String(http.StatusBadRequest, "OIDC auth request invalid")
+		}
+		redirectURL = "/authorize/callback?id=" + authReqID
+		c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
+	}
 
 	return c.JSON(http.StatusOK, map[string]string{
-		"status": "ok",
-		"email": user.Email,
+		"status":       "ok",
+		"email":        user.Email,
 		"display_name": user.DisplayName,
-		"redirect": redirectURL,
+		"redirect":     redirectURL,
 	})
 }
 
 func (s *Service) Logout(c echo.Context) error {
-    if cookie, err := c.Cookie("user_session"); err == nil && cookie.Value != "" {
-        _ = s.redis.Del(c.Request().Context(), "sess:"+cookie.Value).Err()
-    }
+	if cookie, err := c.Cookie("user_session"); err == nil && cookie.Value != "" {
+		_ = s.redis.Del(c.Request().Context(), "sess:"+cookie.Value).Err()
+	}
 
-    c.SetCookie(&http.Cookie{
-        Name:     "user_session",
-        Value:    "",
-        Path:     "/",
-        HttpOnly: true,
-        Secure:   true,
-        SameSite: http.SameSiteLaxMode,
-        MaxAge:   -1,
-    })
+	c.SetCookie(&http.Cookie{
+		Name:     "user_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Service) DeleteAccount(c echo.Context) error {
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
+
 	userID, ok := s.SessionUserID(c)
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
@@ -420,45 +485,53 @@ func (s *Service) DeleteAccount(c echo.Context) error {
 }
 
 func (s *Service) SessionUserID(c echo.Context) (string, bool) {
-    cookie, err := c.Cookie("user_session")
-    if err != nil || cookie.Value == "" {
-        return "", false
-    }
-    userID, err := s.redis.Get(c.Request().Context(), "sess:"+cookie.Value).Result()
-    if err != nil || userID == "" {
-        return "", false
-    }
-    return userID, true
+	cookie, err := c.Cookie("user_session")
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	userID, err := s.redis.Get(c.Request().Context(), "sess:"+cookie.Value).Result()
+	if err != nil || userID == "" {
+		return "", false
+	}
+	return userID, true
 }
 
 func (s *Service) SessionStatus(c echo.Context) error {
-    userID, ok := s.SessionUserID(c)
-    if !ok {
-        return c.JSON(http.StatusOK, map[string]any{
-            "authenticated": false,
-        })
-    }
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusOK, map[string]any{
+			"authenticated": false,
+		})
+	}
 
-    user, err := s.store.GetUser(userID)
-    if err != nil {
-        return c.JSON(http.StatusOK, map[string]any{
-            "authenticated": false,
-        })
-    }
+	user, err := s.store.GetUser(userID)
+	if err != nil {
+		return c.JSON(http.StatusOK, map[string]any{
+			"authenticated": false,
+		})
+	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"authenticated": true,
-		"email": user.Email,
-		"display_name": user.DisplayName,
-		"profile_email": user.ProfileEmail,
-		"phone": user.Phone,
-		"share_profile": user.ShareProfile,
+		"authenticated":  true,
+		"recovery_mode":  s.InRecoveryMode(c),
+		"email":          user.Email,
+		"display_name":   user.DisplayName,
+		"profile_email":  user.ProfileEmail,
+		"phone":          user.Phone,
+		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
 	})
 }
 
 func (s *Service) GetProfile(c echo.Context) error {
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
+
 	userID, ok := s.SessionUserID(c)
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
@@ -470,16 +543,23 @@ func (s *Service) GetProfile(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"display_name":  user.DisplayName,
-		"email":         user.ProfileEmail,
-		"phone":         user.Phone,
-		"share_profile": user.ShareProfile,
+		"display_name":   user.DisplayName,
+		"email":          user.ProfileEmail,
+		"phone":          user.Phone,
+		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
 	})
 }
 
 func (s *Service) UpdateProfile(c echo.Context) error {
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
+
 	userID, ok := s.SessionUserID(c)
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})

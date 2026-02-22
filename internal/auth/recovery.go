@@ -1,15 +1,19 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
 )
 
 func (s *Service) RequestRecovery(c echo.Context) error {
@@ -58,32 +62,66 @@ func (s *Service) VerifyRecovery(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "Token required")
 	}
 
-	// 1. Validate Token
-	userID, err := s.redis.Get(c.Request().Context(), "recovery_token:"+token).Result()
+	ctx := c.Request().Context()
+	userID, err := redisGetDel(ctx, s.redis, "recovery_token:"+token)
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return c.String(http.StatusForbidden, "Invalid or expired link")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+	if userID == "" {
 		return c.String(http.StatusForbidden, "Invalid or expired link")
 	}
 
-	// 2. Consume Token (Single Use)
-	s.redis.Del(c.Request().Context(), "recovery_token:"+token)
+	sessionID, err := s.setUserSessionWithID(c, userID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+	if err := s.redis.Set(ctx, "recovery:"+sessionID, "1", 15*time.Minute).Err(); err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
 
-	// 3. Set Recovery Session
-	// This session puts the user in a special "Must Re-Register" state.
-	// We set a cookie that allows them to call /auth/register endpoints ONLY?
-	// Or we just log them in fully but redirect to settings?
-	// The requirement is "User MUST create a new Passkey immediately".
-	// Let's set a strictly scoped cookie "recovery_mode_user_id".
-	
-	c.SetCookie(&http.Cookie{
-		Name:     "user_id", // Reuse the main session cookie for simplicity, effectively logging them in?
-		Value:    userID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		MaxAge:   900, // 15 minutes to register a new key
-	})
-
-	// Also set a flag to frontend to trigger "Force Setup" UI?
-	// Actually, we can just redirect to the main page with a query param?
 	return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
+}
+
+func redisGetDel(ctx context.Context, rdb *redis.Client, key string) (string, error) {
+	value, err := rdb.Do(ctx, "GETDEL", key).Text()
+	if err == nil {
+		return value, nil
+	}
+	if errors.Is(err, redis.Nil) {
+		return "", redis.Nil
+	}
+	if !isUnknownRedisCommand(err) {
+		return "", err
+	}
+
+	res, evalErr := rdb.Eval(
+		ctx,
+		`local v = redis.call("GET", KEYS[1]); if v then redis.call("DEL", KEYS[1]); end; return v`,
+		[]string{key},
+	).Result()
+	if evalErr != nil {
+		if errors.Is(evalErr, redis.Nil) {
+			return "", redis.Nil
+		}
+		return "", evalErr
+	}
+	if res == nil {
+		return "", redis.Nil
+	}
+	str, ok := res.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected redis result type %T", res)
+	}
+	return str, nil
+}
+
+func isUnknownRedisCommand(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown command") || strings.Contains(msg, "unsupported command")
 }
