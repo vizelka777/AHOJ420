@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/houbamydar/AHOJ420/internal/auth"
@@ -76,7 +77,20 @@ func main() {
 	oidcHandler := echo.WrapHandler(oidcProvider)
 
 	e.Static("/static", "web/static")
-	e.GET("/", func(c echo.Context) error { return c.File("web/templates/index.html") })
+	e.GET("/", func(c echo.Context) error {
+		mode := c.QueryParam("mode")
+		if mode == "login" {
+			if _, ok := authService.SessionUserID(c); ok && !authService.InRecoveryMode(c) {
+				if returnTo := c.QueryParam("return_to"); isSafeReturnTo(returnTo) {
+					return c.Redirect(http.StatusFound, returnTo)
+				}
+				if authRequestID := c.QueryParam("auth_request_id"); isSafeAuthRequestID(authRequestID) {
+					return c.Redirect(http.StatusFound, "/authorize/callback?id="+url.QueryEscape(authRequestID))
+				}
+			}
+		}
+		return c.File("web/templates/index.html")
+	})
 	e.GET("/robots.txt", func(c echo.Context) error {
 		return c.String(http.StatusOK, "User-agent: *\nDisallow: /\n")
 	})
@@ -158,4 +172,39 @@ func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {
 		provider.ServeHTTP(c.Response(), req)
 		return nil
 	}
+}
+
+func isSafeReturnTo(returnTo string) bool {
+	if returnTo == "" {
+		return false
+	}
+	if returnTo[0] != '/' {
+		return false
+	}
+	if len(returnTo) > 1 && returnTo[1] == '/' {
+		return false
+	}
+	if hasScheme(returnTo) {
+		return false
+	}
+	return len(returnTo) >= len("/authorize/callback") && returnTo[:len("/authorize/callback")] == "/authorize/callback"
+}
+
+var authRequestIDPattern = regexp.MustCompile(`^auth_[A-Za-z0-9_-]+$`)
+
+func isSafeAuthRequestID(id string) bool {
+	return authRequestIDPattern.MatchString(id)
+}
+
+func hasScheme(v string) bool {
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		if ch == ':' {
+			return true
+		}
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '+' || ch == '-' || ch == '.') {
+			return false
+		}
+	}
+	return false
 }
