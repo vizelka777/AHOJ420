@@ -25,4 +25,18 @@ else
     echo "OIDC_CRYPTO_KEY already set in .env."
 fi
 
+if ! grep -q "OIDC_KEY_ID" .env; then
+    echo "OIDC_KEY_ID=key-current-$(date +%Y%m%d)" >> .env
+else
+    echo "OIDC_KEY_ID already set in .env."
+fi
+
+if ! grep -q "OIDC_PREV_PRIVKEY_PATH" .env; then
+    echo "OIDC_PREV_PRIVKEY_PATH=" >> .env
+fi
+
+if ! grep -q "OIDC_PREV_KEY_ID" .env; then
+    echo "OIDC_PREV_KEY_ID=" >> .env
+fi
+
 echo "Done. Secrets are ready."

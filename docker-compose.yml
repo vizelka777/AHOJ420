@@ -47,6 +47,9 @@ services:
       - RP_ORIGIN=${RP_ORIGIN}
       - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES}
       - OIDC_PRIVKEY_PATH=/run/secrets/oidc_private_key.pem
+      - OIDC_KEY_ID=${OIDC_KEY_ID}
+      - OIDC_PREV_PRIVKEY_PATH=${OIDC_PREV_PRIVKEY_PATH}
+      - OIDC_PREV_KEY_ID=${OIDC_PREV_KEY_ID}
       - OIDC_CRYPTO_KEY=${OIDC_CRYPTO_KEY}
     volumes:
       - .:/app

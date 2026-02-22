@@ -29,45 +29,60 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 	userStore := &UserStore{store: s}
 	storage := NewMemStorage(userStore)
 
-	// 1. Try to load key from file
-	var key *rsa.PrivateKey
-	var err error
+	// 1. Load current signing key (or fallback ephemeral for dev)
+	currentKeyID := os.Getenv("OIDC_KEY_ID")
+	if currentKeyID == "" {
+		currentKeyID = "sig_key_current"
+	}
 
-	keyPath := os.Getenv("OIDC_PRIVKEY_PATH")
-	if keyPath != "" {
-		keyData, err := os.ReadFile(keyPath)
+	var currentKey *rsa.PrivateKey
+	var err error
+	currentKeyPath := os.Getenv("OIDC_PRIVKEY_PATH")
+	if currentKeyPath != "" {
+		currentKey, err = loadRSAPrivateKey(currentKeyPath)
 		if err != nil {
-			log.Printf("Failed to read key file: %v. Generating temporary key.", err)
-		} else {
-			block, _ := pem.Decode(keyData)
-			if block == nil {
-				log.Printf("Failed to parse PEM block. Generating temporary key.")
-			} else {
-				key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-				if err != nil {
-					// Try PKCS8
-					if keyInterface, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-						if k, ok := keyInterface.(*rsa.PrivateKey); ok {
-							key = k
-						}
-					}
-				}
-				if key == nil {
-					log.Printf("Failed to parse private key. Generating temporary key.")
-				}
-			}
+			log.Printf("Failed to load current OIDC key from %s: %v", currentKeyPath, err)
 		}
 	}
 
-	if key == nil {
+	if currentKey == nil {
 		log.Println("WARNING: Generating ephemeral RSA key. All tokens will be invalid after restart.")
-		key, err = rsa.GenerateKey(rand.Reader, 2048)
+		currentKey, err = rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// 2. Crypto Key
+	keys := []*SimpleKey{
+		{
+			id:  currentKeyID,
+			alg: jose.RS256,
+			use: "sig",
+			key: currentKey,
+		},
+	}
+
+	// 2. Optionally load previous key for zero-downtime rotation validation.
+	prevKeyPath := os.Getenv("OIDC_PREV_PRIVKEY_PATH")
+	if prevKeyPath != "" {
+		prevKeyID := os.Getenv("OIDC_PREV_KEY_ID")
+		if prevKeyID == "" {
+			prevKeyID = "sig_key_previous"
+		}
+		prevKey, prevErr := loadRSAPrivateKey(prevKeyPath)
+		if prevErr != nil {
+			log.Printf("Failed to load previous OIDC key from %s: %v", prevKeyPath, prevErr)
+		} else {
+			keys = append(keys, &SimpleKey{
+				id:  prevKeyID,
+				alg: jose.RS256,
+				use: "sig",
+				key: prevKey,
+			})
+		}
+	}
+
+	// 3. Cookie crypto key
 	cryptoKeyStr := os.Getenv("OIDC_CRYPTO_KEY")
 	if len(cryptoKeyStr) < 32 {
 		log.Println("WARNING: OIDC_CRYPTO_KEY not set or too short. Using insecure default.")
@@ -96,14 +111,33 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 		return nil, err
 	}
 
-	storage.signingKey = &SimpleKey{
-		id:  "sig_key_auto",
-		alg: jose.RS256,
-		use: "sig",
-		key: key,
-	}
+	storage.signingKey = keys[0]
+	storage.keys = keys
 
 	return &Provider{OpenIDProvider: provider, Storage: storage}, nil
+}
+
+func loadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
+	keyData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, fmt.Errorf("parse pem: no block found")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	keyInterface, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	key, ok := keyInterface.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("private key is not RSA")
+	}
+	return key, nil
 }
 
 // SetAuthRequestDone marks an auth request as authenticated and assigns a subject.
@@ -182,6 +216,7 @@ type MemStorage struct {
 	codes        map[string]*SimpleAuthRequest
 	userStore *UserStore
     signingKey *SimpleKey
+	keys       []*SimpleKey
 }
 
 func NewMemStorage(us *UserStore) *MemStorage {
@@ -394,15 +429,18 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 }
 
 func (s *MemStorage) GetKeyByIDAndClientID(ctx context.Context, keyID, clientID string) (*jose.JSONWebKey, error) {
-     if s.signingKey != nil && s.signingKey.id == keyID {
-         jwk := jose.JSONWebKey{
-            Key: s.signingKey.key,
-            KeyID: s.signingKey.id,
-            Algorithm: string(s.signingKey.alg),
-            Use: s.signingKey.use,
-        }
-        return &jwk, nil
-    }
+	for _, key := range s.keys {
+		if key.id != keyID {
+			continue
+		}
+		jwk := jose.JSONWebKey{
+			Key:       key.key,
+			KeyID:     key.id,
+			Algorithm: string(key.alg),
+			Use:       key.use,
+		}
+		return &jwk, nil
+	}
 	return nil, fmt.Errorf("key not found")
 }
 
@@ -422,11 +460,14 @@ func (s *MemStorage) SignatureAlgorithms(ctx context.Context) ([]jose.SignatureA
 }
 
 func (s *MemStorage) KeySet(ctx context.Context) ([]op.Key, error) {
-    if s.signingKey == nil {
-        return []op.Key{}, nil
-    }
-    // op.Key is interface, SimpleKey implements it
-	return []op.Key{s.signingKey}, nil
+	if len(s.keys) == 0 {
+		return []op.Key{}, nil
+	}
+	keys := make([]op.Key, 0, len(s.keys))
+	for _, key := range s.keys {
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // StaticClient implementation
