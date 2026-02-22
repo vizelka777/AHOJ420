@@ -219,6 +219,17 @@ func (p *Provider) SetAuthRequestDone(id, userID string) error {
 
 type UserStore struct {
 	store *store.Store
+	get   func(userID string) (*store.User, error)
+}
+
+func (u *UserStore) GetUser(userID string) (*store.User, error) {
+	if u == nil {
+		return nil, fmt.Errorf("user store is nil")
+	}
+	if u.get != nil {
+		return u.get(userID)
+	}
+	return u.store.GetUser(userID)
 }
 
 type SimpleKey struct {
@@ -282,6 +293,7 @@ type clientConfig struct {
 	AuthMethod    string   `json:"auth_method"`
 	GrantTypes    []string `json:"grant_types"`
 	ResponseTypes []string `json:"response_types"`
+	Scopes        []string `json:"scopes"`
 }
 
 type MemStorage struct {
@@ -425,6 +437,11 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 		authMethod = oidc.AuthMethodNone
 		cfg.Secrets = nil
 	}
+	if cfg.Confidential && len(cfg.Secrets) == 0 && strings.EqualFold(cfg.ID, "mushroom-bff") {
+		if secret := strings.TrimSpace(os.Getenv("OIDC_CLIENT_MUSHROOM_BFF_SECRET")); secret != "" {
+			cfg.Secrets = []string{secret}
+		}
+	}
 	if cfg.Confidential && authMethod == oidc.AuthMethodNone {
 		return nil, errors.New("confidential client cannot use auth_method none")
 	}
@@ -440,6 +457,7 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedScopes := parseAllowedScopes(cfg.Scopes)
 
 	return &StaticClient{
 		id:              cfg.ID,
@@ -450,7 +468,23 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 		applicationType: op.ApplicationTypeWeb,
 		authMethod:      authMethod,
 		requirePKCE:     cfg.RequirePKCE,
+		allowedScopes:   allowedScopes,
 	}, nil
+}
+
+func parseAllowedScopes(scopes []string) map[string]struct{} {
+	if len(scopes) == 0 {
+		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone}
+	}
+	out := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		trimmed := strings.TrimSpace(scope)
+		if trimmed == "" {
+			continue
+		}
+		out[trimmed] = struct{}{}
+	}
+	return out
 }
 
 func parseAuthMethod(raw string) (oidc.AuthMethod, error) {
@@ -755,7 +789,7 @@ func (s *MemStorage) AuthorizeClientIDSecret(ctx context.Context, clientID, clie
 }
 
 func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.UserInfo, userID, clientID string, scopes []string) error {
-	user, err := s.userStore.store.GetUser(userID)
+	user, err := s.userStore.GetUser(userID)
 	if err != nil {
 		return err
 	}
@@ -763,17 +797,13 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 	for _, scope := range scopes {
 		switch scope {
 		case oidc.ScopeProfile:
-			if user.ShareProfile {
-				userinfo.Name = user.DisplayName
-				userinfo.PreferredUsername = user.DisplayName
-			}
+			userinfo.Name = user.DisplayName
+			userinfo.PreferredUsername = user.DisplayName
 		case oidc.ScopeEmail:
-			if user.ShareProfile && user.ProfileEmail != "" {
-				userinfo.Email = user.ProfileEmail
-				userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
-			}
+			userinfo.Email = user.Email
+			userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
 		case oidc.ScopePhone:
-			if user.ShareProfile && user.Phone != "" {
+			if strings.TrimSpace(user.Phone) != "" {
 				userinfo.PhoneNumber = user.Phone
 				userinfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
 			}
@@ -792,28 +822,22 @@ func (s *MemStorage) SetIntrospectionFromToken(ctx context.Context, userinfo *oi
 }
 
 func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, clientID string, scopes []string) (map[string]interface{}, error) {
-	user, err := s.userStore.store.GetUser(userID)
+	user, err := s.userStore.GetUser(userID)
 	if err != nil {
 		return nil, err
 	}
 
 	claims := map[string]interface{}{}
-	if !user.ShareProfile {
-		return claims, nil
-	}
-
 	for _, scope := range scopes {
 		switch scope {
 		case oidc.ScopeProfile:
 			claims["name"] = user.DisplayName
 			claims["preferred_username"] = user.DisplayName
 		case oidc.ScopeEmail:
-			if user.ProfileEmail != "" {
-				claims["email"] = user.ProfileEmail
-				claims["email_verified"] = user.EmailVerified
-			}
+			claims["email"] = user.Email
+			claims["email_verified"] = user.EmailVerified
 		case oidc.ScopePhone:
-			if user.Phone != "" {
+			if strings.TrimSpace(user.Phone) != "" {
 				claims["phone_number"] = user.Phone
 				claims["phone_number_verified"] = user.PhoneVerified
 			}
@@ -873,6 +897,7 @@ type StaticClient struct {
 	applicationType op.ApplicationType
 	authMethod      oidc.AuthMethod
 	requirePKCE     bool
+	allowedScopes   map[string]struct{}
 }
 
 func (c *StaticClient) GetID() string                        { return c.id }
@@ -887,7 +912,10 @@ func (c *StaticClient) IDTokenLifetime() time.Duration       { return 1 * time.H
 func (c *StaticClient) DevMode() bool                        { return true }
 func (c *StaticClient) IDTokenUserinfoClaimsAssertion() bool { return false }
 func (c *StaticClient) ClockSkew() time.Duration             { return 0 }
-func (c *StaticClient) IsScopeAllowed(scope string) bool     { return true }
+func (c *StaticClient) IsScopeAllowed(scope string) bool {
+	_, ok := c.allowedScopes[scope]
+	return ok
+}
 func (c *StaticClient) RestrictAdditionalIdTokenScopes() func(scopes []string) []string {
 	return func(scopes []string) []string { return scopes }
 }
