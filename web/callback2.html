@@ -7,12 +7,24 @@
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     const state = params.get("state");
+    const error = params.get("error");
+    const errorDescription = params.get("error_description");
     const expectedState = sessionStorage.getItem("oidc_state");
     const ok = state && expectedState && state === expectedState;
-    document.getElementById("out").textContent =
-      "code: " + code + "\n" +
-      "state: " + state + "\n" +
-      "state_ok: " + ok;
+
+    const lines = [];
+    if (error) {
+      lines.push("error: " + error);
+      lines.push("error_description: " + (errorDescription || ""));
+    } else {
+      lines.push("code: " + code);
+    }
+    lines.push("state: " + state);
+    lines.push("state_ok: " + ok);
+    lines.push("nonce_saved: " + Boolean(sessionStorage.getItem("oidc_nonce")));
+    lines.push("pkce_verifier_saved: " + Boolean(sessionStorage.getItem("oidc_code_verifier")));
+
+    document.getElementById("out").textContent = lines.join("\n");
   </script>
 </body>
 </html>

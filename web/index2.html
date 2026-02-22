@@ -4,39 +4,150 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Login via Ahoj420 (client2)</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #111a2b;
+      --text: #e8eefc;
+      --muted: #a6b2d1;
+      --ok: #3bd28f;
+      --warn: #f3b94d;
+      --btn1: #4f7cff;
+      --btn2: #3b63d1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background:
+        radial-gradient(900px 600px at 10% 10%, #1a2d53 0%, transparent 60%),
+        radial-gradient(900px 600px at 90% 90%, #15352d 0%, transparent 60%),
+        var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }
+    .card {
+      width: min(560px, 100%);
+      background: linear-gradient(180deg, #131f35 0%, #0f182a 100%);
+      border: 1px solid #2b3a5d;
+      border-radius: 16px;
+      padding: 22px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0 0 18px;
+      color: var(--muted);
+    }
+    .meta {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      line-height: 1.5;
+    }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      background: linear-gradient(180deg, var(--btn1), var(--btn2));
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    pre {
+      margin-top: 14px;
+      background: #0b1322;
+      border: 1px solid #243555;
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 100px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #d2dcf6;
+      font-size: 13px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+  </style>
 </head>
 <body>
-  <button id="loginBtn">Login (client2)</button>
-  <pre id="out"></pre>
+  <main class="card">
+    <h1>OIDC Login Test (client2)</h1>
+    <p>Проверка входа через `ahoj420.eu` на домене `houbamzdar.cz`.</p>
+    <div class="meta">
+      client_id: <b>client2</b><br />
+      redirect_uri: <b>https://houbamzdar.cz/callback2.html</b>
+    </div>
+    <button id="loginBtn">Login via Ahoj420</button>
+    <pre id="out">Ready.</pre>
+  </main>
 
   <script>
     const CLIENT_ID = "client2";
     const REDIRECT_URI = "https://houbamzdar.cz/callback2.html";
     const ISSUER = "https://ahoj420.eu";
+    const out = document.getElementById("out");
 
-    function randomString(len=24) {
-      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-      let out = "";
-      for (let i=0;i<len;i++) out += chars[Math.floor(Math.random()*chars.length)];
-      return out;
+    function randomString(len = 48) {
+      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+      let value = "";
+      const arr = new Uint8Array(len);
+      crypto.getRandomValues(arr);
+      for (let i = 0; i < len; i++) value += chars[arr[i] % chars.length];
+      return value;
     }
 
-    document.getElementById("loginBtn").onclick = () => {
-      const state = randomString(24);
-      const nonce = randomString(24);
-      sessionStorage.setItem("oidc_state", state);
-      sessionStorage.setItem("oidc_nonce", nonce);
+    function toBase64Url(uint8) {
+      let str = "";
+      uint8.forEach((b) => { str += String.fromCharCode(b); });
+      return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
 
-      const url =
-        `${ISSUER}/authorize` +
-        `?client_id=${encodeURIComponent(CLIENT_ID)}` +
-        `&response_type=code` +
-        `&scope=openid` +
-        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-        `&state=${encodeURIComponent(state)}` +
-        `&nonce=${encodeURIComponent(nonce)}`;
+    async function sha256Base64Url(input) {
+      const enc = new TextEncoder().encode(input);
+      const digest = await crypto.subtle.digest("SHA-256", enc);
+      return toBase64Url(new Uint8Array(digest));
+    }
 
-      window.location.href = url;
+    document.getElementById("loginBtn").onclick = async () => {
+      try {
+        const state = randomString(32);
+        const nonce = randomString(32);
+        const codeVerifier = randomString(64);
+        const codeChallenge = await sha256Base64Url(codeVerifier);
+
+        sessionStorage.setItem("oidc_state", state);
+        sessionStorage.setItem("oidc_nonce", nonce);
+        sessionStorage.setItem("oidc_code_verifier", codeVerifier);
+
+        const url =
+          `${ISSUER}/authorize` +
+          `?client_id=${encodeURIComponent(CLIENT_ID)}` +
+          `&response_type=code` +
+          `&scope=openid` +
+          `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+          `&state=${encodeURIComponent(state)}` +
+          `&nonce=${encodeURIComponent(nonce)}` +
+          `&code_challenge=${encodeURIComponent(codeChallenge)}` +
+          `&code_challenge_method=S256`;
+
+        out.innerHTML = "<span class='ok'>Redirecting to authorize...</span>\n" + url;
+        window.location.href = url;
+      } catch (e) {
+        out.innerHTML = "<span class='warn'>Cannot start login:</span> " + (e && e.message ? e.message : String(e));
+      }
     };
   </script>
 </body>

@@ -79,7 +79,7 @@ func main() {
 			"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 	}))
 
-	sensitiveLimiter := middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(rate.Limit(0.7)))
+	sensitiveLimiter := middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(rate.Limit(3)))
 
 	e.Static("/static", "web/static")
 
@@ -96,7 +96,10 @@ func main() {
 	e.GET("/auth/login/begin", authService.BeginLogin, sensitiveLimiter)
 	e.POST("/auth/login/finish", authService.FinishLogin, sensitiveLimiter)
 	e.POST("/auth/logout", authService.Logout)
+	e.POST("/auth/delete-account", authService.DeleteAccount)
 	e.GET("/auth/session", authService.SessionStatus)
+	e.GET("/auth/profile", authService.GetProfile)
+	e.POST("/auth/profile", authService.UpdateProfile)
 
 	// Recovery Routes
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
@@ -137,7 +140,7 @@ func main() {
 			return nil
 		}
 		return authorizeHandler(c)
-	}, sensitiveLimiter)
+	})
 
 	// Authorization Callback (after login UI)
 	e.GET("/authorize/callback", func(c echo.Context) error {

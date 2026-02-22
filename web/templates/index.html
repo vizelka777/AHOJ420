@@ -8,6 +8,21 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="/static/js/glue.js?v=20260127b"></script>
+    <style>
+        #profile-modal {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.65);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            z-index: 50;
+        }
+        #profile-modal.open {
+            display: flex;
+        }
+    </style>
 </head>
 
 <body class="bg-gray-900 text-white min-h-screen flex items-center justify-center font-sans">
@@ -62,11 +77,84 @@
             </div>
         </div>
 
+        <div id="account-ui" class="hidden space-y-4">
+            <h2 class="text-xl font-semibold text-center">Ваш профиль</h2>
+            <form class="space-y-3" onsubmit="saveAccountProfile(event)">
+                <input id="account-name" type="text" placeholder="Имя"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                <div class="space-y-2">
+                    <input id="account-email" type="email" placeholder="Email (опционально)"
+                        class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                    <div class="flex items-center justify-between text-xs">
+                        <span id="account-email-status" class="text-yellow-300">Email: не подтверждено</span>
+                        <button type="button" id="btn-verify-email" onclick="verifyEmailStub()"
+                            class="px-2 py-1 border border-yellow-400/40 rounded text-yellow-200 hover:text-yellow-100 hover:border-yellow-300">
+                            Подтвердить
+                        </button>
+                    </div>
+                </div>
+                <div class="space-y-2">
+                    <input id="account-phone" type="tel" placeholder="Телефон (опционально)"
+                        class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                    <div class="flex items-center justify-between text-xs">
+                        <span id="account-phone-status" class="text-yellow-300">Телефон: не подтверждено</span>
+                        <button type="button" id="btn-verify-phone" onclick="verifyPhoneStub()"
+                            class="px-2 py-1 border border-yellow-400/40 rounded text-yellow-200 hover:text-yellow-100 hover:border-yellow-300">
+                            Подтвердить
+                        </button>
+                    </div>
+                </div>
+                <label class="flex items-start gap-2 text-sm text-gray-300">
+                    <input id="account-share" type="checkbox" class="mt-1">
+                    <span>Передавать эти данные в сторонние сервисы при OIDC входе.</span>
+                </label>
+                <button type="submit"
+                    class="w-full py-2 bg-gradient-to-r from-teal-500 to-blue-600 rounded-lg font-semibold hover:from-teal-400 hover:to-blue-500 transition">
+                    Сохранить профиль
+                </button>
+                <button type="button" onclick="handleDeleteAccount()"
+                    class="w-full py-2 border border-red-500/40 rounded-lg font-semibold text-red-300 hover:text-red-200 hover:border-red-400 transition">
+                    Удалить аккаунт и профиль
+                </button>
+            </form>
+        </div>
+
         <div id="message" class="mt-4 text-center text-sm min-h-[20px]"></div>
         <button id="logout-btn" onclick="handleLogout()"
             class="hidden mt-3 w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
             Logout
         </button>
+    </div>
+
+    <div id="profile-modal">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
+            <h3 class="text-xl font-semibold mb-3">Профиль (опционально)</h3>
+            <p class="text-sm text-gray-300 mb-4">
+                Можно добавить имя, email и телефон. Эти данные будут передаваться в другие сервисы только при вашем согласии.
+            </p>
+            <form class="space-y-3" onsubmit="saveProfile(event)">
+                <input id="profile-name" type="text" placeholder="Имя"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                <input id="profile-email" type="email" placeholder="Email (опционально)"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                <input id="profile-phone" type="tel" placeholder="Телефон (опционально)"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                <label class="flex items-start gap-2 text-sm text-gray-300">
+                    <input id="profile-share" type="checkbox" class="mt-1">
+                    <span>Разрешаю передавать эти данные при входе на другие сервисы.</span>
+                </label>
+                <div class="flex gap-2 pt-1">
+                    <button type="submit"
+                        class="flex-1 py-2 bg-gradient-to-r from-teal-500 to-blue-600 rounded-lg font-semibold hover:from-teal-400 hover:to-blue-500 transition">
+                        Сохранить
+                    </button>
+                    <button type="button" onclick="closeProfileModal()"
+                        class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        Пропустить
+                    </button>
+                </div>
+            </form>
+        </div>
     </div>
 
     <script>
@@ -106,8 +194,18 @@
             }
 
             try {
-                await registerUser(email);
-                showMessage("Success! Passkey created.", "text-green-400");
+                const res = await registerUser(email);
+                showMessage("Passkey created. You are logged in.", "text-green-400");
+                applySessionState(true, res.display_name || res.email || "User");
+                openProfileModal({
+                    display_name: res.display_name || "",
+                    email: "",
+                    phone: "",
+                    share_profile: false
+                });
+                if (res.redirect) {
+                    window.location.href = res.redirect;
+                }
             } catch (err) {
                 console.error(err);
                 showMessage("Error: " + err.message, "text-red-400");
@@ -129,11 +227,18 @@
             try {
                 const res = await loginUser(email, authRequestID);
                 showMessage("Logged in as " + res.email, "text-green-400");
+                applySessionState(true, res.display_name || res.email || "User");
+                if (res.redirect && res.redirect !== "/") {
+                    window.location.href = res.redirect;
+                    return;
+                }
                 const params = new URLSearchParams(window.location.search);
                 const returnTo = params.get("return_to");
                 if (returnTo) {
                     window.location.href = returnTo;
+                    return;
                 }
+                await loadProfileForAccountUI();
             } catch (err) {
                 console.error(err);
                 showMessage("Error: " + err.message, "text-red-400");
@@ -217,6 +322,7 @@
                 if (!res.ok) {
                     throw new Error(await res.text());
                 }
+                closeProfileModal();
                 applySessionState(false, "");
                 showMessage("Logged out", "text-green-400");
                 history.replaceState({}, "", "/");
@@ -225,16 +331,36 @@
             }
         }
 
+        async function handleDeleteAccount() {
+            const ok = window.confirm("Удалить аккаунт и профиль без возможности восстановления?");
+            if (!ok) return;
+            try {
+                const res = await fetch('/auth/delete-account', { method: 'POST' });
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+                closeProfileModal();
+                applySessionState(false, "");
+                showMessage("Аккаунт удален.", "text-green-400");
+                history.replaceState({}, "", "/");
+            } catch (err) {
+                showMessage("Delete error: " + err.message, "text-red-400");
+            }
+        }
+
         function applySessionState(authenticated, email) {
             const guestUI = document.getElementById('guest-ui');
+            const accountUI = document.getElementById('account-ui');
             const logoutBtn = document.getElementById('logout-btn');
             if (authenticated) {
                 guestUI.classList.add('hidden');
+                accountUI.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
                 showMessage("Session active: " + email, "text-green-400");
                 return;
             }
             guestUI.classList.remove('hidden');
+            accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
         }
 
@@ -243,9 +369,134 @@
                 const res = await fetch('/auth/session');
                 if (!res.ok) return;
                 const data = await res.json();
-                applySessionState(Boolean(data.authenticated), data.email || "");
+                const authenticated = Boolean(data.authenticated);
+                applySessionState(authenticated, data.display_name || data.email || "");
+                if (authenticated) {
+                    populateAccountUI(data);
+                    await loadProfileForAccountUI();
+                }
             } catch (_) {
                 applySessionState(false, "");
+            }
+        }
+
+        function populateAccountUI(profile) {
+            document.getElementById('account-name').value = profile.display_name || "";
+            document.getElementById('account-email').value = profile.profile_email || profile.email || "";
+            document.getElementById('account-phone').value = profile.phone || "";
+            document.getElementById('account-share').checked = Boolean(profile.share_profile);
+            renderVerificationStatus({
+                email_verified: Boolean(profile.email_verified),
+                phone_verified: Boolean(profile.phone_verified),
+                email: profile.profile_email || profile.email || "",
+                phone: profile.phone || ""
+            });
+        }
+
+        function renderVerificationStatus(profile) {
+            const emailVerified = Boolean(profile.email_verified);
+            const phoneVerified = Boolean(profile.phone_verified);
+            const emailHasValue = Boolean((profile.email || "").trim());
+            const phoneHasValue = Boolean((profile.phone || "").trim());
+
+            const emailStatus = document.getElementById('account-email-status');
+            emailStatus.innerText = "Email: " + (emailVerified ? "подтверждено" : "не подтверждено");
+            emailStatus.className = emailVerified ? "text-green-300" : "text-yellow-300";
+
+            const phoneStatus = document.getElementById('account-phone-status');
+            phoneStatus.innerText = "Телефон: " + (phoneVerified ? "подтверждено" : "не подтверждено");
+            phoneStatus.className = phoneVerified ? "text-green-300" : "text-yellow-300";
+
+            document.getElementById('btn-verify-email').classList.toggle('hidden', emailVerified || !emailHasValue);
+            document.getElementById('btn-verify-phone').classList.toggle('hidden', phoneVerified || !phoneHasValue);
+        }
+
+        async function loadProfileForAccountUI() {
+            try {
+                const res = await fetch('/auth/profile');
+                if (!res.ok) {
+                    return;
+                }
+                const profile = await res.json();
+                document.getElementById('account-name').value = profile.display_name || "";
+                document.getElementById('account-email').value = profile.email || "";
+                document.getElementById('account-phone').value = profile.phone || "";
+                document.getElementById('account-share').checked = Boolean(profile.share_profile);
+                renderVerificationStatus(profile);
+            } catch (_) {
+                // no-op
+            }
+        }
+
+        async function saveAccountProfile(e) {
+            e.preventDefault();
+            const payload = {
+                display_name: document.getElementById('account-name').value.trim(),
+                email: document.getElementById('account-email').value.trim(),
+                phone: document.getElementById('account-phone').value.trim(),
+                share_profile: document.getElementById('account-share').checked
+            };
+            try {
+                const res = await fetch('/auth/profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+                await loadProfileForAccountUI();
+                applySessionState(true, payload.display_name || payload.email || "User");
+                showMessage("Profile saved.", "text-green-400");
+            } catch (err) {
+                showMessage("Profile save failed: " + err.message, "text-red-400");
+            }
+        }
+
+        function verifyEmailStub() {
+            showMessage("Подтверждение email пока в разработке.", "text-yellow-400");
+        }
+
+        function verifyPhoneStub() {
+            showMessage("Подтверждение телефона пока в разработке.", "text-yellow-400");
+        }
+
+        function openProfileModal(profile) {
+            document.getElementById('profile-name').value = profile.display_name || "";
+            document.getElementById('profile-email').value = profile.email || "";
+            document.getElementById('profile-phone').value = profile.phone || "";
+            document.getElementById('profile-share').checked = Boolean(profile.share_profile);
+            document.getElementById('profile-modal').classList.add('open');
+        }
+
+        function closeProfileModal() {
+            document.getElementById('profile-modal').classList.remove('open');
+        }
+
+        async function saveProfile(e) {
+            e.preventDefault();
+            const payload = {
+                display_name: document.getElementById('profile-name').value.trim(),
+                email: document.getElementById('profile-email').value.trim(),
+                phone: document.getElementById('profile-phone').value.trim(),
+                share_profile: document.getElementById('profile-share').checked
+            };
+            try {
+                const res = await fetch('/auth/profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+                closeProfileModal();
+                showMessage("Profile saved.", "text-green-400");
+                if (payload.display_name) {
+                    applySessionState(true, payload.display_name);
+                }
+            } catch (err) {
+                showMessage("Profile save failed: " + err.message, "text-red-400");
             }
         }
 

@@ -27,6 +27,13 @@ type Service struct {
     sessionTTL time.Duration
 }
 
+type profilePayload struct {
+	DisplayName  string `json:"display_name"`
+	Email        string `json:"email"`
+	Phone        string `json:"phone"`
+	ShareProfile bool   `json:"share_profile"`
+}
+
 func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
     w, err := webauthn.New(&webauthn.Config{
         RPDisplayName: "Ahoj420 Identity",
@@ -57,6 +64,27 @@ func newSessionID() (string, error) {
         return "", err
     }
     return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func (s *Service) setUserSession(c echo.Context, userID string) error {
+	userSessionID, err := newSessionID()
+	if err != nil {
+		return err
+	}
+	sessionKey := "sess:" + userSessionID
+	if err := s.redis.Set(c.Request().Context(), sessionKey, userID, s.sessionTTL).Err(); err != nil {
+		return err
+	}
+	c.SetCookie(&http.Cookie{
+		Name:     "user_session",
+		Value:    userSessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(s.sessionTTL.Seconds()),
+	})
+	return nil
 }
 
 func (s *Service) BeginRegistration(c echo.Context) error {
@@ -160,7 +188,24 @@ func (s *Service) FinishRegistration(c echo.Context) error {
         return c.String(http.StatusInternalServerError, "Failed to save credential")
     }
 
-    return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	if err := s.setUserSession(c, user.ID); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to create session")
+	}
+
+	redirectURL := ""
+	if authReqID := c.QueryParam("auth_request_id"); authReqID != "" {
+		if err := s.provider.SetAuthRequestDone(authReqID, user.ID); err == nil {
+			redirectURL = "/authorize/callback?id=" + authReqID
+		}
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":        "ok",
+		"email":         user.Email,
+		"display_name":  user.DisplayName,
+		"needs_profile": true,
+		"redirect":      redirectURL,
+	})
 }
 
 func (s *Service) BeginLogin(c echo.Context) error {
@@ -288,23 +333,9 @@ func (s *Service) FinishLogin(c echo.Context) error {
         fmt.Printf("Failed to update credential stats: %v\n", err)
     }
 
-    userSessionID, err := newSessionID()
-    if err != nil {
-        return c.String(http.StatusInternalServerError, "Failed to create session")
-    }
-    sessionKey := "sess:" + userSessionID
-    if err := s.redis.Set(c.Request().Context(), sessionKey, user.ID, s.sessionTTL).Err(); err != nil {
-        return c.String(http.StatusInternalServerError, "Failed to persist session")
-    }
-    c.SetCookie(&http.Cookie{
-        Name:     "user_session",
-        Value:    userSessionID,
-        Path:     "/",
-        HttpOnly: true,
-        Secure:   true,
-        SameSite: http.SameSiteLaxMode,
-        MaxAge:   int(s.sessionTTL.Seconds()),
-    })
+	if err := s.setUserSession(c, user.ID); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to create session")
+	}
     
     // If login is part of OIDC flow, mark auth request as done
     if authReqID := c.QueryParam("auth_request_id"); authReqID != "" {
@@ -335,11 +366,12 @@ func (s *Service) FinishLogin(c echo.Context) error {
         c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
     }
 
-    return c.JSON(http.StatusOK, map[string]string{
-        "status": "ok", 
-        "email": user.Email,
-        "redirect": redirectURL,
-    })
+	return c.JSON(http.StatusOK, map[string]string{
+		"status": "ok",
+		"email": user.Email,
+		"display_name": user.DisplayName,
+		"redirect": redirectURL,
+	})
 }
 
 func (s *Service) Logout(c echo.Context) error {
@@ -357,7 +389,34 @@ func (s *Service) Logout(c echo.Context) error {
         MaxAge:   -1,
     })
 
-    return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Service) DeleteAccount(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	sessionCookie, _ := c.Cookie("user_session")
+	if err := s.store.DeleteUser(userID); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to delete account")
+	}
+
+	if sessionCookie != nil && sessionCookie.Value != "" {
+		_ = s.redis.Del(c.Request().Context(), "sess:"+sessionCookie.Value).Err()
+	}
+	c.SetCookie(&http.Cookie{
+		Name:     "user_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Service) SessionUserID(c echo.Context) (string, bool) {
@@ -387,8 +446,51 @@ func (s *Service) SessionStatus(c echo.Context) error {
         })
     }
 
-    return c.JSON(http.StatusOK, map[string]any{
-        "authenticated": true,
-        "email": user.Email,
-    })
+	return c.JSON(http.StatusOK, map[string]any{
+		"authenticated": true,
+		"email": user.Email,
+		"display_name": user.DisplayName,
+		"profile_email": user.ProfileEmail,
+		"phone": user.Phone,
+		"share_profile": user.ShareProfile,
+		"email_verified": user.EmailVerified,
+		"phone_verified": user.PhoneVerified,
+	})
+}
+
+func (s *Service) GetProfile(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	user, err := s.store.GetUser(userID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "User not found")
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"display_name":  user.DisplayName,
+		"email":         user.ProfileEmail,
+		"phone":         user.Phone,
+		"share_profile": user.ShareProfile,
+		"email_verified": user.EmailVerified,
+		"phone_verified": user.PhoneVerified,
+	})
+}
+
+func (s *Service) UpdateProfile(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	var payload profilePayload
+	if err := c.Bind(&payload); err != nil {
+		return c.String(http.StatusBadRequest, "Invalid payload")
+	}
+	if err := s.store.UpdateProfile(userID, payload.DisplayName, payload.Email, payload.Phone, payload.ShareProfile); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to save profile")
+	}
+	return c.JSON(http.StatusOK, map[string]any{"status": "ok"})
 }

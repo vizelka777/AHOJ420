@@ -4,6 +4,14 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_email TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS share_profile BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_completed_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS credentials (
     id BYTEA PRIMARY KEY,             -- CredentialID
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -14,3 +22,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_used_at TIMESTAMPTZ
 );
+
+UPDATE users
+SET display_name = COALESCE(NULLIF(display_name, ''), 'Ahoj User')
+WHERE display_name IS NULL OR display_name = '';

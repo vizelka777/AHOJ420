@@ -96,7 +96,7 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 		AuthMethodPost:           true,
 		AuthMethodPrivateKeyJWT:  true,
 		GrantTypeRefreshToken:    true,
-		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail},
+		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 	}
 
 	provider, err := op.NewOpenIDProvider(
@@ -410,8 +410,25 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 		return err
 	}
 	userinfo.Subject = user.ID
-	userinfo.Email = user.Email
-	userinfo.EmailVerified = oidc.Bool(true)
+	for _, scope := range scopes {
+		switch scope {
+		case oidc.ScopeProfile:
+			if user.ShareProfile {
+				userinfo.Name = user.DisplayName
+				userinfo.PreferredUsername = user.DisplayName
+			}
+		case oidc.ScopeEmail:
+			if user.ShareProfile && user.ProfileEmail != "" {
+				userinfo.Email = user.ProfileEmail
+				userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
+			}
+		case oidc.ScopePhone:
+			if user.ShareProfile && user.Phone != "" {
+				userinfo.PhoneNumber = user.Phone
+				userinfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
+			}
+		}
+	}
 	return nil
 }
 
@@ -425,7 +442,34 @@ func (s *MemStorage) SetIntrospectionFromToken(ctx context.Context, userinfo *oi
 }
 
 func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, clientID string, scopes []string) (map[string]interface{}, error) {
-	return map[string]interface{}{}, nil
+	user, err := s.userStore.store.GetUser(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	claims := map[string]interface{}{}
+	if !user.ShareProfile {
+		return claims, nil
+	}
+
+	for _, scope := range scopes {
+		switch scope {
+		case oidc.ScopeProfile:
+			claims["name"] = user.DisplayName
+			claims["preferred_username"] = user.DisplayName
+		case oidc.ScopeEmail:
+			if user.ProfileEmail != "" {
+				claims["email"] = user.ProfileEmail
+				claims["email_verified"] = user.EmailVerified
+			}
+		case oidc.ScopePhone:
+			if user.Phone != "" {
+				claims["phone_number"] = user.Phone
+				claims["phone_number_verified"] = user.PhoneVerified
+			}
+		}
+	}
+	return claims, nil
 }
 
 func (s *MemStorage) GetKeyByIDAndClientID(ctx context.Context, keyID, clientID string) (*jose.JSONWebKey, error) {
