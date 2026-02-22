@@ -50,6 +50,7 @@ Optional for key rotation:
 - `OIDC_KEY_ID=key-current`
 - `OIDC_PREV_PRIVKEY_PATH=/run/secrets/oidc_private_key_prev.pem`
 - `OIDC_PREV_KEY_ID=key-prev`
+- `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (used when `mushroom-bff` client has no explicit `secrets` in JSON)
 
 If `AHOJ_ENV=dev` and key/crypto key are missing, ephemeral values are generated and tokens/cookies become invalid after restart.
 
@@ -140,14 +141,21 @@ Example confidential client:
 ```json
 [
   {
-    "id": "postman",
-    "redirect_uris": ["https://oauth.pstmn.io/v1/callback"],
+    "id": "mushroom-bff",
+    "redirect_uris": ["https://api.houbamzdar.cz/oidc/callback"],
     "confidential": true,
-    "secrets": ["secret"],
+    "secrets": ["use OIDC_CLIENT_MUSHROOM_BFF_SECRET in prod"],
     "require_pkce": true,
     "auth_method": "basic",
-    "grant_types": ["authorization_code"],
-    "response_types": ["code"]
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "scopes": ["openid", "profile", "email", "phone"]
   }
 ]
 ```
+
+## Claims Mapping (ID Token and /userinfo)
+By requested scopes:
+- `profile` -> `name`, `preferred_username` from `users.display_name`
+- `email` -> `email`, `email_verified` from `users.email`, `users.email_verified`
+- `phone` -> `phone_number`, `phone_number_verified` from `users.phone`, `users.phone_verified` (phone claims omitted when phone is empty)

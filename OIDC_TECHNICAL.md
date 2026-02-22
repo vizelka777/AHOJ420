@@ -9,6 +9,7 @@
 - JWKS (native): `/keys`
 - JWKS (compat alias): `/jwks`
 - UserInfo: `/userinfo`
+- SSO logout: `/logout` (and `/end_session`)
 
 ## Runtime Modes
 Environment variable: `AHOJ_ENV=dev|prod` (default `dev`).
@@ -66,6 +67,22 @@ Fields:
 - `auth_method`: `none|basic|post`
 - `grant_types`: e.g. `authorization_code`
 - `response_types`: e.g. `code`
+- `scopes`: e.g. `openid profile email phone` (defaults to these scopes if omitted)
+
+## Claims in ID Token and /userinfo
+Mapping from `users` table:
+- `sub` -> `users.id`
+- `name` -> `users.display_name`
+- `preferred_username` -> `users.display_name`
+- `email` -> `users.email`
+- `email_verified` -> `users.email_verified`
+- `phone_number` -> `users.phone` (only when non-empty)
+- `phone_number_verified` -> `users.phone_verified` (only when phone is present)
+
+Scope-based emission:
+- `profile` -> `name`, `preferred_username`
+- `email` -> `email`, `email_verified`
+- `phone` -> `phone_number`, `phone_number_verified`
 
 ## PKCE Enforcement
 For clients with `require_pkce=true`:
@@ -100,3 +117,21 @@ Now:
 - `OIDC_PRIVKEY_PATH` mounted read-only.
 - `OIDC_CRYPTO_KEY` set (32+ bytes).
 - Clients configured via JSON/file; public clients use `auth_method=none` + `require_pkce=true`.
+
+## Bunny BFF client example
+```json
+[
+  {
+    "id": "mushroom-bff",
+    "redirect_uris": ["https://api.houbamzdar.cz/oidc/callback"],
+    "confidential": true,
+    "require_pkce": true,
+    "auth_method": "basic",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "scopes": ["openid", "profile", "email", "phone"]
+  }
+]
+```
+
+Secret for `mushroom-bff` is read from `OIDC_CLIENT_MUSHROOM_BFF_SECRET` when `secrets` is not present in client config.
