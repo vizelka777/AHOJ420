@@ -1,0 +1,11 @@
+ahoj420.eu, www.ahoj420.eu {
+    @www host www.ahoj420.eu
+    redir @www https://ahoj420.eu{uri} 301
+
+    reverse_proxy backend:8080
+
+    header {
+        # WebAuthn security headers
+        Permissions-Policy "publickey-credentials-get=*"
+    }
+}

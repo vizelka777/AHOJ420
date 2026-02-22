@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login via Ahoj420</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f172a; color:#e2e8f0; display:flex; align-items:center; justify-content:center; height:100vh; }
+    .card { background:#111827; border:1px solid #1f2937; padding:24px; border-radius:12px; width:360px; box-shadow:0 10px 30px rgba(0,0,0,.3); }
+    button { width:100%; padding:12px; border:0; border-radius:8px; background:#38bdf8; color:#0f172a; font-weight:700; cursor:pointer; }
+    button:hover { background:#0ea5e9; }
+    .muted { color:#94a3b8; font-size:12px; margin-top:8px; }
+    .status { margin-top:12px; font-size:14px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Вход через Ahoj420</h2>
+    <button id="loginBtn">Войти</button>
+    <div class="status" id="status"></div>
+    <div class="muted">Будет редирект на Ahoj420 и обратно.</div>
+  </div>
+
+  <script>
+    const CLIENT_ID = "houbamzdar";
+    const REDIRECT_URI = "https://houbamzdar.cz/callback.html";
+    const ISSUER = "https://ahoj420.eu";
+
+    function randomString(len=24) {
+      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      let out = "";
+      for (let i=0;i<len;i++) out += chars[Math.floor(Math.random()*chars.length)];
+      return out;
+    }
+
+    document.getElementById("loginBtn").onclick = () => {
+      const state = randomString(24);
+      const nonce = randomString(24);
+      sessionStorage.setItem("oidc_state", state);
+      sessionStorage.setItem("oidc_nonce", nonce);
+
+      const url =
+        `${ISSUER}/authorize` +
+        `?client_id=${encodeURIComponent(CLIENT_ID)}` +
+        `&response_type=code` +
+        `&scope=openid` +
+        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&state=${encodeURIComponent(state)}` +
+        `&nonce=${encodeURIComponent(nonce)}`;
+
+      window.location.href = url;
+    };
+  </script>
+</body>
+</html>

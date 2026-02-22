@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ahoj420 - Passkey Auth</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/static/js/glue.js?v=20260127b"></script>
+</head>
+
+<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center font-sans">
+
+    <div class="bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-teal-400 to-blue-500">
+                Ahoj420
+            </h1>
+            <p class="text-gray-400 mt-2">The Passwordless Future</p>
+        </div>
+
+        <div id="guest-ui">
+            <!-- Tabs -->
+            <div class="flex border-b border-gray-700 mb-6">
+                <button onclick="switchMode('login')" id="tab-login"
+                    class="flex-1 py-2 text-blue-400 border-b-2 border-blue-400 font-medium">Sign In</button>
+                <button onclick="switchMode('register')" id="tab-register" class="flex-1 py-2 text-gray-500 font-medium">
+                    Register</button>
+            </div>
+
+            <!-- Registration Form -->
+            <div id="register-flow" class="hidden">
+                <h2 class="text-xl font-semibold mb-4 text-center">Create Passkey</h2>
+                <form class="space-y-4" onsubmit="handleRegister(event)">
+                    <button type="submit"
+                        class="w-full py-3 bg-gradient-to-r from-teal-500 to-blue-600 rounded-lg font-semibold hover:from-teal-400 hover:to-blue-500 transition shadow-lg shadow-teal-500/20">
+                        Create Passkey
+                    </button>
+                </form>
+            </div>
+
+            <!-- Login Form -->
+            <div id="login-flow">
+                <h2 class="text-xl font-semibold mb-4 text-center">Welcome Back</h2>
+                <form class="space-y-4" onsubmit="handleLogin(event)">
+                    <button type="submit"
+                        class="w-full py-3 bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg font-semibold hover:from-blue-500 hover:to-purple-500 transition shadow-lg shadow-blue-500/20">
+                        Sign In with Passkey
+                    </button>
+                </form>
+            </div>
+
+            <!-- Extra options -->
+            <div class="mt-6 space-y-3">
+                <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
+                    QR Login (coming soon)
+                </button>
+                <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
+                    Add Device (coming soon)
+                </button>
+            </div>
+        </div>
+
+        <div id="message" class="mt-4 text-center text-sm min-h-[20px]"></div>
+        <button id="logout-btn" onclick="handleLogout()"
+            class="hidden mt-3 w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
+            Logout
+        </button>
+    </div>
+
+    <script>
+        function switchMode(mode) {
+            const regFlow = document.getElementById('register-flow');
+            const loginFlow = document.getElementById('login-flow');
+            const tabReg = document.getElementById('tab-register');
+            const tabLogin = document.getElementById('tab-login');
+            const msg = document.getElementById('message');
+
+            msg.innerText = ""; // clear messages
+
+            if (mode === 'register') {
+                regFlow.classList.remove('hidden');
+                loginFlow.classList.add('hidden');
+                tabReg.className = "flex-1 py-2 text-teal-400 border-b-2 border-teal-400 font-medium";
+                tabLogin.className = "flex-1 py-2 text-gray-500 font-medium";
+            } else {
+                regFlow.classList.add('hidden');
+                loginFlow.classList.remove('hidden');
+                tabReg.className = "flex-1 py-2 text-gray-500 font-medium";
+                tabLogin.className = "flex-1 py-2 text-blue-400 border-b-2 border-blue-400 font-medium";
+            }
+        }
+
+        let conditionalAbort = null;
+        let conditionalInFlight = false;
+
+        async function handleRegister(e) {
+            e.preventDefault();
+            const email = "";
+            showMessage("Requesting creation...", "text-yellow-400");
+            if (conditionalAbort) {
+                conditionalAbort.abort();
+                conditionalAbort = null;
+                conditionalInFlight = false;
+            }
+
+            try {
+                await registerUser(email);
+                showMessage("Success! Passkey created.", "text-green-400");
+            } catch (err) {
+                console.error(err);
+                showMessage("Error: " + err.message, "text-red-400");
+            }
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const email = "";
+            const params = new URLSearchParams(window.location.search);
+            const authRequestID = params.get("auth_request_id");
+            showMessage("Requesting assertion...", "text-yellow-400");
+            if (conditionalAbort) {
+                conditionalAbort.abort();
+                conditionalAbort = null;
+                conditionalInFlight = false;
+            }
+
+            try {
+                const res = await loginUser(email, authRequestID);
+                showMessage("Logged in as " + res.email, "text-green-400");
+                const params = new URLSearchParams(window.location.search);
+                const returnTo = params.get("return_to");
+                if (returnTo) {
+                    window.location.href = returnTo;
+                }
+            } catch (err) {
+                console.error(err);
+                showMessage("Error: " + err.message, "text-red-400");
+            }
+        }
+
+        async function tryConditionalLogin() {
+            const logoutVisible = !document.getElementById('logout-btn').classList.contains('hidden');
+            if (logoutVisible) return;
+            const params = new URLSearchParams(window.location.search);
+            if (params.get("mode") === "register") return;
+
+            if (!window.PublicKeyCredential || !PublicKeyCredential.isConditionalMediationAvailable) {
+                return;
+            }
+
+            let conditionalAvailable = false;
+            try {
+                conditionalAvailable = await PublicKeyCredential.isConditionalMediationAvailable();
+            } catch {
+                conditionalAvailable = false;
+            }
+            if (!conditionalAvailable) {
+                return;
+            }
+
+            try {
+                if (conditionalInFlight) return;
+                conditionalInFlight = true;
+                conditionalAbort = new AbortController();
+
+                // Fetch options for conditional login
+                const beginRes = await fetch('/auth/login/begin');
+                if (!beginRes.ok) {
+                    conditionalInFlight = false;
+                    return;
+                }
+                const options = await beginRes.json();
+                options.publicKey.challenge = base64URLToBuffer(options.publicKey.challenge);
+                if (options.publicKey.allowCredentials) {
+                    options.publicKey.allowCredentials.forEach(cred => {
+                        cred.id = base64URLToBuffer(cred.id);
+                    });
+                }
+
+                const credential = await navigator.credentials.get({
+                    publicKey: options.publicKey,
+                    mediation: "conditional",
+                    signal: conditionalAbort.signal,
+                });
+
+                if (!credential) {
+                    conditionalInFlight = false;
+                    return;
+                }
+
+                showMessage("Signing in...", "text-yellow-400");
+                const res = await finishLoginWithCredential(credential, params.get("auth_request_id"));
+                showMessage("Logged in as " + res.email, "text-green-400");
+                conditionalInFlight = false;
+
+                const returnTo = params.get("return_to");
+                if (returnTo) {
+                    window.location.href = returnTo;
+                }
+            } catch (err) {
+                conditionalInFlight = false;
+                // Ignore conditional errors; user can use manual login/register
+            }
+        }
+
+        function showMessage(text, colorClass) {
+            const msg = document.getElementById('message');
+            msg.innerText = text;
+            msg.className = "mt-4 text-center text-sm " + colorClass;
+        }
+
+        async function handleLogout() {
+            try {
+                const res = await fetch('/auth/logout', { method: 'POST' });
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+                applySessionState(false, "");
+                showMessage("Logged out", "text-green-400");
+                history.replaceState({}, "", "/");
+            } catch (err) {
+                showMessage("Logout error: " + err.message, "text-red-400");
+            }
+        }
+
+        function applySessionState(authenticated, email) {
+            const guestUI = document.getElementById('guest-ui');
+            const logoutBtn = document.getElementById('logout-btn');
+            if (authenticated) {
+                guestUI.classList.add('hidden');
+                logoutBtn.classList.remove('hidden');
+                showMessage("Session active: " + email, "text-green-400");
+                return;
+            }
+            guestUI.classList.remove('hidden');
+            logoutBtn.classList.add('hidden');
+        }
+
+        async function loadSessionState() {
+            try {
+                const res = await fetch('/auth/session');
+                if (!res.ok) return;
+                const data = await res.json();
+                applySessionState(Boolean(data.authenticated), data.email || "");
+            } catch (_) {
+                applySessionState(false, "");
+            }
+        }
+
+        // Resolve session state first, then conditional login.
+        loadSessionState().then(() => tryConditionalLogin());
+    </script>
+</body>
+
+</html>

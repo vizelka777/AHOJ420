@@ -1,0 +1,5 @@
+Reminder:
+- Before production, close external port 8080 (backend) by removing its ports mapping in docker-compose.yml
+- Keep access via Caddy on 80/443 only
+- Postgres/Redis ports already closed (no external ports)
+- .env contains real values at the end; replace or remove before publishing

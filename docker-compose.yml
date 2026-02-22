@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ahoj" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - postgres
+      - redis
+      - backend
+
+  backend:
+    build: .
+    environment:
+      - POSTGRES_URL=${POSTGRES_URL}
+      - REDIS_ADDR=${REDIS_ADDR}
+      - RP_ID=${RP_ID}
+      - RP_ORIGIN=${RP_ORIGIN}
+      - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES}
+      - OIDC_PRIVKEY_PATH=/run/secrets/oidc_private_key.pem
+      - OIDC_CRYPTO_KEY=${OIDC_CRYPTO_KEY}
+    volumes:
+      - .:/app
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

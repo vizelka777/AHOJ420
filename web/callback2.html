@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"></head>
+<body>
+  <pre id="out"></pre>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    const expectedState = sessionStorage.getItem("oidc_state");
+    const ok = state && expectedState && state === expectedState;
+    document.getElementById("out").textContent =
+      "code: " + code + "\n" +
+      "state: " + state + "\n" +
+      "state_ok: " + ok;
+  </script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.env
+secrets/
+tmp/
+cookies*.txt
+CHAT_CONTINUE_NOTES_*.md
+otladka/

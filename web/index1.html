@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login via Ahoj420 (client1)</title>
+</head>
+<body>
+  <button id="loginBtn">Login (client1)</button>
+  <pre id="out"></pre>
+
+  <script>
+    const CLIENT_ID = "lient1";
+    const REDIRECT_URI = "https://houbamzdar.cz/callback1.html";
+    const ISSUER = "https://ahoj420.eu";
+
+    function randomString(len=24) {
+      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      let out = "";
+      for (let i=0;i<len;i++) out += chars[Math.floor(Math.random()*chars.length)];
+      return out;
+    }
+
+    document.getElementById("loginBtn").onclick = () => {
+      const state = randomString(24);
+      const nonce = randomString(24);
+      sessionStorage.setItem("oidc_state", state);
+      sessionStorage.setItem("oidc_nonce", nonce);
+
+      const url =
+        `${ISSUER}/authorize` +
+        `?client_id=${encodeURIComponent(CLIENT_ID)}` +
+        `&response_type=code` +
+        `&scope=openid` +
+        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+        `&state=${encodeURIComponent(state)}` +
+        `&nonce=${encodeURIComponent(nonce)}`;
+
+      window.location.href = url;
+    };
+  </script>
+</body>
+</html>
