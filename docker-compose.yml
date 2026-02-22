@@ -52,6 +52,7 @@ services:
       - OIDC_PREV_PRIVKEY_PATH=${OIDC_PREV_PRIVKEY_PATH}
       - OIDC_PREV_KEY_ID=${OIDC_PREV_KEY_ID}
       - OIDC_CRYPTO_KEY=${OIDC_CRYPTO_KEY}
+      - OIDC_CLIENT_MUSHROOM_BFF_SECRET=${OIDC_CLIENT_MUSHROOM_BFF_SECRET}
       # choose one source for clients:
       - OIDC_CLIENTS_FILE=${OIDC_CLIENTS_FILE:-/run/secrets/oidc_clients.json}
       # - OIDC_CLIENTS_JSON=[{"id":"client2","redirect_uris":["https://houbamzdar.cz/callback2.html"],"confidential":false,"require_pkce":true,"auth_method":"none","grant_types":["authorization_code"],"response_types":["code"]}]

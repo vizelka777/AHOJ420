@@ -101,6 +101,8 @@ func main() {
 	e.POST("/auth/login/finish", authService.FinishLogin, sensitiveLimiter)
 	e.POST("/auth/logout", authService.Logout)
 	e.POST("/auth/delete-account", authService.DeleteAccount)
+	e.GET("/logout", authService.LogoutRedirect)
+	e.GET("/end_session", authService.LogoutRedirect)
 	e.GET("/auth/session", authService.SessionStatus)
 	e.GET("/auth/profile", authService.GetProfile)
 	e.POST("/auth/profile", authService.UpdateProfile)
