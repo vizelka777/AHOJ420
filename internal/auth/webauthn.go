@@ -634,7 +634,13 @@ func (s *Service) UpdateProfile(c echo.Context) error {
 	if err := c.Bind(&payload); err != nil {
 		return c.String(http.StatusBadRequest, "Invalid payload")
 	}
-	if err := s.store.UpdateProfile(userID, payload.DisplayName, payload.Email, payload.Phone, payload.ShareProfile); err != nil {
+
+	normalized, err := normalizeProfilePayload(payload)
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
+
+	if err := s.store.UpdateProfile(userID, normalized.DisplayName, normalized.Email, normalized.Phone, normalized.ShareProfile); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to save profile")
 	}
 	return c.JSON(http.StatusOK, map[string]any{"status": "ok"})

@@ -17,9 +17,12 @@ import (
 )
 
 func (s *Service) RequestRecovery(c echo.Context) error {
-	email := c.FormValue("email")
+	email, err := normalizeEmail(c.FormValue("email"))
 	if email == "" {
 		return c.String(http.StatusBadRequest, "Email required")
+	}
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
 	}
 
 	// 1. Check if user exists
