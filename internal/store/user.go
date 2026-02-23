@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
@@ -18,15 +19,19 @@ func New(db *sql.DB) *Store {
 }
 
 type User struct {
-	ID            string
-	Email         string
-	DisplayName   string
-	ProfileEmail  string
-	Phone         string
-	ShareProfile  bool
-	EmailVerified bool
-	PhoneVerified bool
-	Credentials   []webauthn.Credential
+	ID              string
+	Email           string
+	DisplayName     string
+	ProfileEmail    string
+	Phone           string
+	ShareProfile    bool
+	EmailVerified   bool
+	PhoneVerified   bool
+	AvatarKey       string
+	AvatarUpdatedAt *time.Time
+	AvatarMIME      string
+	AvatarBytes     int64
+	Credentials     []webauthn.Credential
 }
 
 // WebAuthnUser interface implementation
@@ -107,7 +112,11 @@ func (s *Store) GetUser(id string) (*User, error) {
 			COALESCE(phone, ''),
 			COALESCE(share_profile, false),
 			COALESCE(email_verified, false),
-			COALESCE(phone_verified, false)
+			COALESCE(phone_verified, false),
+			COALESCE(avatar_key, ''),
+			avatar_updated_at,
+			COALESCE(avatar_mime, ''),
+			COALESCE(avatar_bytes, 0)
 		FROM users
 		WHERE id = $1
 	`, id).Scan(
@@ -119,6 +128,10 @@ func (s *Store) GetUser(id string) (*User, error) {
 		&user.ShareProfile,
 		&user.EmailVerified,
 		&user.PhoneVerified,
+		&user.AvatarKey,
+		&user.AvatarUpdatedAt,
+		&user.AvatarMIME,
+		&user.AvatarBytes,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get user: %w", err)
@@ -215,5 +228,18 @@ func (s *Store) UpdateProfile(userID, displayName, profileEmail, phone string, s
 
 func (s *Store) DeleteUser(userID string) error {
 	_, err := s.db.Exec(`DELETE FROM users WHERE id = $1`, userID)
+	return err
+}
+
+func (s *Store) UpdateAvatar(userID, avatarKey, avatarMIME string, avatarBytes int64) error {
+	_, err := s.db.Exec(`
+		UPDATE users
+		SET
+			avatar_key = $1,
+			avatar_updated_at = NOW(),
+			avatar_mime = $2,
+			avatar_bytes = $3
+		WHERE id = $4
+	`, strings.TrimSpace(avatarKey), strings.TrimSpace(avatarMIME), avatarBytes, userID)
 	return err
 }

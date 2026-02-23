@@ -6,6 +6,7 @@ toolchain go1.24.12
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/chai2010/webp v1.4.0
 	github.com/go-jose/go-jose/v4 v4.0.5
 	github.com/go-webauthn/webauthn v0.10.0
 	github.com/google/uuid v1.6.0
@@ -13,6 +14,7 @@ require (
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.17.3
 	github.com/zitadel/oidc/v3 v3.45.3
+	golang.org/x/image v0.36.0
 	golang.org/x/time v0.8.0
 )
 
@@ -50,5 +52,5 @@ require (
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 )

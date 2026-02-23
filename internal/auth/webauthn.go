@@ -17,6 +17,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/houbamydar/AHOJ420/internal/avatar"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
 )
@@ -27,6 +28,15 @@ type Service struct {
 	redis      *redis.Client
 	provider   *mp.Provider
 	sessionTTL time.Duration
+	avatarCfg  avatarConfig
+}
+
+type avatarConfig struct {
+	publicBase string
+	endpoint   string
+	zone       string
+	accessKey  string
+	maxBytes   int64
 }
 
 type profilePayload struct {
@@ -62,7 +72,21 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		redis:      r,
 		provider:   p,
 		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
+		avatarCfg: avatarConfig{
+			publicBase: strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE")),
+			endpoint:   strings.TrimSpace(defaultString(os.Getenv("BUNNY_STORAGE_ENDPOINT"), "storage.bunnycdn.com")),
+			zone:       strings.TrimSpace(os.Getenv("BUNNY_STORAGE_ZONE")),
+			accessKey:  strings.TrimSpace(os.Getenv("BUNNY_STORAGE_ACCESS_KEY")),
+			maxBytes:   2 * 1024 * 1024,
+		},
 	}, nil
+}
+
+func defaultString(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 func newSessionID() (string, error) {
@@ -560,6 +584,7 @@ func (s *Service) SessionStatus(c echo.Context) error {
 		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
+		"picture_url":    avatar.BuildPublicURL(s.avatarCfg.publicBase, user.AvatarKey, user.AvatarUpdatedAt),
 	})
 }
 
@@ -588,6 +613,7 @@ func (s *Service) GetProfile(c echo.Context) error {
 		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
+		"picture_url":    avatar.BuildPublicURL(s.avatarCfg.publicBase, user.AvatarKey, user.AvatarUpdatedAt),
 	})
 }
 
