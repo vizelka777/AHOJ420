@@ -52,6 +52,12 @@ Optional for key rotation:
 - `OIDC_PREV_KEY_ID=key-prev`
 - `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (used when `mushroom-bff` client has no explicit `secrets` in JSON)
 
+Avatar storage:
+- `AVATAR_PUBLIC_BASE=https://avatar.ahoj420.eu/` (required in `prod` to emit `picture` claim)
+- `BUNNY_STORAGE_ENDPOINT=storage.bunnycdn.com` (default if empty)
+- `BUNNY_STORAGE_ZONE=avatar420`
+- `BUNNY_STORAGE_ACCESS_KEY=<bunny-storage-access-key>`
+
 If `AHOJ_ENV=dev` and key/crypto key are missing, ephemeral values are generated and tokens/cookies become invalid after restart.
 
 ## Caddy
@@ -156,6 +162,11 @@ Example confidential client:
 
 ## Claims Mapping (ID Token and /userinfo)
 By requested scopes:
-- `profile` -> `name`, `preferred_username` from `users.display_name`
+- `profile` -> `name`, `preferred_username` from `users.display_name`, `picture` from avatar storage URL
 - `email` -> `email`, `email_verified` from `users.email`, `users.email_verified`
 - `phone` -> `phone_number`, `phone_number_verified` from `users.phone`, `users.phone_verified` (phone claims omitted when phone is empty)
+
+`picture` is returned as:
+- `https://avatar.ahoj420.eu/avatars/<user_id>.webp?v=<avatar_updated_at_unix>`
+
+The `?v=` value is added to force cache refresh after avatar updates.

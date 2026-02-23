@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/houbamydar/AHOJ420/internal/avatar"
 	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
@@ -63,7 +64,11 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 	prodMode := envMode == envProd
 
 	userStore := &UserStore{store: s}
-	storage, err := NewMemStorage(r, userStore, prodMode)
+	avatarPublicBase := strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE"))
+	if prodMode && avatarPublicBase == "" {
+		return nil, errors.New("AVATAR_PUBLIC_BASE must be set in prod")
+	}
+	storage, err := NewMemStorage(r, userStore, prodMode, avatarPublicBase)
 	if err != nil {
 		return nil, err
 	}
@@ -300,11 +305,12 @@ type MemStorage struct {
 	clients    map[string]*StaticClient
 	redis      *redis.Client
 	userStore  *UserStore
+	avatarBase string
 	signingKey *SimpleKey
 	keys       []*SimpleKey
 }
 
-func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool) (*MemStorage, error) {
+func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool, avatarBase string) (*MemStorage, error) {
 	clients, err := loadClients(prodMode)
 	if err != nil {
 		return nil, err
@@ -312,9 +318,10 @@ func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool) (*MemStorage
 	log.Printf("OIDC clients loaded: %s", strings.Join(sortedClientIDs(clients), ", "))
 
 	return &MemStorage{
-		clients:   clients,
-		redis:     rdb,
-		userStore: us,
+		clients:    clients,
+		redis:      rdb,
+		userStore:  us,
+		avatarBase: strings.TrimSpace(avatarBase),
 	}, nil
 }
 
@@ -409,6 +416,16 @@ func defaultDevClients() map[string]*StaticClient {
 			AuthMethod:    "none",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+		},
+		{
+			ID:            "mushroom-bff",
+			Confidential:  true,
+			RequirePKCE:   true,
+			AuthMethod:    "basic",
+			GrantTypes:    []string{"authorization_code", "refresh_token"},
+			ResponseTypes: []string{"code"},
+			RedirectURIs:  []string{"https://api.houbamzdar.cz/oidc/callback"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 		},
 	}
 
@@ -799,6 +816,9 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 		case oidc.ScopeProfile:
 			userinfo.Name = user.DisplayName
 			userinfo.PreferredUsername = user.DisplayName
+			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
+				userinfo.Picture = picture
+			}
 		case oidc.ScopeEmail:
 			userinfo.Email = user.Email
 			userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
@@ -833,6 +853,9 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 		case oidc.ScopeProfile:
 			claims["name"] = user.DisplayName
 			claims["preferred_username"] = user.DisplayName
+			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
+				claims["picture"] = picture
+			}
 		case oidc.ScopeEmail:
 			claims["email"] = user.Email
 			claims["email_verified"] = user.EmailVerified

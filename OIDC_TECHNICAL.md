@@ -20,6 +20,7 @@ Environment variable: `AHOJ_ENV=dev|prod` (default `dev`).
 - One client config source must be provided:
   - `OIDC_CLIENTS_JSON`, or
   - `OIDC_CLIENTS_FILE`
+- `AVATAR_PUBLIC_BASE` must be set (used for OIDC `picture` claim URL).
 
 ### dev behavior
 - If signing key is missing/invalid, an ephemeral RSA key is generated.
@@ -32,6 +33,7 @@ In-memory OIDC state was removed for auth requests/codes.
 Redis keys:
 - `oidc:ar:<id>` -> serialized auth request (`TTL 10m`)
 - `oidc:code:<code>` -> auth request id (`TTL 10m`)
+- `oidc:ar_code:<id>` -> last issued auth code for request (`TTL 10m`)
 
 Used by storage methods:
 - `CreateAuthRequest` -> write `oidc:ar:<id>`
@@ -78,11 +80,27 @@ Mapping from `users` table:
 - `email_verified` -> `users.email_verified`
 - `phone_number` -> `users.phone` (only when non-empty)
 - `phone_number_verified` -> `users.phone_verified` (only when phone is present)
+- `picture` -> `AVATAR_PUBLIC_BASE + users.avatar_key + "?v=<avatar_updated_at_unix>"` (only when avatar exists)
 
 Scope-based emission:
-- `profile` -> `name`, `preferred_username`
+- `profile` -> `name`, `preferred_username`, `picture`
 - `email` -> `email`, `email_verified`
 - `phone` -> `phone_number`, `phone_number_verified`
+
+Avatar upload endpoint:
+- `POST /auth/avatar` (authenticated via `user_session`)
+- input: multipart `file` (jpg/png/webp, max 2 MB)
+- server normalizes to `256x256` webp and uploads to Bunny Storage
+- DB updates:
+  - `users.avatar_key`
+  - `users.avatar_updated_at`
+  - `users.avatar_mime`
+  - `users.avatar_bytes`
+
+Required upload env:
+- `BUNNY_STORAGE_ENDPOINT` (default `storage.bunnycdn.com`)
+- `BUNNY_STORAGE_ZONE`
+- `BUNNY_STORAGE_ACCESS_KEY`
 
 ## PKCE Enforcement
 For clients with `require_pkce=true`:
