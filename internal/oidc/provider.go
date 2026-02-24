@@ -819,10 +819,13 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
 				userinfo.Picture = picture
 			}
-		case oidc.ScopeEmail:
-			userinfo.Email = user.Email
-			userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
-		case oidc.ScopePhone:
+		                case oidc.ScopeEmail:
+		                        email := user.Email
+		                        if user.ProfileEmail != "" {
+		                                email = user.ProfileEmail
+		                        }
+		                        userinfo.Email = email
+		                        userinfo.EmailVerified = oidc.Bool(user.EmailVerified)		case oidc.ScopePhone:
 			if strings.TrimSpace(user.Phone) != "" {
 				userinfo.PhoneNumber = user.Phone
 				userinfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
@@ -856,10 +859,13 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
 				claims["picture"] = picture
 			}
-		case oidc.ScopeEmail:
-			claims["email"] = user.Email
-			claims["email_verified"] = user.EmailVerified
-		case oidc.ScopePhone:
+		                case oidc.ScopeEmail:
+		                        email := user.Email
+		                        if user.ProfileEmail != "" {
+		                                email = user.ProfileEmail
+		                        }
+		                        claims["email"] = email
+		                        claims["email_verified"] = user.EmailVerified		case oidc.ScopePhone:
 			if strings.TrimSpace(user.Phone) != "" {
 				claims["phone_number"] = user.Phone
 				claims["phone_number_verified"] = user.PhoneVerified
