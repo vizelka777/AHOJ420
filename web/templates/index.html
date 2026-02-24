@@ -175,6 +175,7 @@
 
     <script>
         let pendingOidcReturn = null;
+        let originalAccountProfile = null;
 
         function switchMode(mode) {
             const regFlow = document.getElementById('register-flow');
@@ -337,6 +338,11 @@
             msg.className = "mt-4 text-center text-sm " + colorClass;
         }
 
+        function isHoubamzdarProfileEditFlow() {
+            const params = new URLSearchParams(window.location.search);
+            return params.get("edit_profile") === "1" && (params.get("client_host") || "").trim() === "houbamzdar.cz";
+        }
+
         function renderOidcReturnButton() {
             const btn = document.getElementById('oidc-return-btn');
             if (!pendingOidcReturn || !pendingOidcReturn.url) {
@@ -359,9 +365,12 @@
             const returnTo = params.get("return_to");
             const authRequestID = params.get("auth_request_id");
             const clientHost = (params.get("client_host") || "client").trim();
+            const editProfile = params.get("edit_profile") === "1";
 
             let url = "";
-            if (returnTo) {
+            if (editProfile && clientHost === "houbamzdar.cz") {
+                url = "https://houbamzdar.cz/me.html";
+            } else if (returnTo) {
                 url = returnTo;
             } else if (authRequestID) {
                 url = "/authorize/callback?id=" + encodeURIComponent(authRequestID);
@@ -446,6 +455,12 @@
             document.getElementById('account-email').value = profile.profile_email || profile.email || "";
             document.getElementById('account-phone').value = profile.phone || "";
             document.getElementById('account-share').checked = Boolean(profile.share_profile);
+            originalAccountProfile = {
+                display_name: (profile.display_name || "").trim(),
+                email: (profile.profile_email || profile.email || "").trim(),
+                phone: (profile.phone || "").trim(),
+                share_profile: Boolean(profile.share_profile),
+            };
             setAvatar(profile.picture_url || "");
             renderVerificationStatus({
                 email_verified: Boolean(profile.email_verified),
@@ -484,11 +499,34 @@
                 document.getElementById('account-email').value = profile.email || "";
                 document.getElementById('account-phone').value = profile.phone || "";
                 document.getElementById('account-share').checked = Boolean(profile.share_profile);
+                originalAccountProfile = {
+                    display_name: (profile.display_name || "").trim(),
+                    email: (profile.email || "").trim(),
+                    phone: (profile.phone || "").trim(),
+                    share_profile: Boolean(profile.share_profile),
+                };
                 setAvatar(profile.picture_url || "");
                 renderVerificationStatus(profile);
             } catch (_) {
                 // no-op
             }
+        }
+
+        function collectAccountPayload() {
+            return {
+                display_name: document.getElementById('account-name').value.trim(),
+                email: document.getElementById('account-email').value.trim(),
+                phone: document.getElementById('account-phone').value.trim(),
+                share_profile: document.getElementById('account-share').checked
+            };
+        }
+
+        function accountProfileChanged(payload) {
+            if (!originalAccountProfile) return true;
+            return payload.display_name !== originalAccountProfile.display_name ||
+                payload.email !== originalAccountProfile.email ||
+                payload.phone !== originalAccountProfile.phone ||
+                payload.share_profile !== originalAccountProfile.share_profile;
         }
 
         function setAvatar(url) {
@@ -527,24 +565,30 @@
 
         async function saveAccountProfile(e) {
             e.preventDefault();
-            const payload = {
-                display_name: document.getElementById('account-name').value.trim(),
-                email: document.getElementById('account-email').value.trim(),
-                phone: document.getElementById('account-phone').value.trim(),
-                share_profile: document.getElementById('account-share').checked
-            };
+            const payload = collectAccountPayload();
+            const changed = accountProfileChanged(payload);
+
             try {
-                const res = await fetch('/auth/profile', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (!res.ok) {
-                    throw new Error(await res.text());
+                if (changed) {
+                    const res = await fetch('/auth/profile', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    if (!res.ok) {
+                        throw new Error(await res.text());
+                    }
+                    await loadProfileForAccountUI();
+                    applySessionState(true, payload.display_name || payload.email || "User");
+                    showMessage("Profile saved.", "text-green-400");
                 }
-                await loadProfileForAccountUI();
-                applySessionState(true, payload.display_name || payload.email || "User");
-                showMessage("Profile saved.", "text-green-400");
+                if (isHoubamzdarProfileEditFlow()) {
+                    window.location.href = "https://houbamzdar.cz/reauth.html";
+                    return;
+                }
+                if (!changed) {
+                    showMessage("No profile changes.", "text-yellow-400");
+                }
             } catch (err) {
                 showMessage("Profile save failed: " + err.message, "text-red-400");
             }
