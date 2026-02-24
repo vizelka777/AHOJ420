@@ -116,8 +116,8 @@
                         </button>
                     </div>
                 </div>
-                <label class="flex items-start gap-2 text-sm text-gray-300">
-                    <input id="account-share" type="checkbox" class="mt-1">
+                <label class="flex items-start gap-2 text-sm text-gray-300 hidden">
+                    <input id="account-share" type="checkbox" class="mt-1" checked>
                     <span>Передавать эти данные в сторонние сервисы при OIDC входе.</span>
                 </label>
                 <button type="submit"
@@ -132,6 +132,10 @@
         </div>
 
         <div id="message" class="mt-4 text-center text-sm min-h-[20px]"></div>
+        <button id="oidc-return-btn" onclick="resumeOidcReturn()"
+            class="hidden mt-2 w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-300 hover:text-teal-200 hover:border-teal-400 transition">
+            Вернуться к клиенту
+        </button>
         <button id="logout-btn" onclick="handleLogout()"
             class="hidden mt-3 w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
             Logout
@@ -151,8 +155,8 @@
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
                 <input id="profile-phone" type="tel" placeholder="Телефон (опционально)"
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
-                <label class="flex items-start gap-2 text-sm text-gray-300">
-                    <input id="profile-share" type="checkbox" class="mt-1">
+                <label class="flex items-start gap-2 text-sm text-gray-300 hidden">
+                    <input id="profile-share" type="checkbox" class="mt-1" checked>
                     <span>Разрешаю передавать эти данные при входе на другие сервисы.</span>
                 </label>
                 <div class="flex gap-2 pt-1">
@@ -170,6 +174,8 @@
     </div>
 
     <script>
+        let pendingOidcReturn = null;
+
         function switchMode(mode) {
             const regFlow = document.getElementById('register-flow');
             const loginFlow = document.getElementById('login-flow');
@@ -209,14 +215,17 @@
                 const res = await registerUser(email);
                 showMessage("Passkey created. You are logged in.", "text-green-400");
                 applySessionState(true, res.display_name || res.email || "User");
-                openProfileModal({
-                    display_name: res.display_name || "",
-                    email: "",
-                    phone: "",
-                    share_profile: false
-                });
-                if (res.redirect) {
-                    window.location.href = res.redirect;
+                await loadProfileForAccountUI();
+                if (res.manual_return_required && res.redirect) {
+                    pendingOidcReturn = {
+                        url: res.redirect,
+                        host: (res.return_client_host || "client").trim()
+                    };
+                    renderOidcReturnButton();
+                    showMessage("Профиль сохраните при желании, затем вернитесь в " + pendingOidcReturn.host, "text-green-400");
+                } else {
+                    pendingOidcReturn = null;
+                    renderOidcReturnButton();
                 }
             } catch (err) {
                 console.error(err);
@@ -229,6 +238,8 @@
             const email = "";
             const params = new URLSearchParams(window.location.search);
             const authRequestID = params.get("auth_request_id");
+            const isEditProfile = params.get("edit_profile") === "1";
+
             showMessage("Requesting assertion...", "text-yellow-400");
             if (conditionalAbort) {
                 conditionalAbort.abort();
@@ -240,11 +251,17 @@
                 const res = await loginUser(email, authRequestID);
                 showMessage("Logged in as " + res.email, "text-green-400");
                 applySessionState(true, res.display_name || res.email || "User");
+                
                 if (res.redirect && res.redirect !== "/") {
+                    if (isEditProfile) {
+                        // Stay on page to allow editing, loadSessionState will handle the return button
+                        await loadSessionState();
+                        showMessage("Вы вошли. Можете обновить профиль и нажать кнопку возврата.", "text-green-400");
+                        return;
+                    }
                     window.location.href = res.redirect;
                     return;
                 }
-                const params = new URLSearchParams(window.location.search);
                 const returnTo = params.get("return_to");
                 if (returnTo) {
                     window.location.href = returnTo;
@@ -328,6 +345,41 @@
             msg.className = "mt-4 text-center text-sm " + colorClass;
         }
 
+        function renderOidcReturnButton() {
+            const btn = document.getElementById('oidc-return-btn');
+            if (!pendingOidcReturn || !pendingOidcReturn.url) {
+                btn.classList.add('hidden');
+                btn.innerText = "Вернуться к клиенту";
+                return;
+            }
+            btn.innerText = "Вернуться на " + pendingOidcReturn.host;
+            btn.classList.remove('hidden');
+        }
+
+        function resumeOidcReturn() {
+            if (!pendingOidcReturn || !pendingOidcReturn.url) return;
+            window.location.href = pendingOidcReturn.url;
+        }
+
+        function initializePendingOidcReturnFromQuery() {
+            if (pendingOidcReturn && pendingOidcReturn.url) return;
+            const params = new URLSearchParams(window.location.search);
+            const returnTo = params.get("return_to");
+            const authRequestID = params.get("auth_request_id");
+            const clientHost = (params.get("client_host") || "client").trim();
+
+            let url = "";
+            if (returnTo) {
+                url = returnTo;
+            } else if (authRequestID) {
+                url = "/authorize/callback?id=" + encodeURIComponent(authRequestID);
+            }
+            if (!url) return;
+
+            pendingOidcReturn = { url, host: clientHost };
+            renderOidcReturnButton();
+        }
+
         async function handleLogout() {
             try {
                 const res = await fetch('/auth/logout', { method: 'POST' });
@@ -335,6 +387,8 @@
                     throw new Error(await res.text());
                 }
                 closeProfileModal();
+                pendingOidcReturn = null;
+                renderOidcReturnButton();
                 applySessionState(false, "");
                 showMessage("Logged out", "text-green-400");
                 history.replaceState({}, "", "/");
@@ -374,6 +428,8 @@
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
+            pendingOidcReturn = null;
+            renderOidcReturnButton();
         }
 
         async function loadSessionState() {
@@ -384,8 +440,14 @@
                 const authenticated = Boolean(data.authenticated);
                 applySessionState(authenticated, data.display_name || data.email || "");
                 if (authenticated) {
+                    initializePendingOidcReturnFromQuery();
                     populateAccountUI(data);
                     await loadProfileForAccountUI();
+
+                    const params = new URLSearchParams(window.location.search);
+                    if (params.get("edit_profile") === "1") {
+                        showMessage("Вы можете обновить свои данные в профиле ниже", "text-teal-400");
+                    }
                 }
             } catch (_) {
                 applySessionState(false, "");
@@ -542,6 +604,9 @@
                 showMessage("Profile saved.", "text-green-400");
                 if (payload.display_name) {
                     applySessionState(true, payload.display_name);
+                }
+                if (pendingOidcReturn && pendingOidcReturn.url) {
+                    showMessage("Профиль сохранен. Нажмите «Вернуться на " + pendingOidcReturn.host + "».", "text-green-400");
                 }
             } catch (err) {
                 showMessage("Profile save failed: " + err.message, "text-red-400");

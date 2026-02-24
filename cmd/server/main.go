@@ -121,7 +121,10 @@ func main() {
 	e.Any("/userinfo", oidcHandler)
 
 	e.GET("/authorize", func(c echo.Context) error {
-		if userID, ok := authService.SessionUserID(c); ok {
+		editProfile := c.QueryParam("edit_profile") == "1"
+		userID, ok := authService.SessionUserID(c)
+
+		if ok && !editProfile {
 			if authService.InRecoveryMode(c) {
 				return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
 			}
@@ -146,6 +149,17 @@ func main() {
 			if authRequestID == "" {
 				return
 			}
+
+			q := u.Query()
+			if clientHost, hostErr := oidcProvider.AuthRequestClientHost(authRequestID); hostErr == nil && clientHost != "" {
+				q.Set("client_host", clientHost)
+			}
+			if editProfile {
+				q.Set("edit_profile", "1")
+			}
+			u.RawQuery = q.Encode()
+			c.Response().Header().Set(echo.HeaderLocation, u.String())
+
 			c.SetCookie(&http.Cookie{
 				Name:     "oidc_auth_request",
 				Value:    authRequestID,

@@ -222,6 +222,14 @@ func (p *Provider) SetAuthRequestDone(id, userID string) error {
 	return fmt.Errorf("storage does not support SetAuthRequestDone")
 }
 
+func (p *Provider) AuthRequestClientHost(id string) (string, error) {
+	s, ok := p.Storage.(*MemStorage)
+	if !ok {
+		return "", fmt.Errorf("storage does not support AuthRequestClientHost")
+	}
+	return s.AuthRequestClientHost(context.Background(), id)
+}
+
 type UserStore struct {
 	store *store.Store
 	get   func(userID string) (*store.User, error)
@@ -266,6 +274,7 @@ type SimpleAuthRequest struct {
 	CodeChallengeMethod oidc.CodeChallengeMethod `json:"code_challenge_method"`
 	Audience            []string                 `json:"audience"`
 	ClientID            string                   `json:"client_id"`
+	EditProfile         bool                     `json:"edit_profile"`
 }
 
 func (r *SimpleAuthRequest) GetID() string                      { return r.ID }
@@ -664,6 +673,18 @@ func (s *MemStorage) DeleteAuthRequest(ctx context.Context, id string) error {
 	}
 	_, execErr := pipe.Exec(ctx)
 	return execErr
+}
+
+func (s *MemStorage) AuthRequestClientHost(ctx context.Context, id string) (string, error) {
+	req, err := s.getAuthRequest(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(req.RedirectURI)
+	if err != nil {
+		return "", err
+	}
+	return u.Host, nil
 }
 
 func (s *MemStorage) SetAuthRequestDone(id, userID string) error {
