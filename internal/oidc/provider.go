@@ -906,7 +906,16 @@ func (s *MemStorage) KeySet(ctx context.Context) ([]op.Key, error) {
 	}
 	keys := make([]op.Key, 0, len(s.keys))
 	for _, key := range s.keys {
-		keys = append(keys, key)
+		pubKey := key.key
+		if rsaKey, ok := key.key.(*rsa.PrivateKey); ok {
+			pubKey = &rsaKey.PublicKey
+		}
+		keys = append(keys, &SimpleKey{
+			id:  key.id,
+			alg: key.alg,
+			use: key.use,
+			key: pubKey,
+		})
 	}
 	return keys, nil
 }
