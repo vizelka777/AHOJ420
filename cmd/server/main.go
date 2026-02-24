@@ -82,7 +82,8 @@ func main() {
 	e.GET("/", func(c echo.Context) error {
 		mode := c.QueryParam("mode")
 		if mode == "login" {
-			if _, ok := authService.SessionUserID(c); ok && !authService.InRecoveryMode(c) {
+			editProfile := c.QueryParam("edit_profile") == "1"
+			if _, ok := authService.SessionUserID(c); ok && !authService.InRecoveryMode(c) && !editProfile {
 				if returnTo := c.QueryParam("return_to"); isSafeReturnTo(returnTo) {
 					return c.Redirect(http.StatusFound, returnTo)
 				}
@@ -145,6 +146,12 @@ func main() {
 			authRequestID := u.Query().Get("auth_request_id")
 			if authRequestID == "" {
 				return
+			}
+			if clientHost, hostErr := oidcProvider.AuthRequestClientHost(authRequestID); hostErr == nil && clientHost != "" {
+				q := u.Query()
+				q.Set("client_host", clientHost)
+				u.RawQuery = q.Encode()
+				c.Response().Header().Set(echo.HeaderLocation, u.String())
 			}
 			c.SetCookie(&http.Cookie{
 				Name:     "oidc_auth_request",
