@@ -942,7 +942,7 @@ func (c *StaticClient) GrantTypes() []oidc.GrantType         { return c.grantTyp
 func (c *StaticClient) AccessTokenType() op.AccessTokenType  { return op.AccessTokenTypeBearer }
 func (c *StaticClient) IDTokenLifetime() time.Duration       { return 1 * time.Hour }
 func (c *StaticClient) DevMode() bool                        { return true }
-func (c *StaticClient) IDTokenUserinfoClaimsAssertion() bool { return false }
+func (c *StaticClient) IDTokenUserinfoClaimsAssertion() bool { return true }
 func (c *StaticClient) ClockSkew() time.Duration             { return 0 }
 func (c *StaticClient) IsScopeAllowed(scope string) bool {
 	_, ok := c.allowedScopes[scope]
