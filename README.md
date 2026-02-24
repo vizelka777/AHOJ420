@@ -148,7 +148,7 @@ Example confidential client:
 [
   {
     "id": "mushroom-bff",
-    "redirect_uris": ["https://api.houbamzdar.cz/oidc/callback"],
+    "redirect_uris": ["https://api.houbamzdar.cz/auth/callback"],
     "confidential": true,
     "secrets": ["use OIDC_CLIENT_MUSHROOM_BFF_SECRET in prod"],
     "require_pkce": true,

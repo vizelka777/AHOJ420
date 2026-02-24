@@ -424,7 +424,7 @@ func defaultDevClients() map[string]*StaticClient {
 			AuthMethod:    "basic",
 			GrantTypes:    []string{"authorization_code", "refresh_token"},
 			ResponseTypes: []string{"code"},
-			RedirectURIs:  []string{"https://api.houbamzdar.cz/oidc/callback"},
+			RedirectURIs:  []string{"https://api.houbamzdar.cz/auth/callback"},
 			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 		},
 	}

@@ -141,7 +141,7 @@ Now:
 [
   {
     "id": "mushroom-bff",
-    "redirect_uris": ["https://api.houbamzdar.cz/oidc/callback"],
+    "redirect_uris": ["https://api.houbamzdar.cz/auth/callback"],
     "confidential": true,
     "require_pkce": true,
     "auth_method": "basic",
