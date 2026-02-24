@@ -338,9 +338,24 @@
             msg.className = "mt-4 text-center text-sm " + colorClass;
         }
 
-        function isHoubamzdarProfileEditFlow() {
-            const params = new URLSearchParams(window.location.search);
-            return params.get("edit_profile") === "1" && (params.get("client_host") || "").trim() === "houbamzdar.cz";
+        function resolveSafeReturnURL(rawURL, clientHost) {
+            const raw = (rawURL || "").trim();
+            if (!raw) return "";
+            const host = (clientHost || "").trim().toLowerCase();
+
+            if (raw.startsWith("/")) {
+                if (raw.startsWith("//")) return "";
+                return raw;
+            }
+
+            try {
+                const u = new URL(raw);
+                if (u.protocol !== "https:") return "";
+                if (host && u.host.toLowerCase() !== host) return "";
+                return u.toString();
+            } catch (_) {
+                return "";
+            }
         }
 
         function renderOidcReturnButton() {
@@ -365,11 +380,12 @@
             const returnTo = params.get("return_to");
             const authRequestID = params.get("auth_request_id");
             const clientHost = (params.get("client_host") || "client").trim();
-            const editProfile = params.get("edit_profile") === "1";
+            const profileReturn = resolveSafeReturnURL(params.get("return_profile_to"), clientHost);
+            const afterSaveReturn = resolveSafeReturnURL(params.get("return_after_save_to"), clientHost);
 
             let url = "";
-            if (editProfile && clientHost === "houbamzdar.cz") {
-                url = "https://houbamzdar.cz/me.html";
+            if (profileReturn) {
+                url = profileReturn;
             } else if (returnTo) {
                 url = returnTo;
             } else if (authRequestID) {
@@ -377,7 +393,7 @@
             }
             if (!url) return;
 
-            pendingOidcReturn = { url, host: clientHost };
+            pendingOidcReturn = { url, host: clientHost, afterSaveURL: afterSaveReturn };
             renderOidcReturnButton();
         }
 
@@ -582,8 +598,8 @@
                     applySessionState(true, payload.display_name || payload.email || "User");
                     showMessage("Profile saved.", "text-green-400");
                 }
-                if (isHoubamzdarProfileEditFlow()) {
-                    window.location.href = "https://houbamzdar.cz/reauth.html";
+                if (pendingOidcReturn && pendingOidcReturn.afterSaveURL) {
+                    window.location.href = pendingOidcReturn.afterSaveURL;
                     return;
                 }
                 if (!changed) {
