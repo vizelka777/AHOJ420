@@ -89,6 +89,14 @@ func defaultString(v, fallback string) string {
 	return v
 }
 
+func sanitizePublicEmail(email string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(email))
+	if strings.HasPrefix(trimmed, "anon-") {
+		return ""
+	}
+	return strings.TrimSpace(email)
+}
+
 func newSessionID() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -279,17 +287,25 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 	}
 
 	redirectURL := ""
+	returnClientHost := ""
+	manualReturnRequired := false
 	if authReqID != "" && s.provider.SetAuthRequestDone(authReqID, user.ID) == nil {
 		redirectURL = "/authorize/callback?id=" + authReqID
+		if host, hostErr := s.provider.AuthRequestClientHost(authReqID); hostErr == nil && strings.TrimSpace(host) != "" {
+			returnClientHost = host
+			manualReturnRequired = true
+		}
 		c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"status":        "ok",
-		"email":         user.Email,
-		"display_name":  user.DisplayName,
-		"needs_profile": true,
-		"redirect":      redirectURL,
+		"status":                 "ok",
+		"email":                  sanitizePublicEmail(user.Email),
+		"display_name":           user.DisplayName,
+		"needs_profile":          true,
+		"redirect":               redirectURL,
+		"manual_return_required": manualReturnRequired,
+		"return_client_host":     returnClientHost,
 	})
 }
 
@@ -452,7 +468,7 @@ func (s *Service) FinishLogin(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"status":       "ok",
-		"email":        user.Email,
+		"email":        sanitizePublicEmail(user.Email),
 		"display_name": user.DisplayName,
 		"redirect":     redirectURL,
 	})
@@ -577,7 +593,7 @@ func (s *Service) SessionStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"authenticated":  true,
 		"recovery_mode":  s.InRecoveryMode(c),
-		"email":          user.Email,
+		"email":          sanitizePublicEmail(user.Email),
 		"display_name":   user.DisplayName,
 		"profile_email":  user.ProfileEmail,
 		"phone":          user.Phone,

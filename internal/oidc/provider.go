@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -220,6 +221,14 @@ func (p *Provider) SetAuthRequestDone(id, userID string) error {
 		return s.SetAuthRequestDone(id, userID)
 	}
 	return fmt.Errorf("storage does not support SetAuthRequestDone")
+}
+
+func (p *Provider) AuthRequestClientHost(id string) (string, error) {
+	s, ok := p.Storage.(*MemStorage)
+	if !ok {
+		return "", fmt.Errorf("storage does not support AuthRequestClientHost")
+	}
+	return s.AuthRequestClientHost(context.Background(), id)
 }
 
 type UserStore struct {
@@ -678,6 +687,18 @@ func (s *MemStorage) SetAuthRequestDone(id, userID string) error {
 	return s.saveAuthRequest(ctx, req, oidcStateTTL)
 }
 
+func (s *MemStorage) AuthRequestClientHost(ctx context.Context, id string) (string, error) {
+	req, err := s.getAuthRequest(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(req.RedirectURI)
+	if err != nil {
+		return "", err
+	}
+	return parsed.Host, nil
+}
+
 func (s *MemStorage) saveAuthRequest(ctx context.Context, req *SimpleAuthRequest, ttl time.Duration) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -758,6 +779,20 @@ func randomID(prefix string) string {
 	return fmt.Sprintf("%s_%s", prefix, base64.RawURLEncoding.EncodeToString(b))
 }
 
+func publicEmailForClaims(user *store.User) string {
+	if user == nil {
+		return ""
+	}
+	email := strings.TrimSpace(user.Email)
+	if strings.TrimSpace(user.ProfileEmail) != "" {
+		email = strings.TrimSpace(user.ProfileEmail)
+	}
+	if strings.HasPrefix(strings.ToLower(email), "anon-") {
+		return ""
+	}
+	return email
+}
+
 func (s *MemStorage) CreateAccessToken(ctx context.Context, request op.TokenRequest) (string, time.Time, error) {
 	return "access_token_" + request.GetSubject(), time.Now().Add(1 * time.Hour), nil
 }
@@ -819,13 +854,12 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
 				userinfo.Picture = picture
 			}
-		                case oidc.ScopeEmail:
-		                        email := user.Email
-		                        if user.ProfileEmail != "" {
-		                                email = user.ProfileEmail
-		                        }
-		                        userinfo.Email = email
-		                        userinfo.EmailVerified = oidc.Bool(user.EmailVerified)		case oidc.ScopePhone:
+		case oidc.ScopeEmail:
+			if email := publicEmailForClaims(user); email != "" {
+				userinfo.Email = email
+				userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
+			}
+		case oidc.ScopePhone:
 			if strings.TrimSpace(user.Phone) != "" {
 				userinfo.PhoneNumber = user.Phone
 				userinfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
@@ -834,7 +868,6 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 	}
 	return nil
 }
-
 func (s *MemStorage) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.UserInfo, tokenID, subject, origin string) error {
 	return nil
 }
@@ -859,13 +892,12 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
 				claims["picture"] = picture
 			}
-		                case oidc.ScopeEmail:
-		                        email := user.Email
-		                        if user.ProfileEmail != "" {
-		                                email = user.ProfileEmail
-		                        }
-		                        claims["email"] = email
-		                        claims["email_verified"] = user.EmailVerified		case oidc.ScopePhone:
+		case oidc.ScopeEmail:
+			if email := publicEmailForClaims(user); email != "" {
+				claims["email"] = email
+				claims["email_verified"] = user.EmailVerified
+			}
+		case oidc.ScopePhone:
 			if strings.TrimSpace(user.Phone) != "" {
 				claims["phone_number"] = user.Phone
 				claims["phone_number_verified"] = user.PhoneVerified
@@ -874,7 +906,6 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 	}
 	return claims, nil
 }
-
 func (s *MemStorage) GetKeyByIDAndClientID(ctx context.Context, keyID, clientID string) (*jose.JSONWebKey, error) {
 	for _, key := range s.keys {
 		if key.id != keyID {

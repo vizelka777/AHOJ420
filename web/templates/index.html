@@ -132,6 +132,10 @@
         </div>
 
         <div id="message" class="mt-4 text-center text-sm min-h-[20px]"></div>
+        <button id="oidc-return-btn" onclick="resumeOidcReturn()"
+            class="hidden mt-2 w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-300 hover:text-teal-200 hover:border-teal-400 transition">
+            Вернуться к клиенту
+        </button>
         <button id="logout-btn" onclick="handleLogout()"
             class="hidden mt-3 w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
             Logout
@@ -170,6 +174,8 @@
     </div>
 
     <script>
+        let pendingOidcReturn = null;
+
         function switchMode(mode) {
             const regFlow = document.getElementById('register-flow');
             const loginFlow = document.getElementById('login-flow');
@@ -215,8 +221,16 @@
                     phone: "",
                     share_profile: false
                 });
-                if (res.redirect) {
-                    window.location.href = res.redirect;
+                if (res.manual_return_required && res.redirect) {
+                    pendingOidcReturn = {
+                        url: res.redirect,
+                        host: (res.return_client_host || "client").trim()
+                    };
+                    renderOidcReturnButton();
+                    showMessage("Профиль сохраните при желании, затем вернитесь в " + pendingOidcReturn.host, "text-green-400");
+                } else {
+                    pendingOidcReturn = null;
+                    renderOidcReturnButton();
                 }
             } catch (err) {
                 console.error(err);
@@ -328,6 +342,22 @@
             msg.className = "mt-4 text-center text-sm " + colorClass;
         }
 
+        function renderOidcReturnButton() {
+            const btn = document.getElementById('oidc-return-btn');
+            if (!pendingOidcReturn || !pendingOidcReturn.url) {
+                btn.classList.add('hidden');
+                btn.innerText = "Вернуться к клиенту";
+                return;
+            }
+            btn.innerText = "Вернуться на " + pendingOidcReturn.host;
+            btn.classList.remove('hidden');
+        }
+
+        function resumeOidcReturn() {
+            if (!pendingOidcReturn || !pendingOidcReturn.url) return;
+            window.location.href = pendingOidcReturn.url;
+        }
+
         async function handleLogout() {
             try {
                 const res = await fetch('/auth/logout', { method: 'POST' });
@@ -335,6 +365,8 @@
                     throw new Error(await res.text());
                 }
                 closeProfileModal();
+                pendingOidcReturn = null;
+                renderOidcReturnButton();
                 applySessionState(false, "");
                 showMessage("Logged out", "text-green-400");
                 history.replaceState({}, "", "/");
@@ -374,6 +406,8 @@
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
+            pendingOidcReturn = null;
+            renderOidcReturnButton();
         }
 
         async function loadSessionState() {
@@ -542,6 +576,9 @@
                 showMessage("Profile saved.", "text-green-400");
                 if (payload.display_name) {
                     applySessionState(true, payload.display_name);
+                }
+                if (pendingOidcReturn && pendingOidcReturn.url) {
+                    showMessage("Профиль сохранен. Нажмите «Вернуться на " + pendingOidcReturn.host + "».", "text-green-400");
                 }
             } catch (err) {
                 showMessage("Profile save failed: " + err.message, "text-red-400");
