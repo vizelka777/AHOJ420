@@ -222,6 +222,13 @@ func (p *Provider) SetAuthRequestDone(id, userID string) error {
 	return fmt.Errorf("storage does not support SetAuthRequestDone")
 }
 
+func (p *Provider) GetClientIDFromAuthRequest(id string) (string, error) {
+	if s, ok := p.Storage.(*MemStorage); ok {
+		return s.GetClientIDFromAuthRequest(id)
+	}
+	return "", fmt.Errorf("storage does not support GetClientIDFromAuthRequest")
+}
+
 type UserStore struct {
 	store *store.Store
 	get   func(userID string) (*store.User, error)
@@ -664,6 +671,15 @@ func (s *MemStorage) DeleteAuthRequest(ctx context.Context, id string) error {
 	}
 	_, execErr := pipe.Exec(ctx)
 	return execErr
+}
+
+func (s *MemStorage) GetClientIDFromAuthRequest(id string) (string, error) {
+	ctx := context.Background()
+	req, err := s.getAuthRequest(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return req.ClientID, nil
 }
 
 func (s *MemStorage) SetAuthRequestDone(id, userID string) error {

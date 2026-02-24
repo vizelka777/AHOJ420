@@ -574,7 +574,7 @@ func (s *Service) SessionStatus(c echo.Context) error {
 		})
 	}
 
-	return c.JSON(http.StatusOK, map[string]any{
+	data := map[string]any{
 		"authenticated":  true,
 		"recovery_mode":  s.InRecoveryMode(c),
 		"email":          user.Email,
@@ -585,7 +585,15 @@ func (s *Service) SessionStatus(c echo.Context) error {
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
 		"picture_url":    avatar.BuildPublicURL(s.avatarCfg.publicBase, user.AvatarKey, user.AvatarUpdatedAt),
-	})
+	}
+
+	if authReqID := c.QueryParam("auth_request_id"); authReqID != "" {
+		if clientID, err := s.provider.GetClientIDFromAuthRequest(authReqID); err == nil {
+			data["oidc_client_id"] = clientID
+		}
+	}
+
+	return c.JSON(http.StatusOK, data)
 }
 
 func (s *Service) GetProfile(c echo.Context) error {

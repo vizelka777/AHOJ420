@@ -78,6 +78,10 @@
         </div>
 
         <div id="account-ui" class="hidden space-y-4">
+            <div id="oidc-return-container" class="hidden p-4 bg-teal-900/30 border border-teal-500/50 rounded-xl mb-4">
+                <button id="oidc-return-btn" class="w-full py-3 bg-teal-500 hover:bg-teal-400 text-white font-bold rounded-lg transition shadow-lg shadow-teal-500/20"></button>
+            </div>
+
             <h2 class="text-xl font-semibold text-center">Ваш профиль</h2>
             <div class="flex items-center gap-3">
                 <img id="account-avatar" src="" alt="Avatar"
@@ -116,8 +120,8 @@
                         </button>
                     </div>
                 </div>
-                <label class="flex items-start gap-2 text-sm text-gray-300">
-                    <input id="account-share" type="checkbox" class="mt-1">
+                <label class="flex items-start gap-2 text-sm text-gray-300 hidden">
+                    <input id="account-share" type="checkbox" class="mt-1" checked>
                     <span>Передавать эти данные в сторонние сервисы при OIDC входе.</span>
                 </label>
                 <button type="submit"
@@ -142,7 +146,7 @@
         <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
             <h3 class="text-xl font-semibold mb-3">Профиль (опционально)</h3>
             <p class="text-sm text-gray-300 mb-4">
-                Можно добавить имя, email и телефон. Эти данные будут передаваться в другие сервисы только при вашем согласии.
+                Можно добавить имя, email и телефон.
             </p>
             <form class="space-y-3" onsubmit="saveProfile(event)">
                 <input id="profile-name" type="text" placeholder="Имя"
@@ -151,8 +155,8 @@
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
                 <input id="profile-phone" type="tel" placeholder="Телефон (опционально)"
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
-                <label class="flex items-start gap-2 text-sm text-gray-300">
-                    <input id="profile-share" type="checkbox" class="mt-1">
+                <label class="flex items-start gap-2 text-sm text-gray-300 hidden">
+                    <input id="profile-share" type="checkbox" class="mt-1" checked>
                     <span>Разрешаю передавать эти данные при входе на другие сервисы.</span>
                 </label>
                 <div class="flex gap-2 pt-1">
@@ -194,6 +198,7 @@
 
         let conditionalAbort = null;
         let conditionalInFlight = false;
+        let oidcRedirectURL = "";
 
         async function handleRegister(e) {
             e.preventDefault();
@@ -209,15 +214,17 @@
                 const res = await registerUser(email);
                 showMessage("Passkey created. You are logged in.", "text-green-400");
                 applySessionState(true, res.display_name || res.email || "User");
+                
+                oidcRedirectURL = res.redirect || "";
+                
                 openProfileModal({
                     display_name: res.display_name || "",
                     email: "",
                     phone: "",
-                    share_profile: false
+                    share_profile: true
                 });
-                if (res.redirect) {
-                    window.location.href = res.redirect;
-                }
+                
+                await loadProfileForAccountUI();
             } catch (err) {
                 console.error(err);
                 showMessage("Error: " + err.message, "text-red-400");
@@ -240,11 +247,14 @@
                 const res = await loginUser(email, authRequestID);
                 showMessage("Logged in as " + res.email, "text-green-400");
                 applySessionState(true, res.display_name || res.email || "User");
-                if (res.redirect && res.redirect !== "/") {
-                    window.location.href = res.redirect;
+                
+                oidcRedirectURL = res.redirect || "";
+                
+                if (oidcRedirectURL && oidcRedirectURL !== "/") {
+                    await loadSessionState();
                     return;
                 }
-                const params = new URLSearchParams(window.location.search);
+
                 const returnTo = params.get("return_to");
                 if (returnTo) {
                     window.location.href = returnTo;
@@ -364,27 +374,49 @@
             const guestUI = document.getElementById('guest-ui');
             const accountUI = document.getElementById('account-ui');
             const logoutBtn = document.getElementById('logout-btn');
+            const returnContainer = document.getElementById('oidc-return-container');
+
             if (authenticated) {
                 guestUI.classList.add('hidden');
                 accountUI.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
-                showMessage("Session active: " + email, "text-green-400");
                 return;
             }
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
+            returnContainer.classList.add('hidden');
         }
 
         async function loadSessionState() {
             try {
-                const res = await fetch('/auth/session');
+                const params = new URLSearchParams(window.location.search);
+                const authRequestID = params.get("auth_request_id");
+                let url = '/auth/session';
+                if (authRequestID) url += '?auth_request_id=' + encodeURIComponent(authRequestID);
+
+                const res = await fetch(url);
                 if (!res.ok) return;
                 const data = await res.json();
                 const authenticated = Boolean(data.authenticated);
                 applySessionState(authenticated, data.display_name || data.email || "");
                 if (authenticated) {
                     populateAccountUI(data);
+                    
+                    if (data.oidc_client_id) {
+                        const returnContainer = document.getElementById('oidc-return-container');
+                        const returnBtn = document.getElementById('oidc-return-btn');
+                        returnContainer.classList.remove('hidden');
+                        returnBtn.innerText = "Вернуться на " + data.oidc_client_id;
+                        returnBtn.onclick = () => {
+                            if (oidcRedirectURL) {
+                                window.location.href = oidcRedirectURL;
+                            } else if (authRequestID) {
+                                window.location.href = "/authorize/callback?id=" + authRequestID;
+                            }
+                        };
+                    }
+
                     await loadProfileForAccountUI();
                 }
             } catch (_) {
@@ -396,7 +428,7 @@
             document.getElementById('account-name').value = profile.display_name || "";
             document.getElementById('account-email').value = profile.profile_email || profile.email || "";
             document.getElementById('account-phone').value = profile.phone || "";
-            document.getElementById('account-share').checked = Boolean(profile.share_profile);
+            document.getElementById('account-share').checked = true;
             setAvatar(profile.picture_url || "");
             renderVerificationStatus({
                 email_verified: Boolean(profile.email_verified),
@@ -434,7 +466,7 @@
                 document.getElementById('account-name').value = profile.display_name || "";
                 document.getElementById('account-email').value = profile.email || "";
                 document.getElementById('account-phone').value = profile.phone || "";
-                document.getElementById('account-share').checked = Boolean(profile.share_profile);
+                document.getElementById('account-share').checked = true;
                 setAvatar(profile.picture_url || "");
                 renderVerificationStatus(profile);
             } catch (_) {
@@ -482,7 +514,7 @@
                 display_name: document.getElementById('account-name').value.trim(),
                 email: document.getElementById('account-email').value.trim(),
                 phone: document.getElementById('account-phone').value.trim(),
-                share_profile: document.getElementById('account-share').checked
+                share_profile: true
             };
             try {
                 const res = await fetch('/auth/profile', {
@@ -513,7 +545,7 @@
             document.getElementById('profile-name').value = profile.display_name || "";
             document.getElementById('profile-email').value = profile.email || "";
             document.getElementById('profile-phone').value = profile.phone || "";
-            document.getElementById('profile-share').checked = Boolean(profile.share_profile);
+            document.getElementById('profile-share').checked = true;
             document.getElementById('profile-modal').classList.add('open');
         }
 
@@ -527,7 +559,7 @@
                 display_name: document.getElementById('profile-name').value.trim(),
                 email: document.getElementById('profile-email').value.trim(),
                 phone: document.getElementById('profile-phone').value.trim(),
-                share_profile: document.getElementById('profile-share').checked
+                share_profile: true
             };
             try {
                 const res = await fetch('/auth/profile', {
