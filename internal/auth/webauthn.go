@@ -31,6 +31,7 @@ type Service struct {
 	sessionTTL time.Duration
 	avatarCfg  avatarConfig
 	mailer     emailSender
+	smsSender  smsSender
 	devMode    bool
 }
 
@@ -72,6 +73,20 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		log.Printf("SMTP mailer configured for auth emails")
 	}
 
+	smsSender, err := newSMSSenderFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if smsSender == nil {
+		if devMode {
+			log.Printf("GoSMS is not configured: using log-only delivery for phone verification codes")
+		} else {
+			log.Printf("GoSMS is not configured: phone verification SMS will not be delivered")
+		}
+	} else {
+		log.Printf("GoSMS sender configured for phone verification")
+	}
+
 	w, err := webauthn.New(&webauthn.Config{
 		RPDisplayName: "Ahoj420 Identity",
 		RPID:          os.Getenv("RP_ID"), // auth.localhost
@@ -93,6 +108,7 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		provider:   p,
 		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
 		mailer:     mailer,
+		smsSender:  smsSender,
 		devMode:    devMode,
 		avatarCfg: avatarConfig{
 			publicBase: strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE")),
