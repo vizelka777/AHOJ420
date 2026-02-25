@@ -198,6 +198,24 @@ func (s *Store) GetUserByProfileEmail(profileEmail string) (*User, error) {
 	return s.GetUser(id)
 }
 
+func (s *Store) GetUserByVerifiedPhone(phone string) (*User, error) {
+	normalizedPhone := strings.TrimSpace(phone)
+	var id string
+	err := s.db.QueryRow(`
+		SELECT id::text
+		FROM users
+		WHERE trim(COALESCE(phone, '')) <> ''
+		  AND trim(phone) = trim($1)
+		  AND COALESCE(phone_verified, false) = true
+		ORDER BY created_at ASC
+		LIMIT 1
+	`, normalizedPhone).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUser(id)
+}
+
 func (s *Store) GetUserByCredentialID(credID []byte) (*User, error) {
 	var userID string
 	err := s.db.QueryRow(`

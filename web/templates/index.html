@@ -7,9 +7,10 @@
     <title>Ahoj420 - Passkey Auth</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="/static/js/glue.js?v=20260127b"></script>
+    <script src="/static/js/glue.js?v=20260225a"></script>
     <style>
-        #profile-modal {
+        #profile-modal,
+        #recovery-modal {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.65);
@@ -19,7 +20,8 @@
             padding: 16px;
             z-index: 50;
         }
-        #profile-modal.open {
+        #profile-modal.open,
+        #recovery-modal.open {
             display: flex;
         }
     </style>
@@ -70,6 +72,10 @@
             <div class="mt-6 space-y-3">
                 <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
                     QR Login (coming soon)
+                </button>
+                <button type="button" onclick="openRecoveryModal()"
+                    class="w-full py-2 text-sm border border-amber-500/40 rounded-lg text-amber-200 hover:text-amber-100 hover:border-amber-300 transition">
+                    Восстановить учет через email или телефон
                 </button>
                 <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
                     Add Device (coming soon)
@@ -167,6 +173,32 @@
                     <button type="button" onclick="closeProfileModal()"
                         class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
                         Пропустить
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="recovery-modal">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
+            <h3 class="text-xl font-semibold mb-3">Восстановление учетной записи</h3>
+            <p class="text-sm text-gray-300 mb-4">
+                Укажите email или подтвержденный телефон. На этот контакт придет ссылка для восстановления.
+            </p>
+            <form class="space-y-3" onsubmit="submitRecoveryRequest(event)">
+                <input id="recovery-email" type="email" placeholder="Email"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                <div class="text-center text-xs text-gray-400">или</div>
+                <input id="recovery-phone" type="tel" placeholder="Телефон в формате +420777123456"
+                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                <div class="flex gap-2 pt-1">
+                    <button id="btn-recovery-submit" type="submit"
+                        class="flex-1 py-2 bg-gradient-to-r from-amber-500 to-orange-500 rounded-lg font-semibold hover:from-amber-400 hover:to-orange-400 transition">
+                        Отправить ссылку
+                    </button>
+                    <button type="button" onclick="closeRecoveryModal()"
+                        class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        Закрыть
                     </button>
                 </div>
             </form>
@@ -404,6 +436,7 @@
                     throw new Error(await res.text());
                 }
                 closeProfileModal();
+                closeRecoveryModal();
                 pendingOidcReturn = null;
                 renderOidcReturnButton();
                 applySessionState(false, "");
@@ -668,6 +701,40 @@
                 showMessage("Телефон подтвержден.", "text-green-400");
             } catch (err) {
                 showMessage("Не удалось подтвердить телефон: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function openRecoveryModal() {
+            document.getElementById('recovery-email').value = "";
+            document.getElementById('recovery-phone').value = "";
+            document.getElementById('recovery-modal').classList.add('open');
+        }
+
+        function closeRecoveryModal() {
+            document.getElementById('recovery-modal').classList.remove('open');
+        }
+
+        async function submitRecoveryRequest(e) {
+            e.preventDefault();
+            const email = document.getElementById('recovery-email').value.trim();
+            const phone = document.getElementById('recovery-phone').value.trim();
+
+            if ((!email && !phone) || (email && phone)) {
+                showMessage("Укажите либо email, либо телефон.", "text-yellow-400");
+                return;
+            }
+
+            const btn = document.getElementById('btn-recovery-submit');
+            btn.disabled = true;
+
+            try {
+                const message = await requestRecovery({ email, phone });
+                closeRecoveryModal();
+                showMessage(message || "Если учетная запись существует, сообщение отправлено.", "text-green-400");
+            } catch (err) {
+                showMessage("Не удалось отправить восстановление: " + err.message, "text-red-400");
             } finally {
                 btn.disabled = false;
             }

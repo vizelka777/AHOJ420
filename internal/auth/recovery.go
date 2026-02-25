@@ -20,48 +20,83 @@ import (
 var recoveryRandReader io.Reader = rand.Reader
 
 func (s *Service) RequestRecovery(c echo.Context) error {
-	email, err := normalizeEmail(c.FormValue("email"))
-	if email == "" {
-		return c.String(http.StatusBadRequest, "Email required")
+	rawEmail := strings.TrimSpace(c.FormValue("email"))
+	rawPhone := strings.TrimSpace(c.FormValue("phone"))
+	if rawEmail == "" && rawPhone == "" {
+		return c.String(http.StatusBadRequest, "Email or phone required")
 	}
+	if rawEmail != "" && rawPhone != "" {
+		return c.String(http.StatusBadRequest, "Provide either email or phone")
+	}
+
+	if rawEmail != "" {
+		email, err := normalizeEmail(rawEmail)
+		if err != nil {
+			return c.String(http.StatusBadRequest, err.Error())
+		}
+
+		user, err := s.store.GetUserByProfileEmail(email)
+		if err != nil || user == nil {
+			log.Printf("Recovery requested for non-existent email: %s", email)
+			return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+		}
+
+		magicLink, tokenKey, err := s.createRecoveryToken(c, user.ID)
+		if err != nil {
+			return c.String(http.StatusInternalServerError, "Internal error")
+		}
+
+		if err := s.sendRecoveryLink(email, magicLink); err != nil {
+			_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
+			log.Printf("Recovery mail send failed for %s: %v", email, err)
+			return c.String(http.StatusInternalServerError, "Internal error")
+		}
+
+		return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+	}
+
+	phone, err := normalizePhone(rawPhone)
 	if err != nil {
 		return c.String(http.StatusBadRequest, err.Error())
 	}
-
-	// 1. Check if user exists by recovery contact email.
-	user, err := s.store.GetUserByProfileEmail(email)
+	user, err := s.store.GetUserByVerifiedPhone(phone)
 	if err != nil || user == nil {
-		// Security: Always return success to prevent enumeration
-		// But for dev we might want to know
-		log.Printf("Recovery requested for non-existent email: %s", email)
-		return c.JSON(http.StatusOK, map[string]string{"message": "If this email exists, a link has been sent."})
+		log.Printf("Recovery requested for non-existent or unverified phone: %s", phone)
+		return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
 	}
 
-	// 2. Generate token
+	magicLink, tokenKey, err := s.createRecoveryToken(c, user.ID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+	if err := s.sendRecoverySMS(c.Request().Context(), phone, magicLink); err != nil {
+		_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
+		log.Printf("Recovery SMS send failed for %s: %v", phone, err)
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+}
+
+func (s *Service) createRecoveryToken(c echo.Context, userID string) (magicLink string, tokenKey string, err error) {
 	token, err := generateRecoveryToken()
 	if err != nil {
 		log.Printf("Recovery token generation failed: %v", err)
-		return c.String(http.StatusInternalServerError, "Internal error")
+		return "", "", err
 	}
 
 	// 3. Store in Redis (15 min)
 	// Key: recovery_token:<token> -> userID
-	tokenKey := "recovery_token:" + token
-	err = s.redis.Set(c.Request().Context(), tokenKey, user.ID, 15*time.Minute).Err()
+	tokenKey = "recovery_token:" + token
+	err = s.redis.Set(c.Request().Context(), tokenKey, userID, 15*time.Minute).Err()
 	if err != nil {
-		return c.String(http.StatusInternalServerError, "Internal error")
+		return "", "", err
 	}
 
 	// 4. Send recovery link
 	base := recoveryBaseURL()
-	magicLink := fmt.Sprintf("%s/auth/recovery/verify?token=%s", base, token)
-	if err := s.sendRecoveryLink(email, magicLink); err != nil {
-		_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
-		log.Printf("Recovery mail send failed for %s: %v", email, err)
-		return c.String(http.StatusInternalServerError, "Internal error")
-	}
-
-	return c.JSON(http.StatusOK, map[string]string{"message": "If this email exists, a link has been sent."})
+	magicLink = fmt.Sprintf("%s/auth/recovery/verify?token=%s", base, token)
+	return magicLink, tokenKey, nil
 }
 
 func generateRecoveryToken() (string, error) {
@@ -80,6 +115,16 @@ func (s *Service) logRecoveryLink(email, magicLink string) {
 		return
 	}
 	log.Printf("Recovery link generated for email: %s", email)
+}
+
+func (s *Service) logRecoverySMS(phone, magicLink string) {
+	if s.devMode {
+		log.Println("==================================================")
+		log.Printf("RECOVERY SMS for %s: %s", phone, magicLink)
+		log.Println("==================================================")
+		return
+	}
+	log.Printf("Recovery SMS generated for phone: %s", phone)
 }
 
 func recoveryBaseURL() string {
@@ -102,6 +147,22 @@ func (s *Service) sendRecoveryLink(email, magicLink string) error {
 		}
 	}
 	s.logRecoveryLink(email, magicLink)
+	return nil
+}
+
+func (s *Service) sendRecoverySMS(ctx context.Context, phone, magicLink string) error {
+	if s.smsSender == nil {
+		if s.devMode {
+			s.logRecoverySMS(phone, magicLink)
+			return nil
+		}
+		return fmt.Errorf("sms sender is not configured")
+	}
+	message := "Ahoj420 recovery link: " + magicLink
+	if err := s.smsSender.SendSMS(ctx, phone, message); err != nil {
+		return err
+	}
+	s.logRecoverySMS(phone, magicLink)
 	return nil
 }
 

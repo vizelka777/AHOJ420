@@ -118,20 +118,28 @@ async function loginUser(email, authRequestID) {
     return await finishLoginWithCredential(credential, authRequestID);
 }
 
-async function requestRecovery(email) {
-    const res = await fetch('/auth/recovery/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'email=' + encodeURIComponent(email)
-    });
-    return await res.json();
-}
+async function requestRecovery(payload) {
+    const params = new URLSearchParams();
+    const email = (payload && payload.email ? payload.email : "").trim();
+    const phone = (payload && payload.phone ? payload.phone : "").trim();
+    if (email) params.set('email', email);
+    if (phone) params.set('phone', phone);
 
-async function requestRecovery(email) {
     const res = await fetch('/auth/recovery/request', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'email=' + encodeURIComponent(email)
+        body: params.toString()
     });
-    return await res.json();
+
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let message = "";
+    if (contentType.includes('application/json')) {
+        const data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return message;
 }
