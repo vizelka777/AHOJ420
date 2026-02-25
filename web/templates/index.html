@@ -99,7 +99,7 @@
                         class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
                     <div class="flex items-center justify-between text-xs">
                         <span id="account-email-status" class="text-yellow-300">Email: не подтверждено</span>
-                        <button type="button" id="btn-verify-email" onclick="verifyEmailStub()"
+                        <button type="button" id="btn-verify-email" onclick="requestEmailVerification()"
                             class="px-2 py-1 border border-yellow-400/40 rounded text-yellow-200 hover:text-yellow-100 hover:border-yellow-300">
                             Подтвердить
                         </button>
@@ -610,8 +610,32 @@
             }
         }
 
-        function verifyEmailStub() {
-            showMessage("Подтверждение email пока в разработке.", "text-yellow-400");
+        async function requestEmailVerification() {
+            const btn = document.getElementById('btn-verify-email');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/auth/profile/email/request-verify', { method: 'POST' });
+                const contentType = (res.headers.get('content-type') || "").toLowerCase();
+                let message = "";
+                if (contentType.includes('application/json')) {
+                    const data = await res.json();
+                    message = data.message || "";
+                } else {
+                    message = await res.text();
+                }
+                if (!res.ok) {
+                    if (res.status === 404) {
+                        showMessage("Сервер пока не поддерживает endpoint подтверждения email.", "text-yellow-400");
+                        return;
+                    }
+                    throw new Error(message || ("HTTP " + res.status));
+                }
+                showMessage(message || "Ссылка подтверждения отправлена.", "text-green-400");
+            } catch (err) {
+                showMessage("Не удалось отправить письмо подтверждения: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
+            }
         }
 
         function verifyPhoneStub() {
