@@ -79,7 +79,7 @@ ahoj420.eu, www.ahoj420.eu {
 ```sql
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL, -- legacy name, acts as technical login ID
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -94,6 +94,13 @@ CREATE TABLE credentials (
     last_used_at TIMESTAMPTZ
 );
 ```
+
+## Terminology Note
+We made an early naming mistake: `users.email` is historically named as an email field, but in practice it acts as an internal login identifier (`anon-*` for passkey-first users).
+
+Actual user contact email lives in `users.profile_email` and is the field used for profile email verification and recovery flows.
+
+For backward compatibility we keep the physical DB column name `email` for now. A dedicated schema rename/migration is planned for a future release.
 
 ## Project Structure
 ```
@@ -163,7 +170,7 @@ Example confidential client:
 ## Claims Mapping (ID Token and /userinfo)
 By requested scopes:
 - `profile` -> `name`, `preferred_username` from `users.display_name`, `picture` from avatar storage URL
-- `email` -> `email`, `email_verified` from `users.email`, `users.email_verified`
+- `email` -> `email` from `users.profile_email`, `email_verified` from `users.email_verified`
 - `phone` -> `phone_number`, `phone_number_verified` from `users.phone`, `users.phone_verified` (phone claims omitted when phone is empty)
 
 `picture` is returned as:

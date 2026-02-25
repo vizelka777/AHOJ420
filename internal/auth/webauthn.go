@@ -127,12 +127,12 @@ func defaultString(v, fallback string) string {
 	return v
 }
 
-func sanitizePublicEmail(email string) string {
-	trimmed := strings.TrimSpace(strings.ToLower(email))
-	if strings.HasPrefix(trimmed, "anon-") {
+func sanitizePublicLoginID(loginID string) string {
+	normalized := strings.TrimSpace(loginID)
+	if strings.HasPrefix(strings.ToLower(normalized), "anon-") {
 		return ""
 	}
-	return strings.TrimSpace(email)
+	return normalized
 }
 
 func newSessionID() (string, error) {
@@ -205,9 +205,10 @@ func (s *Service) BeginRegistration(c echo.Context) error {
 	var user *store.User
 	var err error
 
-	email := c.QueryParam("email")
-	if email != "" {
-		user, err = s.store.CreateUser(email)
+	// `email` query param is kept for backward compatibility, but it acts as login ID.
+	loginID := strings.TrimSpace(c.QueryParam("email"))
+	if loginID != "" {
+		user, err = s.store.CreateUser(loginID)
 	} else if userID, ok := s.SessionUserID(c); ok {
 		user, err = s.store.GetUser(userID)
 	} else {
@@ -338,7 +339,7 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":                 "ok",
-		"email":                  sanitizePublicEmail(user.Email),
+		"email":                  sanitizePublicLoginID(user.LoginID),
 		"display_name":           user.DisplayName,
 		"needs_profile":          true,
 		"redirect":               redirectURL,
@@ -355,14 +356,14 @@ func (s *Service) BeginLogin(c echo.Context) error {
 		})
 	}
 
-	// 1. Check if email is provided (for non-discoverable login)
-	email := c.QueryParam("email")
+	// `email` query param is kept for backward compatibility, but it acts as login ID.
+	loginID := strings.TrimSpace(c.QueryParam("email"))
 
 	var user *store.User
 	var err error
 
-	if email != "" {
-		user, err = s.store.GetUserByEmail(email)
+	if loginID != "" {
+		user, err = s.store.GetUserByLoginID(loginID)
 		if err != nil {
 			// In a real app, do not return 404 to avoid enumeration, but for now it's fine
 			return c.String(http.StatusNotFound, "User not found")
@@ -476,7 +477,7 @@ func (s *Service) FinishLogin(c echo.Context) error {
 
 	// 5. Update Counters
 	if credential.Authenticator.CloneWarning {
-		fmt.Println("CLONE WARNING for user", user.Email)
+		fmt.Println("CLONE WARNING for user", user.LoginID)
 		return c.String(http.StatusForbidden, "Security Alert: Possible credential clone")
 	}
 
@@ -506,7 +507,7 @@ func (s *Service) FinishLogin(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"status":       "ok",
-		"email":        sanitizePublicEmail(user.Email),
+		"email":        sanitizePublicLoginID(user.LoginID),
 		"display_name": user.DisplayName,
 		"redirect":     redirectURL,
 	})
@@ -631,7 +632,7 @@ func (s *Service) SessionStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"authenticated":  true,
 		"recovery_mode":  s.InRecoveryMode(c),
-		"email":          sanitizePublicEmail(user.Email),
+		"email":          sanitizePublicLoginID(user.LoginID),
 		"display_name":   user.DisplayName,
 		"profile_email":  user.ProfileEmail,
 		"phone":          user.Phone,

@@ -76,11 +76,15 @@ Mapping from `users` table:
 - `sub` -> `users.id`
 - `name` -> `users.display_name`
 - `preferred_username` -> `users.display_name`
-- `email` -> `users.email`
+- `email` -> `users.profile_email`
 - `email_verified` -> `users.email_verified`
 - `phone_number` -> `users.phone` (only when non-empty)
 - `phone_number_verified` -> `users.phone_verified` (only when phone is present)
 - `picture` -> `AVATAR_PUBLIC_BASE + users.avatar_key + "?v=<avatar_updated_at_unix>"` (only when avatar exists)
+
+Terminology note:
+- `users.email` is a legacy column name kept for backward compatibility and acts as an internal login identifier.
+- user-facing contact email is `users.profile_email`.
 
 Scope-based emission:
 - `profile` -> `name`, `preferred_username`, `picture`

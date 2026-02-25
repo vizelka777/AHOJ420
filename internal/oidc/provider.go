@@ -789,14 +789,7 @@ func publicEmailForClaims(user *store.User) string {
 	if user == nil {
 		return ""
 	}
-	email := strings.TrimSpace(user.Email)
-	if strings.TrimSpace(user.ProfileEmail) != "" {
-		email = strings.TrimSpace(user.ProfileEmail)
-	}
-	if strings.HasPrefix(strings.ToLower(email), "anon-") {
-		return ""
-	}
-	return email
+	return strings.TrimSpace(user.ProfileEmail)
 }
 
 func isRefreshTokenUsed(rec *RefreshTokenRecord) bool {

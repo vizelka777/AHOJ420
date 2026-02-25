@@ -26,7 +26,7 @@ func New(db *sql.DB) *Store {
 
 type User struct {
 	ID              string
-	Email           string
+	LoginID         string
 	DisplayName     string
 	ProfileEmail    string
 	Phone           string
@@ -67,8 +67,9 @@ func (u *User) WebAuthnCredentials() []webauthn.Credential {
 	return u.Credentials
 }
 
-func (s *Store) CreateUser(email string) (*User, error) {
-	displayName := defaultDisplayName(email)
+func (s *Store) CreateUser(loginID string) (*User, error) {
+	normalizedLoginID := strings.TrimSpace(loginID)
+	displayName := defaultDisplayName(normalizedLoginID)
 
 	var id string
 	var finalDisplayName string
@@ -76,29 +77,30 @@ func (s *Store) CreateUser(email string) (*User, error) {
 		INSERT INTO users (email, display_name) VALUES ($1, $2)
 		ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
 		RETURNING id::text, COALESCE(NULLIF(display_name, ''), $2)
-	`, email, displayName).Scan(&id, &finalDisplayName)
+	`, normalizedLoginID, displayName).Scan(&id, &finalDisplayName)
 	if err != nil {
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 
-	return &User{ID: id, Email: email, DisplayName: finalDisplayName}, nil
+	return &User{ID: id, LoginID: normalizedLoginID, DisplayName: finalDisplayName}, nil
 }
 
 func (s *Store) CreateAnonymousUser() (*User, error) {
-	email := "anon-" + uuid.NewString()
-	return s.CreateUser(email)
+	loginID := "anon-" + uuid.NewString()
+	return s.CreateUser(loginID)
 }
 
-func defaultDisplayName(email string) string {
-	if strings.HasPrefix(email, "anon-") {
-		trimmed := strings.TrimPrefix(email, "anon-")
+func defaultDisplayName(loginID string) string {
+	loginID = strings.TrimSpace(loginID)
+	if strings.HasPrefix(loginID, "anon-") {
+		trimmed := strings.TrimPrefix(loginID, "anon-")
 		if len(trimmed) >= 8 {
 			return "Ahoj User " + strings.ToUpper(trimmed[:8])
 		}
 		return "Ahoj User"
 	}
 
-	local := strings.Split(email, "@")[0]
+	local := strings.Split(loginID, "@")[0]
 	local = strings.TrimSpace(local)
 	if local == "" {
 		return "Ahoj User"
@@ -127,7 +129,7 @@ func (s *Store) GetUser(id string) (*User, error) {
 		WHERE id = $1
 	`, id).Scan(
 		&user.ID,
-		&user.Email,
+		&user.LoginID,
 		&user.DisplayName,
 		&user.ProfileEmail,
 		&user.Phone,
@@ -169,9 +171,27 @@ func (s *Store) GetUser(id string) (*User, error) {
 	return &user, nil
 }
 
-func (s *Store) GetUserByEmail(email string) (*User, error) {
+func (s *Store) GetUserByLoginID(loginID string) (*User, error) {
+	normalizedLoginID := strings.TrimSpace(loginID)
 	var id string
-	err := s.db.QueryRow(`SELECT id::text FROM users WHERE email = $1`, email).Scan(&id)
+	err := s.db.QueryRow(`SELECT id::text FROM users WHERE email = $1`, normalizedLoginID).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUser(id)
+}
+
+func (s *Store) GetUserByProfileEmail(profileEmail string) (*User, error) {
+	normalizedProfileEmail := strings.TrimSpace(profileEmail)
+	var id string
+	err := s.db.QueryRow(`
+		SELECT id::text
+		FROM users
+		WHERE trim(COALESCE(profile_email, '')) <> ''
+		  AND lower(trim(profile_email)) = lower(trim($1))
+		ORDER BY created_at ASC
+		LIMIT 1
+	`, normalizedProfileEmail).Scan(&id)
 	if err != nil {
 		return nil, err
 	}

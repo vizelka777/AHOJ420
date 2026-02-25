@@ -28,8 +28,8 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 		return c.String(http.StatusBadRequest, err.Error())
 	}
 
-	// 1. Check if user exists
-	user, err := s.store.GetUserByEmail(email)
+	// 1. Check if user exists by recovery contact email.
+	user, err := s.store.GetUserByProfileEmail(email)
 	if err != nil || user == nil {
 		// Security: Always return success to prevent enumeration
 		// But for dev we might want to know

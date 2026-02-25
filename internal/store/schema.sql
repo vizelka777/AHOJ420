@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,        -- legacy name: internal login ID (not guaranteed contact email)
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

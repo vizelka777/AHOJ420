@@ -120,7 +120,8 @@ func TestUserinfoClaimsByScopes(t *testing.T) {
 				now := time.Unix(1700000000, 0).UTC()
 				return &store.User{
 					ID:              userID,
-					Email:           "alice@example.com",
+					LoginID:         "anon-alice",
+					ProfileEmail:    "alice@example.com",
 					DisplayName:     "alice",
 					Phone:           "+420777123456",
 					EmailVerified:   true,
@@ -179,7 +180,7 @@ func TestPictureClaimAbsentWhenAvatarMissing(t *testing.T) {
 			get: func(userID string) (*store.User, error) {
 				return &store.User{
 					ID:          userID,
-					Email:       "bob@example.com",
+					LoginID:     "bob@example.com",
 					DisplayName: "bob",
 				}, nil
 			},
