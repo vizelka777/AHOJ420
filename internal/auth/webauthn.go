@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +30,8 @@ type Service struct {
 	provider   *mp.Provider
 	sessionTTL time.Duration
 	avatarCfg  avatarConfig
+	mailer     emailSender
+	devMode    bool
 }
 
 type avatarConfig struct {
@@ -52,6 +55,23 @@ type registrationSession struct {
 }
 
 func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
+	env := strings.TrimSpace(strings.ToLower(os.Getenv("AHOJ_ENV")))
+	devMode := env == "" || env == "dev"
+
+	mailer, err := newEmailSenderFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if mailer == nil {
+		if devMode {
+			log.Printf("SMTP is not configured: using log-only delivery for recovery links")
+		} else {
+			log.Printf("SMTP is not configured: recovery links will not be delivered by email")
+		}
+	} else {
+		log.Printf("SMTP mailer configured for auth emails")
+	}
+
 	w, err := webauthn.New(&webauthn.Config{
 		RPDisplayName: "Ahoj420 Identity",
 		RPID:          os.Getenv("RP_ID"), // auth.localhost
@@ -72,6 +92,8 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		redis:      r,
 		provider:   p,
 		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
+		mailer:     mailer,
+		devMode:    devMode,
 		avatarCfg: avatarConfig{
 			publicBase: strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE")),
 			endpoint:   strings.TrimSpace(defaultString(os.Getenv("BUNNY_STORAGE_ENDPOINT"), "storage.bunnycdn.com")),

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 )
+
+var recoveryRandReader io.Reader = rand.Reader
 
 func (s *Service) RequestRecovery(c echo.Context) error {
 	email, err := normalizeEmail(c.FormValue("email"))
@@ -34,29 +37,72 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"message": "If this email exists, a link has been sent."})
 	}
 
-	// 2. Generate Token
-	tokenBytes := make([]byte, 32)
-	rand.Read(tokenBytes)
-	token := hex.EncodeToString(tokenBytes)
+	// 2. Generate token
+	token, err := generateRecoveryToken()
+	if err != nil {
+		log.Printf("Recovery token generation failed: %v", err)
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
 
 	// 3. Store in Redis (15 min)
 	// Key: recovery_token:<token> -> userID
-	err = s.redis.Set(c.Request().Context(), "recovery_token:"+token, user.ID, 15*time.Minute).Err()
+	tokenKey := "recovery_token:" + token
+	err = s.redis.Set(c.Request().Context(), tokenKey, user.ID, 15*time.Minute).Err()
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
-	// 4. "Send" Email
-	base := os.Getenv("RP_ORIGIN")
+	// 4. Send recovery link
+	base := recoveryBaseURL()
+	magicLink := fmt.Sprintf("%s/auth/recovery/verify?token=%s", base, token)
+	if err := s.sendRecoveryLink(email, magicLink); err != nil {
+		_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
+		log.Printf("Recovery mail send failed for %s: %v", email, err)
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "If this email exists, a link has been sent."})
+}
+
+func generateRecoveryToken() (string, error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := io.ReadFull(recoveryRandReader, tokenBytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(tokenBytes), nil
+}
+
+func (s *Service) logRecoveryLink(email, magicLink string) {
+	if s.devMode {
+		log.Println("==================================================")
+		log.Printf("MAGIC LINK for %s: %s", email, magicLink)
+		log.Println("==================================================")
+		return
+	}
+	log.Printf("Recovery link generated for email: %s", email)
+}
+
+func recoveryBaseURL() string {
+	base := strings.TrimSpace(os.Getenv("AHOJ_BASE_URL"))
+	if base == "" {
+		base = strings.TrimSpace(os.Getenv("RP_ORIGIN"))
+	}
 	if base == "" {
 		base = "https://ahoj420.eu"
 	}
-	magicLink := fmt.Sprintf("%s/auth/recovery/verify?token=%s", base, token)
-	log.Println("==================================================")
-	log.Printf("MAGIC LINK for %s: %s", email, magicLink)
-	log.Println("==================================================")
+	return strings.TrimRight(base, "/")
+}
 
-	return c.JSON(http.StatusOK, map[string]string{"message": "If this email exists, a link has been sent."})
+func (s *Service) sendRecoveryLink(email, magicLink string) error {
+	if s.mailer != nil {
+		subject := "Ahoj420 recovery link"
+		body := "Use this link to access recovery mode:\n\n" + magicLink + "\n\nIf you did not request this, you can ignore this email."
+		if err := s.mailer.Send(email, subject, body); err != nil {
+			return err
+		}
+	}
+	s.logRecoveryLink(email, magicLink)
+	return nil
 }
 
 func (s *Service) VerifyRecovery(c echo.Context) error {
