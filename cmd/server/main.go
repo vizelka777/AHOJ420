@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/url"
@@ -70,7 +72,7 @@ func main() {
 		ContentSecurityPolicy: "default-src 'self'; " +
 			"script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.tailwindcss.com; " +
 			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; " +
-			"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+			"img-src 'self' data: https://avatar.ahoj420.eu; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 	}))
 
 	sensitiveLimiter := middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(rate.Limit(3)))
@@ -80,7 +82,8 @@ func main() {
 	e.GET("/", func(c echo.Context) error {
 		mode := c.QueryParam("mode")
 		if mode == "login" {
-			if _, ok := authService.SessionUserID(c); ok && !authService.InRecoveryMode(c) {
+			editProfile := c.QueryParam("edit_profile") == "1"
+			if _, ok := authService.SessionUserID(c); ok && !authService.InRecoveryMode(c) && !editProfile {
 				if returnTo := c.QueryParam("return_to"); isSafeReturnTo(returnTo) {
 					return c.Redirect(http.StatusFound, returnTo)
 				}
@@ -101,14 +104,19 @@ func main() {
 	e.POST("/auth/login/finish", authService.FinishLogin, sensitiveLimiter)
 	e.POST("/auth/logout", authService.Logout)
 	e.POST("/auth/delete-account", authService.DeleteAccount)
+	e.POST("/auth/avatar", authService.UploadAvatar)
+	e.GET("/logout", authService.LogoutRedirect)
+	e.GET("/end_session", authService.LogoutRedirect)
 	e.GET("/auth/session", authService.SessionStatus)
 	e.GET("/auth/profile", authService.GetProfile)
 	e.POST("/auth/profile", authService.UpdateProfile)
+	e.POST("/auth/profile/email/request-verify", authService.RequestProfileEmailVerify, sensitiveLimiter)
+	e.GET("/auth/profile/email/verify", authService.VerifyProfileEmail, sensitiveLimiter)
 
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
 	e.GET("/auth/recovery/verify", authService.VerifyRecovery, sensitiveLimiter)
 
-	e.Any("/.well-known/openid-configuration", oidcHandler)
+	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))
 	e.Any("/keys", oidcHandler)
 	e.Any("/jwks", rewriteOIDCPath(oidcProvider, "/keys"))
 	e.Any("/oauth/token", oidcHandler, sensitiveLimiter)
@@ -141,6 +149,12 @@ func main() {
 			if authRequestID == "" {
 				return
 			}
+			if clientHost, hostErr := oidcProvider.AuthRequestClientHost(authRequestID); hostErr == nil && clientHost != "" {
+				q := u.Query()
+				q.Set("client_host", clientHost)
+				u.RawQuery = q.Encode()
+				c.Response().Header().Set(echo.HeaderLocation, u.String())
+			}
 			c.SetCookie(&http.Cookie{
 				Name:     "oidc_auth_request",
 				Value:    authRequestID,
@@ -172,6 +186,71 @@ func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {
 		provider.ServeHTTP(c.Response(), req)
 		return nil
 	}
+}
+
+func discoveryHandler(provider http.Handler) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		rec := newResponseRecorder()
+		provider.ServeHTTP(rec, c.Request())
+
+		if rec.statusCode == 0 {
+			rec.statusCode = http.StatusOK
+		}
+		body := rec.body.Bytes()
+		if rec.statusCode >= 200 && rec.statusCode < 300 {
+			var doc map[string]any
+			if err := json.Unmarshal(body, &doc); err == nil {
+				doc["scopes_supported"] = []string{"openid", "profile", "email", "phone", "offline_access"}
+				doc["claims_supported"] = []string{
+					"sub", "iss", "aud", "exp", "iat",
+					"preferred_username", "name", "picture",
+					"email", "email_verified",
+					"phone_number", "phone_number_verified",
+				}
+				if _, ok := doc["end_session_endpoint"]; !ok {
+					doc["end_session_endpoint"] = "https://ahoj420.eu/end_session"
+				}
+				if encoded, err := json.Marshal(doc); err == nil {
+					body = encoded
+					rec.headers.Set(echo.HeaderContentType, echo.MIMEApplicationJSONCharsetUTF8)
+				}
+			}
+		}
+
+		for key, values := range rec.headers {
+			for _, value := range values {
+				c.Response().Header().Add(key, value)
+			}
+		}
+		c.Response().WriteHeader(rec.statusCode)
+		_, _ = c.Response().Write(body)
+		return nil
+	}
+}
+
+type responseRecorder struct {
+	headers    http.Header
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func newResponseRecorder() *responseRecorder {
+	return &responseRecorder{
+		headers: make(http.Header),
+		body:    &bytes.Buffer{},
+	}
+}
+
+func (r *responseRecorder) Header() http.Header {
+	return r.headers
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	return r.body.Write(data)
+}
+
+func (r *responseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
 }
 
 func isSafeReturnTo(returnTo string) bool {

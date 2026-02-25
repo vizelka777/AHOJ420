@@ -5,9 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -15,6 +18,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/houbamydar/AHOJ420/internal/avatar"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
 )
@@ -25,6 +29,17 @@ type Service struct {
 	redis      *redis.Client
 	provider   *mp.Provider
 	sessionTTL time.Duration
+	avatarCfg  avatarConfig
+	mailer     emailSender
+	devMode    bool
+}
+
+type avatarConfig struct {
+	publicBase string
+	endpoint   string
+	zone       string
+	accessKey  string
+	maxBytes   int64
 }
 
 type profilePayload struct {
@@ -40,6 +55,23 @@ type registrationSession struct {
 }
 
 func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
+	env := strings.TrimSpace(strings.ToLower(os.Getenv("AHOJ_ENV")))
+	devMode := env == "" || env == "dev"
+
+	mailer, err := newEmailSenderFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if mailer == nil {
+		if devMode {
+			log.Printf("SMTP is not configured: using log-only delivery for recovery links")
+		} else {
+			log.Printf("SMTP is not configured: recovery links will not be delivered by email")
+		}
+	} else {
+		log.Printf("SMTP mailer configured for auth emails")
+	}
+
 	w, err := webauthn.New(&webauthn.Config{
 		RPDisplayName: "Ahoj420 Identity",
 		RPID:          os.Getenv("RP_ID"), // auth.localhost
@@ -60,7 +92,31 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		redis:      r,
 		provider:   p,
 		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
+		mailer:     mailer,
+		devMode:    devMode,
+		avatarCfg: avatarConfig{
+			publicBase: strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE")),
+			endpoint:   strings.TrimSpace(defaultString(os.Getenv("BUNNY_STORAGE_ENDPOINT"), "storage.bunnycdn.com")),
+			zone:       strings.TrimSpace(os.Getenv("BUNNY_STORAGE_ZONE")),
+			accessKey:  strings.TrimSpace(os.Getenv("BUNNY_STORAGE_ACCESS_KEY")),
+			maxBytes:   2 * 1024 * 1024,
+		},
 	}, nil
+}
+
+func defaultString(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
+}
+
+func sanitizePublicEmail(email string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(email))
+	if strings.HasPrefix(trimmed, "anon-") {
+		return ""
+	}
+	return strings.TrimSpace(email)
 }
 
 func newSessionID() (string, error) {
@@ -253,17 +309,25 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 	}
 
 	redirectURL := ""
+	returnClientHost := ""
+	manualReturnRequired := false
 	if authReqID != "" && s.provider.SetAuthRequestDone(authReqID, user.ID) == nil {
 		redirectURL = "/authorize/callback?id=" + authReqID
+		if host, hostErr := s.provider.AuthRequestClientHost(authReqID); hostErr == nil && strings.TrimSpace(host) != "" {
+			returnClientHost = host
+			manualReturnRequired = true
+		}
 		c.SetCookie(&http.Cookie{Name: "oidc_auth_request", MaxAge: -1, Path: "/"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"status":        "ok",
-		"email":         user.Email,
-		"display_name":  user.DisplayName,
-		"needs_profile": true,
-		"redirect":      redirectURL,
+		"status":                 "ok",
+		"email":                  sanitizePublicEmail(user.Email),
+		"display_name":           user.DisplayName,
+		"needs_profile":          true,
+		"redirect":               redirectURL,
+		"manual_return_required": manualReturnRequired,
+		"return_client_host":     returnClientHost,
 	})
 }
 
@@ -426,17 +490,38 @@ func (s *Service) FinishLogin(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"status":       "ok",
-		"email":        user.Email,
+		"email":        sanitizePublicEmail(user.Email),
 		"display_name": user.DisplayName,
 		"redirect":     redirectURL,
 	})
 }
 
 func (s *Service) Logout(c echo.Context) error {
+	s.clearUserSession(c)
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Service) LogoutRedirect(c echo.Context) error {
+	s.clearUserSession(c)
+
+	redirectTarget := safePostLogoutRedirect(c.QueryParam("post_logout_redirect_uri"))
+	if state := strings.TrimSpace(c.QueryParam("state")); state != "" {
+		u, err := url.Parse(redirectTarget)
+		if err == nil {
+			q := u.Query()
+			q.Set("state", state)
+			u.RawQuery = q.Encode()
+			redirectTarget = u.String()
+		}
+	}
+	return c.Redirect(http.StatusFound, redirectTarget)
+}
+
+func (s *Service) clearUserSession(c echo.Context) {
 	if cookie, err := c.Cookie("user_session"); err == nil && cookie.Value != "" {
 		_ = s.redis.Del(c.Request().Context(), "sess:"+cookie.Value).Err()
+		_ = s.redis.Del(c.Request().Context(), "recovery:"+cookie.Value).Err()
 	}
-
 	c.SetCookie(&http.Cookie{
 		Name:     "user_session",
 		Value:    "",
@@ -446,8 +531,24 @@ func (s *Service) Logout(c echo.Context) error {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+}
 
-	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+func safePostLogoutRedirect(raw string) string {
+	const defaultRedirect = "https://ahoj420.eu/"
+	allowed := map[string]struct{}{
+		"https://houbamzdar.cz/":           {},
+		"https://houbamzdar.cz/index.html": {},
+		"http://localhost:3000/":           {},
+		"http://127.0.0.1:3000/":           {},
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return defaultRedirect
+	}
+	if _, ok := allowed[trimmed]; ok {
+		return trimmed
+	}
+	return defaultRedirect
 }
 
 func (s *Service) DeleteAccount(c echo.Context) error {
@@ -514,13 +615,14 @@ func (s *Service) SessionStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"authenticated":  true,
 		"recovery_mode":  s.InRecoveryMode(c),
-		"email":          user.Email,
+		"email":          sanitizePublicEmail(user.Email),
 		"display_name":   user.DisplayName,
 		"profile_email":  user.ProfileEmail,
 		"phone":          user.Phone,
 		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
+		"picture_url":    avatar.BuildPublicURL(s.avatarCfg.publicBase, user.AvatarKey, user.AvatarUpdatedAt),
 	})
 }
 
@@ -549,6 +651,7 @@ func (s *Service) GetProfile(c echo.Context) error {
 		"share_profile":  user.ShareProfile,
 		"email_verified": user.EmailVerified,
 		"phone_verified": user.PhoneVerified,
+		"picture_url":    avatar.BuildPublicURL(s.avatarCfg.publicBase, user.AvatarKey, user.AvatarUpdatedAt),
 	})
 }
 
@@ -569,7 +672,13 @@ func (s *Service) UpdateProfile(c echo.Context) error {
 	if err := c.Bind(&payload); err != nil {
 		return c.String(http.StatusBadRequest, "Invalid payload")
 	}
-	if err := s.store.UpdateProfile(userID, payload.DisplayName, payload.Email, payload.Phone, payload.ShareProfile); err != nil {
+
+	normalized, err := normalizeProfilePayload(payload)
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
+
+	if err := s.store.UpdateProfile(userID, normalized.DisplayName, normalized.Email, normalized.Phone, normalized.ShareProfile); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to save profile")
 	}
 	return c.JSON(http.StatusOK, map[string]any{"status": "ok"})

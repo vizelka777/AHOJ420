@@ -13,12 +13,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/houbamydar/AHOJ420/internal/avatar"
 	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
@@ -63,7 +65,11 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 	prodMode := envMode == envProd
 
 	userStore := &UserStore{store: s}
-	storage, err := NewMemStorage(r, userStore, prodMode)
+	avatarPublicBase := strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE"))
+	if prodMode && avatarPublicBase == "" {
+		return nil, errors.New("AVATAR_PUBLIC_BASE must be set in prod")
+	}
+	storage, err := NewMemStorage(r, userStore, prodMode, avatarPublicBase)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +107,7 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 		AuthMethodPost:           true,
 		AuthMethodPrivateKeyJWT:  true,
 		GrantTypeRefreshToken:    true,
-		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
+		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
 	}
 
 	provider, err := op.NewOpenIDProvider(
@@ -217,8 +223,27 @@ func (p *Provider) SetAuthRequestDone(id, userID string) error {
 	return fmt.Errorf("storage does not support SetAuthRequestDone")
 }
 
+func (p *Provider) AuthRequestClientHost(id string) (string, error) {
+	s, ok := p.Storage.(*MemStorage)
+	if !ok {
+		return "", fmt.Errorf("storage does not support AuthRequestClientHost")
+	}
+	return s.AuthRequestClientHost(context.Background(), id)
+}
+
 type UserStore struct {
 	store *store.Store
+	get   func(userID string) (*store.User, error)
+}
+
+func (u *UserStore) GetUser(userID string) (*store.User, error) {
+	if u == nil {
+		return nil, fmt.Errorf("user store is nil")
+	}
+	if u.get != nil {
+		return u.get(userID)
+	}
+	return u.store.GetUser(userID)
 }
 
 type SimpleKey struct {
@@ -282,17 +307,19 @@ type clientConfig struct {
 	AuthMethod    string   `json:"auth_method"`
 	GrantTypes    []string `json:"grant_types"`
 	ResponseTypes []string `json:"response_types"`
+	Scopes        []string `json:"scopes"`
 }
 
 type MemStorage struct {
 	clients    map[string]*StaticClient
 	redis      *redis.Client
 	userStore  *UserStore
+	avatarBase string
 	signingKey *SimpleKey
 	keys       []*SimpleKey
 }
 
-func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool) (*MemStorage, error) {
+func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool, avatarBase string) (*MemStorage, error) {
 	clients, err := loadClients(prodMode)
 	if err != nil {
 		return nil, err
@@ -300,9 +327,10 @@ func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool) (*MemStorage
 	log.Printf("OIDC clients loaded: %s", strings.Join(sortedClientIDs(clients), ", "))
 
 	return &MemStorage{
-		clients:   clients,
-		redis:     rdb,
-		userStore: us,
+		clients:    clients,
+		redis:      rdb,
+		userStore:  us,
+		avatarBase: strings.TrimSpace(avatarBase),
 	}, nil
 }
 
@@ -398,6 +426,16 @@ func defaultDevClients() map[string]*StaticClient {
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
 		},
+		{
+			ID:            "mushroom-bff",
+			Confidential:  true,
+			RequirePKCE:   true,
+			AuthMethod:    "basic",
+			GrantTypes:    []string{"authorization_code", "refresh_token"},
+			ResponseTypes: []string{"code"},
+			RedirectURIs:  []string{"https://api.houbamzdar.cz/auth/callback"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
+		},
 	}
 
 	out := make(map[string]*StaticClient, len(clients))
@@ -425,6 +463,11 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 		authMethod = oidc.AuthMethodNone
 		cfg.Secrets = nil
 	}
+	if cfg.Confidential && len(cfg.Secrets) == 0 && strings.EqualFold(cfg.ID, "mushroom-bff") {
+		if secret := strings.TrimSpace(os.Getenv("OIDC_CLIENT_MUSHROOM_BFF_SECRET")); secret != "" {
+			cfg.Secrets = []string{secret}
+		}
+	}
 	if cfg.Confidential && authMethod == oidc.AuthMethodNone {
 		return nil, errors.New("confidential client cannot use auth_method none")
 	}
@@ -440,6 +483,13 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedScopes := parseAllowedScopes(cfg.Scopes)
+	for _, gt := range grantTypes {
+		if gt == oidc.GrantTypeRefreshToken {
+			allowedScopes[oidc.ScopeOfflineAccess] = struct{}{}
+			break
+		}
+	}
 
 	return &StaticClient{
 		id:              cfg.ID,
@@ -450,7 +500,23 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 		applicationType: op.ApplicationTypeWeb,
 		authMethod:      authMethod,
 		requirePKCE:     cfg.RequirePKCE,
+		allowedScopes:   allowedScopes,
 	}, nil
+}
+
+func parseAllowedScopes(scopes []string) map[string]struct{} {
+	if len(scopes) == 0 {
+		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess}
+	}
+	out := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		trimmed := strings.TrimSpace(scope)
+		if trimmed == "" {
+			continue
+		}
+		out[trimmed] = struct{}{}
+	}
+	return out
 }
 
 func parseAuthMethod(raw string) (oidc.AuthMethod, error) {
@@ -627,6 +693,18 @@ func (s *MemStorage) SetAuthRequestDone(id, userID string) error {
 	return s.saveAuthRequest(ctx, req, oidcStateTTL)
 }
 
+func (s *MemStorage) AuthRequestClientHost(ctx context.Context, id string) (string, error) {
+	req, err := s.getAuthRequest(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(req.RedirectURI)
+	if err != nil {
+		return "", err
+	}
+	return parsed.Host, nil
+}
+
 func (s *MemStorage) saveAuthRequest(ctx context.Context, req *SimpleAuthRequest, ttl time.Duration) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -707,16 +785,227 @@ func randomID(prefix string) string {
 	return fmt.Sprintf("%s_%s", prefix, base64.RawURLEncoding.EncodeToString(b))
 }
 
+func publicEmailForClaims(user *store.User) string {
+	if user == nil {
+		return ""
+	}
+	email := strings.TrimSpace(user.Email)
+	if strings.TrimSpace(user.ProfileEmail) != "" {
+		email = strings.TrimSpace(user.ProfileEmail)
+	}
+	if strings.HasPrefix(strings.ToLower(email), "anon-") {
+		return ""
+	}
+	return email
+}
+
+func isRefreshTokenUsed(rec *RefreshTokenRecord) bool {
+	if rec == nil {
+		return false
+	}
+	return !rec.UsedAt.IsZero() || rec.RotatedToTokenID != ""
+}
+
+func invalidRefreshGrantError() error {
+	return oidc.ErrInvalidGrant().WithParent(op.ErrInvalidRefreshToken)
+}
+
 func (s *MemStorage) CreateAccessToken(ctx context.Context, request op.TokenRequest) (string, time.Time, error) {
-	return "access_token_" + request.GetSubject(), time.Now().Add(1 * time.Hour), nil
+	accessTokenID, err := generateAccessTokenID()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return accessTokenID, time.Now().Add(1 * time.Hour), nil
 }
 
 func (s *MemStorage) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, currentRefreshToken string) (accessTokenID string, newRefreshTokenID string, expiration time.Time, err error) {
-	return "at_" + request.GetSubject(), "rt_" + request.GetSubject(), time.Now().Add(1 * time.Hour), nil
+	now := time.Now().UTC()
+	accessTokenID, err = generateAccessTokenID()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	expiration = now.Add(1 * time.Hour)
+
+	subject := strings.TrimSpace(request.GetSubject())
+	if subject == "" {
+		return "", "", time.Time{}, fmt.Errorf("subject is required for refresh token")
+	}
+
+	clientID := ""
+	if withClientID, ok := request.(interface{ GetClientID() string }); ok {
+		clientID = strings.TrimSpace(withClientID.GetClientID())
+	}
+	if clientID == "" {
+		for _, aud := range request.GetAudience() {
+			if strings.TrimSpace(aud) != "" {
+				clientID = strings.TrimSpace(aud)
+				break
+			}
+		}
+	}
+	if clientID == "" {
+		return "", "", time.Time{}, fmt.Errorf("client id is required for refresh token")
+	}
+
+	authTime := now
+	if withAuthTime, ok := request.(interface{ GetAuthTime() time.Time }); ok {
+		reqAuthTime := withAuthTime.GetAuthTime().UTC()
+		if !reqAuthTime.IsZero() {
+			authTime = reqAuthTime
+		}
+	}
+
+	scopes := append([]string(nil), request.GetScopes()...)
+	audience := append([]string(nil), request.GetAudience()...)
+	amr := []string(nil)
+	if withAMR, ok := request.(interface{ GetAMR() []string }); ok {
+		amr = append([]string(nil), withAMR.GetAMR()...)
+	}
+
+	// Auth code flow: issue first refresh token.
+	if currentRefreshToken == "" {
+		refreshTokenID, genErr := generateRefreshTokenID()
+		if genErr != nil {
+			return "", "", time.Time{}, genErr
+		}
+		rec := &RefreshTokenRecord{
+			TokenID:       refreshTokenID,
+			UserID:        subject,
+			Subject:       subject,
+			ClientID:      clientID,
+			Scopes:        scopes,
+			Audience:      audience,
+			AMR:           amr,
+			AuthTime:      authTime,
+			IssuedAt:      now,
+			ExpiresAt:     now.Add(refreshTokenTTL),
+			ParentTokenID: "",
+			FamilyID:      refreshTokenID,
+		}
+		if len(rec.Audience) == 0 {
+			rec.Audience = []string{clientID}
+		}
+		if err := s.saveRefreshToken(ctx, rec); err != nil {
+			return "", "", time.Time{}, err
+		}
+		return accessTokenID, refreshTokenID, expiration, nil
+	}
+
+	// Refresh grant: validate current token and rotate.
+	currentRec, err := s.getRefreshToken(ctx, currentRefreshToken)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return "", "", time.Time{}, invalidRefreshGrantError()
+		}
+		return "", "", time.Time{}, err
+	}
+	if currentRec.FamilyID == "" {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if currentRec.ClientID != clientID || strings.TrimSpace(currentRec.GetSubject()) != subject {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, currentRec.FamilyID)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	if familyRevoked {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if !currentRec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, currentRefreshToken)
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if !currentRec.RevokedAt.IsZero() {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if isRefreshTokenUsed(currentRec) {
+		_ = s.revokeRefreshTokenFamily(ctx, currentRec.FamilyID, currentRec.ExpiresAt)
+		currentRec.ReuseDetectedAt = now
+		_ = s.saveRefreshToken(ctx, currentRec)
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+
+	newTokenID, genErr := generateRefreshTokenID()
+	if genErr != nil {
+		return "", "", time.Time{}, genErr
+	}
+
+	newRec := &RefreshTokenRecord{
+		TokenID:          newTokenID,
+		UserID:           strings.TrimSpace(currentRec.GetSubject()),
+		Subject:          strings.TrimSpace(currentRec.GetSubject()),
+		ClientID:         currentRec.ClientID,
+		Scopes:           scopes,
+		Audience:         audience,
+		AMR:              append([]string(nil), currentRec.GetAMR()...),
+		AuthTime:         currentRec.AuthTime,
+		IssuedAt:         now,
+		ExpiresAt:        now.Add(refreshTokenTTL),
+		ParentTokenID:    currentRec.TokenID,
+		FamilyID:         currentRec.FamilyID,
+		RotatedToTokenID: "",
+	}
+	if len(newRec.Scopes) == 0 {
+		newRec.Scopes = append([]string(nil), currentRec.Scopes...)
+	}
+	if len(newRec.Audience) == 0 {
+		newRec.Audience = append([]string(nil), currentRec.Audience...)
+	}
+	if len(newRec.Audience) == 0 {
+		newRec.Audience = []string{newRec.ClientID}
+	}
+
+	if err := s.saveRefreshToken(ctx, newRec); err != nil {
+		return "", "", time.Time{}, err
+	}
+
+	currentRec.UsedAt = now
+	currentRec.RotatedToTokenID = newTokenID
+	if err := s.saveRefreshToken(ctx, currentRec); err != nil {
+		return "", "", time.Time{}, err
+	}
+
+	return accessTokenID, newTokenID, expiration, nil
 }
 
 func (s *MemStorage) TokenRequestByRefreshToken(ctx context.Context, refreshTokenID string) (op.RefreshTokenRequest, error) {
-	return nil, fmt.Errorf("not implemented")
+	rec, err := s.getRefreshToken(ctx, refreshTokenID)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return nil, op.ErrInvalidRefreshToken
+		}
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	if rec.FamilyID == "" {
+		return nil, op.ErrInvalidRefreshToken
+	}
+
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, rec.FamilyID)
+	if err != nil {
+		return nil, err
+	}
+	if familyRevoked {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if !rec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, refreshTokenID)
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if !rec.RevokedAt.IsZero() {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if isRefreshTokenUsed(rec) {
+		_ = s.revokeRefreshTokenFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		rec.ReuseDetectedAt = now
+		_ = s.saveRefreshToken(ctx, rec)
+		return nil, op.ErrInvalidRefreshToken
+	}
+
+	return rec, nil
 }
 
 func (s *MemStorage) TerminateSession(ctx context.Context, userID, clientID string) error {
@@ -728,7 +1017,48 @@ func (s *MemStorage) RevokeToken(ctx context.Context, token, userID, clientID st
 }
 
 func (s *MemStorage) GetRefreshTokenInfo(ctx context.Context, clientID, token string) (userID, tokenID string, err error) {
-	return "", "", fmt.Errorf("not implemented")
+	rec, err := s.getRefreshToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return "", "", op.ErrInvalidRefreshToken
+		}
+		return "", "", err
+	}
+
+	now := time.Now().UTC()
+	if rec.FamilyID == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, rec.FamilyID)
+	if err != nil {
+		return "", "", err
+	}
+	if familyRevoked {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if !rec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, token)
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if !rec.RevokedAt.IsZero() {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if isRefreshTokenUsed(rec) {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if strings.TrimSpace(clientID) != "" && rec.ClientID != strings.TrimSpace(clientID) {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+
+	subject := strings.TrimSpace(rec.GetSubject())
+	if subject == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if rec.TokenID == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+
+	return subject, rec.TokenID, nil
 }
 
 func (s *MemStorage) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
@@ -755,7 +1085,7 @@ func (s *MemStorage) AuthorizeClientIDSecret(ctx context.Context, clientID, clie
 }
 
 func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.UserInfo, userID, clientID string, scopes []string) error {
-	user, err := s.userStore.store.GetUser(userID)
+	user, err := s.userStore.GetUser(userID)
 	if err != nil {
 		return err
 	}
@@ -763,17 +1093,18 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 	for _, scope := range scopes {
 		switch scope {
 		case oidc.ScopeProfile:
-			if user.ShareProfile {
-				userinfo.Name = user.DisplayName
-				userinfo.PreferredUsername = user.DisplayName
+			userinfo.Name = user.DisplayName
+			userinfo.PreferredUsername = user.DisplayName
+			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
+				userinfo.Picture = picture
 			}
 		case oidc.ScopeEmail:
-			if user.ShareProfile && user.ProfileEmail != "" {
-				userinfo.Email = user.ProfileEmail
+			if email := publicEmailForClaims(user); email != "" {
+				userinfo.Email = email
 				userinfo.EmailVerified = oidc.Bool(user.EmailVerified)
 			}
 		case oidc.ScopePhone:
-			if user.ShareProfile && user.Phone != "" {
+			if strings.TrimSpace(user.Phone) != "" {
 				userinfo.PhoneNumber = user.Phone
 				userinfo.PhoneNumberVerified = oidc.Bool(user.PhoneVerified)
 			}
@@ -781,7 +1112,6 @@ func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.U
 	}
 	return nil
 }
-
 func (s *MemStorage) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.UserInfo, tokenID, subject, origin string) error {
 	return nil
 }
@@ -792,28 +1122,27 @@ func (s *MemStorage) SetIntrospectionFromToken(ctx context.Context, userinfo *oi
 }
 
 func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, clientID string, scopes []string) (map[string]interface{}, error) {
-	user, err := s.userStore.store.GetUser(userID)
+	user, err := s.userStore.GetUser(userID)
 	if err != nil {
 		return nil, err
 	}
 
 	claims := map[string]interface{}{}
-	if !user.ShareProfile {
-		return claims, nil
-	}
-
 	for _, scope := range scopes {
 		switch scope {
 		case oidc.ScopeProfile:
 			claims["name"] = user.DisplayName
 			claims["preferred_username"] = user.DisplayName
+			if picture := avatar.BuildPublicURL(s.avatarBase, user.AvatarKey, user.AvatarUpdatedAt); picture != "" {
+				claims["picture"] = picture
+			}
 		case oidc.ScopeEmail:
-			if user.ProfileEmail != "" {
-				claims["email"] = user.ProfileEmail
+			if email := publicEmailForClaims(user); email != "" {
+				claims["email"] = email
 				claims["email_verified"] = user.EmailVerified
 			}
 		case oidc.ScopePhone:
-			if user.Phone != "" {
+			if strings.TrimSpace(user.Phone) != "" {
 				claims["phone_number"] = user.Phone
 				claims["phone_number_verified"] = user.PhoneVerified
 			}
@@ -821,7 +1150,6 @@ func (s *MemStorage) GetPrivateClaimsFromScopes(ctx context.Context, userID, cli
 	}
 	return claims, nil
 }
-
 func (s *MemStorage) GetKeyByIDAndClientID(ctx context.Context, keyID, clientID string) (*jose.JSONWebKey, error) {
 	for _, key := range s.keys {
 		if key.id != keyID {
@@ -859,7 +1187,16 @@ func (s *MemStorage) KeySet(ctx context.Context) ([]op.Key, error) {
 	}
 	keys := make([]op.Key, 0, len(s.keys))
 	for _, key := range s.keys {
-		keys = append(keys, key)
+		pubKey := key.key
+		if rsaKey, ok := key.key.(*rsa.PrivateKey); ok {
+			pubKey = &rsaKey.PublicKey
+		}
+		keys = append(keys, &SimpleKey{
+			id:  key.id,
+			alg: key.alg,
+			use: key.use,
+			key: pubKey,
+		})
 	}
 	return keys, nil
 }
@@ -873,6 +1210,7 @@ type StaticClient struct {
 	applicationType op.ApplicationType
 	authMethod      oidc.AuthMethod
 	requirePKCE     bool
+	allowedScopes   map[string]struct{}
 }
 
 func (c *StaticClient) GetID() string                        { return c.id }
@@ -885,9 +1223,12 @@ func (c *StaticClient) GrantTypes() []oidc.GrantType         { return c.grantTyp
 func (c *StaticClient) AccessTokenType() op.AccessTokenType  { return op.AccessTokenTypeBearer }
 func (c *StaticClient) IDTokenLifetime() time.Duration       { return 1 * time.Hour }
 func (c *StaticClient) DevMode() bool                        { return true }
-func (c *StaticClient) IDTokenUserinfoClaimsAssertion() bool { return false }
+func (c *StaticClient) IDTokenUserinfoClaimsAssertion() bool { return true }
 func (c *StaticClient) ClockSkew() time.Duration             { return 0 }
-func (c *StaticClient) IsScopeAllowed(scope string) bool     { return true }
+func (c *StaticClient) IsScopeAllowed(scope string) bool {
+	_, ok := c.allowedScopes[scope]
+	return ok
+}
 func (c *StaticClient) RestrictAdditionalIdTokenScopes() func(scopes []string) []string {
 	return func(scopes []string) []string { return scopes }
 }

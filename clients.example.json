@@ -1,0 +1,22 @@
+[
+  {
+    "id": "client2",
+    "redirect_uris": ["https://houbamzdar.cz/callback2.html"],
+    "confidential": false,
+    "require_pkce": true,
+    "auth_method": "none",
+    "grant_types": ["authorization_code"],
+    "response_types": ["code"],
+    "scopes": ["openid", "profile", "email", "phone"]
+  },
+  {
+    "id": "mushroom-bff",
+    "redirect_uris": ["https://api.houbamzdar.cz/auth/callback"],
+    "confidential": true,
+    "require_pkce": true,
+    "auth_method": "basic",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "scopes": ["openid", "profile", "email", "phone"]
+  }
+]

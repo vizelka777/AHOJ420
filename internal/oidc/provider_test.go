@@ -3,8 +3,10 @@ package oidc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
@@ -107,5 +109,96 @@ func TestAuthCodeSingleUse(t *testing.T) {
 
 	if _, err := st.AuthRequestByCode(context.Background(), "code123"); err == nil {
 		t.Fatal("second AuthRequestByCode should fail for single-use code")
+	}
+}
+
+func TestUserinfoClaimsByScopes(t *testing.T) {
+	st := &MemStorage{
+		avatarBase: "https://avatar.ahoj420.eu/",
+		userStore: &UserStore{
+			get: func(userID string) (*store.User, error) {
+				now := time.Unix(1700000000, 0).UTC()
+				return &store.User{
+					ID:              userID,
+					Email:           "alice@example.com",
+					DisplayName:     "alice",
+					Phone:           "+420777123456",
+					EmailVerified:   true,
+					PhoneVerified:   false,
+					AvatarKey:       "avatars/u-1.webp",
+					AvatarUpdatedAt: &now,
+				}, nil
+			},
+		},
+	}
+
+	userinfo := &oidc.UserInfo{}
+	scopes := []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone}
+	if err := st.SetUserinfoFromScopes(context.Background(), userinfo, "u-1", "client2", scopes); err != nil {
+		t.Fatalf("SetUserinfoFromScopes failed: %v", err)
+	}
+
+	if userinfo.Subject != "u-1" {
+		t.Fatalf("unexpected sub: %s", userinfo.Subject)
+	}
+	if userinfo.Name != "alice" || userinfo.PreferredUsername != "alice" {
+		t.Fatalf("unexpected profile claims: name=%q preferred=%q", userinfo.Name, userinfo.PreferredUsername)
+	}
+	if userinfo.Email != "alice@example.com" || !bool(userinfo.EmailVerified) {
+		t.Fatalf("unexpected email claims: %+v", userinfo)
+	}
+	if userinfo.PhoneNumber != "+420777123456" || bool(userinfo.PhoneNumberVerified) {
+		t.Fatalf("unexpected phone claims: %+v", userinfo)
+	}
+	if userinfo.Picture == "" {
+		t.Fatalf("missing picture in userinfo: %+v", userinfo)
+	}
+
+	privateClaims, err := st.GetPrivateClaimsFromScopes(context.Background(), "u-1", "client2", scopes)
+	if err != nil {
+		t.Fatalf("GetPrivateClaimsFromScopes failed: %v", err)
+	}
+	if privateClaims["preferred_username"] != "alice" {
+		t.Fatalf("missing preferred_username claim")
+	}
+	if privateClaims["email"] != "alice@example.com" {
+		t.Fatalf("missing email claim")
+	}
+	if privateClaims["phone_number"] != "+420777123456" {
+		t.Fatalf("missing phone_number claim")
+	}
+	if privateClaims["picture"] == "" {
+		t.Fatalf("missing picture claim")
+	}
+}
+
+func TestPictureClaimAbsentWhenAvatarMissing(t *testing.T) {
+	st := &MemStorage{
+		avatarBase: "https://avatar.ahoj420.eu/",
+		userStore: &UserStore{
+			get: func(userID string) (*store.User, error) {
+				return &store.User{
+					ID:          userID,
+					Email:       "bob@example.com",
+					DisplayName: "bob",
+				}, nil
+			},
+		},
+	}
+
+	userinfo := &oidc.UserInfo{}
+	if err := st.SetUserinfoFromScopes(context.Background(), userinfo, "u-2", "client2", []string{oidc.ScopeProfile}); err != nil {
+		t.Fatalf("SetUserinfoFromScopes failed: %v", err)
+	}
+	if userinfo.Picture != "" {
+		t.Fatalf("picture must be absent, got %q", userinfo.Picture)
+	}
+
+	privateClaims, err := st.GetPrivateClaimsFromScopes(context.Background(), "u-2", "client2", []string{oidc.ScopeProfile})
+	if err != nil {
+		t.Fatalf("GetPrivateClaimsFromScopes failed: %v", err)
+	}
+	if _, ok := privateClaims["picture"]; ok {
+		t.Fatalf("picture claim must be absent: %+v", privateClaims)
 	}
 }
