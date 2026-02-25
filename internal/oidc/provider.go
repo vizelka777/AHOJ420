@@ -484,6 +484,12 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 		return nil, err
 	}
 	allowedScopes := parseAllowedScopes(cfg.Scopes)
+	for _, gt := range grantTypes {
+		if gt == oidc.GrantTypeRefreshToken {
+			allowedScopes[oidc.ScopeOfflineAccess] = struct{}{}
+			break
+		}
+	}
 
 	return &StaticClient{
 		id:              cfg.ID,
