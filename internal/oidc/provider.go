@@ -106,7 +106,7 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 		AuthMethodPost:           true,
 		AuthMethodPrivateKeyJWT:  true,
 		GrantTypeRefreshToken:    true,
-		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
+		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
 	}
 
 	provider, err := op.NewOpenIDProvider(
@@ -425,7 +425,7 @@ func defaultDevClients() map[string]*StaticClient {
 			GrantTypes:    []string{"authorization_code", "refresh_token"},
 			ResponseTypes: []string{"code"},
 			RedirectURIs:  []string{"https://api.houbamzdar.cz/auth/callback"},
-			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
 		},
 	}
 
@@ -491,7 +491,7 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 
 func parseAllowedScopes(scopes []string) map[string]struct{} {
 	if len(scopes) == 0 {
-		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone}
+		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess}
 	}
 	out := make(map[string]struct{}, len(scopes))
 	for _, scope := range scopes {
