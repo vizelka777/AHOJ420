@@ -15,7 +15,10 @@ type Store struct {
 	db *sql.DB
 }
 
-var ErrProfileEmailVerificationMismatch = errors.New("profile email mismatch or nothing to verify")
+var (
+	ErrProfileEmailVerificationMismatch = errors.New("profile email mismatch or nothing to verify")
+	ErrPhoneVerificationMismatch        = errors.New("phone mismatch or nothing to verify")
+)
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
@@ -264,6 +267,28 @@ func (s *Store) VerifyProfileEmail(userID, expectedEmail string) error {
 	}
 	if affected == 0 {
 		return ErrProfileEmailVerificationMismatch
+	}
+	return nil
+}
+
+func (s *Store) VerifyPhone(userID, expectedPhone string) error {
+	res, err := s.db.Exec(`
+		UPDATE users
+		SET
+			phone_verified = true
+		WHERE id = $1
+		  AND trim(COALESCE(phone, '')) <> ''
+		  AND trim(COALESCE(phone, '')) = trim($2)
+	`, userID, strings.TrimSpace(expectedPhone))
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrPhoneVerificationMismatch
 	}
 	return nil
 }

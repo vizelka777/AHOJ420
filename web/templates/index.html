@@ -638,8 +638,39 @@
             }
         }
 
-        function verifyPhoneStub() {
-            showMessage("Подтверждение телефона пока в разработке.", "text-yellow-400");
+        async function verifyPhoneStub() {
+            const btn = document.getElementById('btn-verify-phone');
+            btn.disabled = true;
+            try {
+                const sendRes = await fetch('/auth/profile/phone/request-verify', { method: 'POST' });
+                const sendText = await sendRes.text();
+                if (!sendRes.ok) {
+                    throw new Error(sendText || ("HTTP " + sendRes.status));
+                }
+
+                const code = (window.prompt("Введите 6-значный код из SMS:") || "").trim();
+                if (!code) {
+                    showMessage("Код не введен.", "text-yellow-400");
+                    return;
+                }
+
+                const verifyRes = await fetch('/auth/profile/phone/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: code })
+                });
+                const verifyText = await verifyRes.text();
+                if (!verifyRes.ok) {
+                    throw new Error(verifyText || ("HTTP " + verifyRes.status));
+                }
+
+                await loadProfileForAccountUI();
+                showMessage("Телефон подтвержден.", "text-green-400");
+            } catch (err) {
+                showMessage("Не удалось подтвердить телефон: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
+            }
         }
 
         function openProfileModal(profile) {
