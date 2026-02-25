@@ -200,7 +200,7 @@ func discoveryHandler(provider http.Handler) echo.HandlerFunc {
 		if rec.statusCode >= 200 && rec.statusCode < 300 {
 			var doc map[string]any
 			if err := json.Unmarshal(body, &doc); err == nil {
-				doc["scopes_supported"] = []string{"openid", "profile", "email", "phone"}
+				doc["scopes_supported"] = []string{"openid", "profile", "email", "phone", "offline_access"}
 				doc["claims_supported"] = []string{
 					"sub", "iss", "aud", "exp", "iat",
 					"preferred_username", "name", "picture",

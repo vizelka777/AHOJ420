@@ -107,7 +107,7 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 		AuthMethodPost:           true,
 		AuthMethodPrivateKeyJWT:  true,
 		GrantTypeRefreshToken:    true,
-		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
+		SupportedScopes:          []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
 	}
 
 	provider, err := op.NewOpenIDProvider(
@@ -434,7 +434,7 @@ func defaultDevClients() map[string]*StaticClient {
 			GrantTypes:    []string{"authorization_code", "refresh_token"},
 			ResponseTypes: []string{"code"},
 			RedirectURIs:  []string{"https://api.houbamzdar.cz/auth/callback"},
-			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
 		},
 	}
 
@@ -500,7 +500,7 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 
 func parseAllowedScopes(scopes []string) map[string]struct{} {
 	if len(scopes) == 0 {
-		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone}
+		scopes = []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess}
 	}
 	out := make(map[string]struct{}, len(scopes))
 	for _, scope := range scopes {
@@ -793,16 +793,213 @@ func publicEmailForClaims(user *store.User) string {
 	return email
 }
 
+func isRefreshTokenUsed(rec *RefreshTokenRecord) bool {
+	if rec == nil {
+		return false
+	}
+	return !rec.UsedAt.IsZero() || rec.RotatedToTokenID != ""
+}
+
+func invalidRefreshGrantError() error {
+	return oidc.ErrInvalidGrant().WithParent(op.ErrInvalidRefreshToken)
+}
+
 func (s *MemStorage) CreateAccessToken(ctx context.Context, request op.TokenRequest) (string, time.Time, error) {
-	return "access_token_" + request.GetSubject(), time.Now().Add(1 * time.Hour), nil
+	accessTokenID, err := generateAccessTokenID()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return accessTokenID, time.Now().Add(1 * time.Hour), nil
 }
 
 func (s *MemStorage) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, currentRefreshToken string) (accessTokenID string, newRefreshTokenID string, expiration time.Time, err error) {
-	return "at_" + request.GetSubject(), "rt_" + request.GetSubject(), time.Now().Add(1 * time.Hour), nil
+	now := time.Now().UTC()
+	accessTokenID, err = generateAccessTokenID()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	expiration = now.Add(1 * time.Hour)
+
+	subject := strings.TrimSpace(request.GetSubject())
+	if subject == "" {
+		return "", "", time.Time{}, fmt.Errorf("subject is required for refresh token")
+	}
+
+	clientID := ""
+	if withClientID, ok := request.(interface{ GetClientID() string }); ok {
+		clientID = strings.TrimSpace(withClientID.GetClientID())
+	}
+	if clientID == "" {
+		for _, aud := range request.GetAudience() {
+			if strings.TrimSpace(aud) != "" {
+				clientID = strings.TrimSpace(aud)
+				break
+			}
+		}
+	}
+	if clientID == "" {
+		return "", "", time.Time{}, fmt.Errorf("client id is required for refresh token")
+	}
+
+	authTime := now
+	if withAuthTime, ok := request.(interface{ GetAuthTime() time.Time }); ok {
+		reqAuthTime := withAuthTime.GetAuthTime().UTC()
+		if !reqAuthTime.IsZero() {
+			authTime = reqAuthTime
+		}
+	}
+
+	scopes := append([]string(nil), request.GetScopes()...)
+	audience := append([]string(nil), request.GetAudience()...)
+	amr := []string(nil)
+	if withAMR, ok := request.(interface{ GetAMR() []string }); ok {
+		amr = append([]string(nil), withAMR.GetAMR()...)
+	}
+
+	// Auth code flow: issue first refresh token.
+	if currentRefreshToken == "" {
+		refreshTokenID, genErr := generateRefreshTokenID()
+		if genErr != nil {
+			return "", "", time.Time{}, genErr
+		}
+		rec := &RefreshTokenRecord{
+			TokenID:       refreshTokenID,
+			UserID:        subject,
+			Subject:       subject,
+			ClientID:      clientID,
+			Scopes:        scopes,
+			Audience:      audience,
+			AMR:           amr,
+			AuthTime:      authTime,
+			IssuedAt:      now,
+			ExpiresAt:     now.Add(refreshTokenTTL),
+			ParentTokenID: "",
+			FamilyID:      refreshTokenID,
+		}
+		if len(rec.Audience) == 0 {
+			rec.Audience = []string{clientID}
+		}
+		if err := s.saveRefreshToken(ctx, rec); err != nil {
+			return "", "", time.Time{}, err
+		}
+		return accessTokenID, refreshTokenID, expiration, nil
+	}
+
+	// Refresh grant: validate current token and rotate.
+	currentRec, err := s.getRefreshToken(ctx, currentRefreshToken)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return "", "", time.Time{}, invalidRefreshGrantError()
+		}
+		return "", "", time.Time{}, err
+	}
+	if currentRec.FamilyID == "" {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if currentRec.ClientID != clientID || strings.TrimSpace(currentRec.GetSubject()) != subject {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, currentRec.FamilyID)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	if familyRevoked {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if !currentRec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, currentRefreshToken)
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if !currentRec.RevokedAt.IsZero() {
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+	if isRefreshTokenUsed(currentRec) {
+		_ = s.revokeRefreshTokenFamily(ctx, currentRec.FamilyID, currentRec.ExpiresAt)
+		currentRec.ReuseDetectedAt = now
+		_ = s.saveRefreshToken(ctx, currentRec)
+		return "", "", time.Time{}, invalidRefreshGrantError()
+	}
+
+	newTokenID, genErr := generateRefreshTokenID()
+	if genErr != nil {
+		return "", "", time.Time{}, genErr
+	}
+
+	newRec := &RefreshTokenRecord{
+		TokenID:          newTokenID,
+		UserID:           strings.TrimSpace(currentRec.GetSubject()),
+		Subject:          strings.TrimSpace(currentRec.GetSubject()),
+		ClientID:         currentRec.ClientID,
+		Scopes:           scopes,
+		Audience:         audience,
+		AMR:              append([]string(nil), currentRec.GetAMR()...),
+		AuthTime:         currentRec.AuthTime,
+		IssuedAt:         now,
+		ExpiresAt:        now.Add(refreshTokenTTL),
+		ParentTokenID:    currentRec.TokenID,
+		FamilyID:         currentRec.FamilyID,
+		RotatedToTokenID: "",
+	}
+	if len(newRec.Scopes) == 0 {
+		newRec.Scopes = append([]string(nil), currentRec.Scopes...)
+	}
+	if len(newRec.Audience) == 0 {
+		newRec.Audience = append([]string(nil), currentRec.Audience...)
+	}
+	if len(newRec.Audience) == 0 {
+		newRec.Audience = []string{newRec.ClientID}
+	}
+
+	if err := s.saveRefreshToken(ctx, newRec); err != nil {
+		return "", "", time.Time{}, err
+	}
+
+	currentRec.UsedAt = now
+	currentRec.RotatedToTokenID = newTokenID
+	if err := s.saveRefreshToken(ctx, currentRec); err != nil {
+		return "", "", time.Time{}, err
+	}
+
+	return accessTokenID, newTokenID, expiration, nil
 }
 
 func (s *MemStorage) TokenRequestByRefreshToken(ctx context.Context, refreshTokenID string) (op.RefreshTokenRequest, error) {
-	return nil, fmt.Errorf("not implemented")
+	rec, err := s.getRefreshToken(ctx, refreshTokenID)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return nil, op.ErrInvalidRefreshToken
+		}
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	if rec.FamilyID == "" {
+		return nil, op.ErrInvalidRefreshToken
+	}
+
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, rec.FamilyID)
+	if err != nil {
+		return nil, err
+	}
+	if familyRevoked {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if !rec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, refreshTokenID)
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if !rec.RevokedAt.IsZero() {
+		return nil, op.ErrInvalidRefreshToken
+	}
+	if isRefreshTokenUsed(rec) {
+		_ = s.revokeRefreshTokenFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		rec.ReuseDetectedAt = now
+		_ = s.saveRefreshToken(ctx, rec)
+		return nil, op.ErrInvalidRefreshToken
+	}
+
+	return rec, nil
 }
 
 func (s *MemStorage) TerminateSession(ctx context.Context, userID, clientID string) error {
@@ -814,7 +1011,48 @@ func (s *MemStorage) RevokeToken(ctx context.Context, token, userID, clientID st
 }
 
 func (s *MemStorage) GetRefreshTokenInfo(ctx context.Context, clientID, token string) (userID, tokenID string, err error) {
-	return "", "", fmt.Errorf("not implemented")
+	rec, err := s.getRefreshToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return "", "", op.ErrInvalidRefreshToken
+		}
+		return "", "", err
+	}
+
+	now := time.Now().UTC()
+	if rec.FamilyID == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	familyRevoked, err := s.isRefreshTokenFamilyRevoked(ctx, rec.FamilyID)
+	if err != nil {
+		return "", "", err
+	}
+	if familyRevoked {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if !rec.ExpiresAt.After(now) {
+		_ = s.deleteRefreshToken(ctx, token)
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if !rec.RevokedAt.IsZero() {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if isRefreshTokenUsed(rec) {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if strings.TrimSpace(clientID) != "" && rec.ClientID != strings.TrimSpace(clientID) {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+
+	subject := strings.TrimSpace(rec.GetSubject())
+	if subject == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+	if rec.TokenID == "" {
+		return "", "", op.ErrInvalidRefreshToken
+	}
+
+	return subject, rec.TokenID, nil
 }
 
 func (s *MemStorage) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
