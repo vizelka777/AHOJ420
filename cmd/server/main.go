@@ -110,6 +110,8 @@ func main() {
 	e.GET("/auth/session", authService.SessionStatus)
 	e.GET("/auth/profile", authService.GetProfile)
 	e.POST("/auth/profile", authService.UpdateProfile)
+	e.POST("/auth/profile/email/request-verify", authService.RequestProfileEmailVerify, sensitiveLimiter)
+	e.GET("/auth/profile/email/verify", authService.VerifyProfileEmail, sensitiveLimiter)
 
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
 	e.GET("/auth/recovery/verify", authService.VerifyRecovery, sensitiveLimiter)

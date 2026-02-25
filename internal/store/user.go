@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ import (
 type Store struct {
 	db *sql.DB
 }
+
+var ErrProfileEmailVerificationMismatch = errors.New("profile email mismatch or nothing to verify")
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
@@ -242,4 +245,25 @@ func (s *Store) UpdateAvatar(userID, avatarKey, avatarMIME string, avatarBytes i
 		WHERE id = $4
 	`, strings.TrimSpace(avatarKey), strings.TrimSpace(avatarMIME), avatarBytes, userID)
 	return err
+}
+
+func (s *Store) VerifyProfileEmail(userID, expectedEmail string) error {
+	res, err := s.db.Exec(`
+		UPDATE users
+		SET
+			email_verified = true
+		WHERE id = $1
+		  AND lower(trim(COALESCE(profile_email, ''))) = lower(trim($2))
+	`, userID, strings.TrimSpace(expectedEmail))
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrProfileEmailVerificationMismatch
+	}
+	return nil
 }
