@@ -29,6 +29,7 @@ type deviceSessionMeta struct {
 }
 
 type deviceSessionDTO struct {
+	SessionID  string `json:"session_id"`
 	Device     string `json:"device"`
 	UserAgent  string `json:"user_agent,omitempty"`
 	IP         string `json:"ip,omitempty"`
@@ -36,6 +37,10 @@ type deviceSessionDTO struct {
 	LastSeenAt string `json:"last_seen_at,omitempty"`
 	Active     bool   `json:"active"`
 	Current    bool   `json:"current"`
+}
+
+type deviceLogoutPayload struct {
+	SessionID string `json:"session_id"`
 }
 
 func deviceSessionMetaKey(sessionID string) string {
@@ -203,6 +208,7 @@ func (s *Service) ListDeviceSessions(c echo.Context) error {
 		}
 
 		devices = append(devices, deviceSessionDTO{
+			SessionID:  sessionID,
 			Device:     sessionDeviceLabel(meta.UserAgent),
 			UserAgent:  meta.UserAgent,
 			IP:         meta.IP,
@@ -214,4 +220,83 @@ func (s *Service) ListDeviceSessions(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{"devices": devices})
+}
+
+func normalizeDeviceSessionID(raw string) (string, error) {
+	sessionID := strings.TrimSpace(raw)
+	if sessionID == "" {
+		return "", errors.New("session_id is required")
+	}
+	if len(sessionID) > 128 {
+		return "", errors.New("invalid session_id")
+	}
+	for _, r := range sessionID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return "", errors.New("invalid session_id")
+	}
+	return sessionID, nil
+}
+
+func (s *Service) LogoutDeviceSession(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	var body deviceLogoutPayload
+	_ = c.Bind(&body)
+	sessionID, err := normalizeDeviceSessionID(body.SessionID)
+	if err != nil {
+		sessionID, err = normalizeDeviceSessionID(c.FormValue("session_id"))
+		if err != nil {
+			return c.String(http.StatusBadRequest, err.Error())
+		}
+	}
+
+	ctx := c.Request().Context()
+	metaPayload, err := s.redis.Get(ctx, deviceSessionMetaKey(sessionID)).Bytes()
+	if err == nil {
+		var meta deviceSessionMeta
+		if json.Unmarshal(metaPayload, &meta) == nil {
+			if strings.TrimSpace(meta.UserID) != "" && strings.TrimSpace(meta.UserID) != userID {
+				return c.String(http.StatusForbidden, "forbidden")
+			}
+		}
+	} else if !errors.Is(err, redis.Nil) {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	if ownerID, ownerErr := s.redis.Get(ctx, "sess:"+sessionID).Result(); ownerErr == nil && strings.TrimSpace(ownerID) != userID {
+		return c.String(http.StatusForbidden, "forbidden")
+	} else if ownerErr != nil && !errors.Is(ownerErr, redis.Nil) {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	pipe := s.redis.TxPipeline()
+	pipe.Del(ctx, "sess:"+sessionID)
+	pipe.Del(ctx, "recovery:"+sessionID)
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	currentSessionID, _ := s.sessionID(c)
+	currentLoggedOut := sessionID == currentSessionID
+	if currentLoggedOut {
+		c.SetCookie(&http.Cookie{
+			Name:     "user_session",
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":             "ok",
+		"current_logged_out": currentLoggedOut,
+	})
 }

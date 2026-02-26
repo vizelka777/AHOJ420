@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="/static/js/glue.js?v=20260226c"></script>
+    <script src="/static/js/glue.js?v=20260226d"></script>
     <style>
         #profile-modal,
         #recovery-modal,
@@ -37,7 +37,6 @@
             <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-teal-400 to-blue-500">
                 Ahoj420
             </h1>
-            <p class="text-gray-400 mt-2">The Passwordless Future</p>
         </div>
 
         <div id="guest-ui">
@@ -86,10 +85,11 @@
                     Add Device
                 </button>
             </div>
+            <div id="message-guest" class="mt-4 text-center text-sm min-h-[20px]"></div>
         </div>
 
         <div id="account-ui" class="hidden space-y-4">
-            <h2 class="text-xl font-semibold text-center">Ваш профиль</h2>
+            <h2 class="text-xl font-semibold text-center">Ahoj <span id="account-title-name">User</span></h2>
             <div id="recovery-passkey-panel" class="hidden p-3 border border-amber-500/40 rounded-lg bg-amber-500/10 text-amber-100 text-sm space-y-2">
                 <div>Режим восстановления активен. Создайте новый passkey, чтобы заменить старые ключи.</div>
                 <button id="btn-recovery-create-passkey" type="button" onclick="createRecoveryPasskey()"
@@ -105,27 +105,26 @@
                     Подтвердить QR вход
                 </button>
             </div>
-            <div id="device-sessions-panel" class="p-3 border border-gray-700 rounded-lg bg-gray-900/60 space-y-2">
-                <div class="flex items-center justify-between">
-                    <div class="text-sm font-semibold text-gray-100">Устройства и сессии</div>
-                    <button type="button" onclick="loadDevicesForAccountUI()"
-                        class="px-2 py-1 text-xs border border-gray-600 rounded text-gray-300 hover:text-white hover:border-gray-400 transition">
-                        Обновить
-                    </button>
-                </div>
-                <div id="device-sessions-list" class="space-y-2 text-xs text-gray-300">
-                    <div class="text-gray-400">Загрузка...</div>
-                </div>
-            </div>
             <div class="flex items-center gap-3">
                 <img id="account-avatar" src="" alt="Avatar"
                     class="w-16 h-16 rounded-full object-cover border border-gray-700 bg-gray-900 hidden">
                 <form onsubmit="uploadAvatar(event)" class="flex-1 flex gap-2 items-center">
-                    <input id="avatar-file" type="file" accept="image/jpeg,image/png,image/webp"
-                        class="flex-1 text-sm text-gray-300">
+                    <input id="avatar-file" type="file" accept="image/jpeg,image/png,image/webp" onchange="onAvatarFileSelected(event)"
+                        class="hidden">
+                    <label for="avatar-file" title="Выбрать файл"
+                        class="w-10 h-10 inline-flex items-center justify-center rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition cursor-pointer">
+                        <svg viewBox="0 0 24 24" class="w-5 h-5 fill-current" aria-hidden="true">
+                            <path d="M4 6a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v2H4V6Zm0 5h16v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7Zm8 2.5a2.5 2.5 0 1 0 .001 5.001A2.5 2.5 0 0 0 12 13.5Z"></path>
+                        </svg>
+                    </label>
+                    <img id="avatar-file-preview" src="" alt="Preview"
+                        class="hidden w-10 h-10 rounded-lg object-cover border border-gray-700 bg-gray-900">
                     <button type="submit"
-                        class="px-3 py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition">
-                        Upload Avatar
+                        title="Загрузить аватар"
+                        class="w-10 h-10 inline-flex items-center justify-center rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        <svg viewBox="0 0 24 24" class="w-5 h-5 fill-current" aria-hidden="true">
+                            <path d="M12 3 7 8h3v6h4V8h3l-5-5Zm-7 13h3v3h8v-3h3v5H5v-5Z"></path>
+                        </svg>
                     </button>
                 </form>
             </div>
@@ -154,7 +153,7 @@
                         </button>
                     </div>
                 </div>
-                <label class="flex items-start gap-2 text-sm text-gray-300">
+                <label class="invisible h-0 overflow-hidden flex items-start gap-2 text-sm text-gray-300">
                     <input id="account-share" type="checkbox" class="mt-1">
                     <span>Передавать эти данные в сторонние сервисы при OIDC входе.</span>
                 </label>
@@ -162,21 +161,33 @@
                     class="w-full py-2 bg-gradient-to-r from-teal-500 to-blue-600 rounded-lg font-semibold hover:from-teal-400 hover:to-blue-500 transition">
                     Сохранить профиль
                 </button>
-                <button type="button" onclick="handleDeleteAccount()"
-                    class="w-full py-2 border border-red-500/40 rounded-lg font-semibold text-red-300 hover:text-red-200 hover:border-red-400 transition">
-                    Удалить аккаунт и профиль
-                </button>
             </form>
+            <div id="message-account" class="text-center text-sm min-h-[20px]"></div>
+            <button id="logout-btn" onclick="handleLogout()"
+                class="w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
+                Logout
+            </button>
+            <div id="device-sessions-panel" class="p-3 border border-gray-700 rounded-lg bg-gray-900/60 space-y-2">
+                <div class="flex items-center justify-between">
+                    <div class="text-sm font-semibold text-gray-100">Устройства и сессии</div>
+                    <button type="button" onclick="loadDevicesForAccountUI()"
+                        class="px-2 py-1 text-xs border border-gray-600 rounded text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        Обновить
+                    </button>
+                </div>
+                <div id="device-sessions-list" class="space-y-2 text-xs text-gray-300">
+                    <div class="text-gray-400">Загрузка...</div>
+                </div>
+            </div>
+            <button type="button" onclick="handleDeleteAccount()"
+                class="w-full py-2 bg-red-600 rounded-lg font-semibold text-white hover:bg-red-500 transition">
+                Удалить аккаунт и пользователя
+            </button>
         </div>
 
-        <div id="message" class="mt-4 text-center text-sm min-h-[20px]"></div>
         <button id="oidc-return-btn" onclick="resumeOidcReturn()"
             class="hidden mt-2 w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-300 hover:text-teal-200 hover:border-teal-400 transition">
             Вернуться к клиенту
-        </button>
-        <button id="logout-btn" onclick="handleLogout()"
-            class="hidden mt-3 w-full py-2 text-sm border border-red-500/40 rounded-lg text-red-300 hover:text-red-200 hover:border-red-400 transition">
-            Logout
         </button>
     </div>
 
@@ -289,9 +300,8 @@
             const loginFlow = document.getElementById('login-flow');
             const tabReg = document.getElementById('tab-register');
             const tabLogin = document.getElementById('tab-login');
-            const msg = document.getElementById('message');
-
-            msg.innerText = ""; // clear messages
+            document.getElementById('message-guest').innerText = "";
+            document.getElementById('message-account').innerText = "";
 
             if (mode === 'register') {
                 regFlow.classList.remove('hidden');
@@ -387,8 +397,8 @@
         }
 
         async function tryConditionalLogin() {
-            const logoutVisible = !document.getElementById('logout-btn').classList.contains('hidden');
-            if (logoutVisible) return;
+            const accountVisible = !document.getElementById('account-ui').classList.contains('hidden');
+            if (accountVisible) return;
             const params = new URLSearchParams(window.location.search);
             if (params.get("mode") === "register") return;
 
@@ -452,9 +462,10 @@
         }
 
         function showMessage(text, colorClass) {
-            const msg = document.getElementById('message');
+            const accountVisible = !document.getElementById('account-ui').classList.contains('hidden');
+            const msg = accountVisible ? document.getElementById('message-account') : document.getElementById('message-guest');
             msg.innerText = text;
-            msg.className = "mt-4 text-center text-sm " + colorClass;
+            msg.className = "text-center text-sm min-h-[20px] " + colorClass;
         }
 
         function resolveSafeReturnURL(rawURL, clientHost) {
@@ -555,11 +566,10 @@
         function applySessionState(authenticated, email) {
             const guestUI = document.getElementById('guest-ui');
             const accountUI = document.getElementById('account-ui');
-            const logoutBtn = document.getElementById('logout-btn');
             if (authenticated) {
                 guestUI.classList.add('hidden');
                 accountUI.classList.remove('hidden');
-                logoutBtn.classList.remove('hidden');
+                document.getElementById('account-title-name').innerText = (email || "User").trim() || "User";
                 renderQRApprovePanel(true);
                 loadDevicesForAccountUI();
                 showMessage("Session active: " + email, "text-green-400");
@@ -568,10 +578,10 @@
             renderRecoveryModeUI(false);
             renderQRApprovePanel(false);
             clearDeviceSessionsList();
+            clearAvatarFileSelection();
             addDeviceFlowStarted = false;
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
-            logoutBtn.classList.add('hidden');
             pendingOidcReturn = null;
             renderOidcReturnButton();
         }
@@ -632,11 +642,16 @@
                     : (device.active
                         ? '<span class="px-2 py-0.5 rounded border border-cyan-400/40 text-cyan-300">В сети</span>'
                         : '<span class="px-2 py-0.5 rounded border border-gray-600 text-gray-400">Не в сети</span>');
+                const encodedSessionID = encodeURIComponent((device.session_id || "").trim());
+                const logoutBtn = device.active && encodedSessionID
+                    ? `<button type="button" onclick="logoutDeviceSessionUI('${encodedSessionID}')"
+                        class="px-2 py-1 rounded text-[11px] border border-pink-500/50 text-pink-300 hover:text-pink-200 hover:border-pink-400 transition">Выйти</button>`
+                    : "";
                 return `
                     <div class="p-2 rounded border border-gray-700 bg-gray-900/80 space-y-1">
                         <div class="flex items-center justify-between gap-2">
                             <div class="text-gray-100 text-sm">${escapeHTML(device.device || "Unknown device")}</div>
-                            ${statusBadge}
+                            <div class="flex items-center gap-2">${statusBadge}${logoutBtn}</div>
                         </div>
                         <div class="text-gray-400">Последняя активность: ${escapeHTML(formatDateTime(device.last_seen_at))}</div>
                         <div class="text-gray-500">Создана: ${escapeHTML(formatDateTime(device.created_at))}</div>
@@ -655,6 +670,38 @@
                 renderDeviceSessions(payload.devices || []);
             } catch (_) {
                 list.innerHTML = '<div class="text-red-400">Не удалось загрузить устройства.</div>';
+            }
+        }
+
+        async function logoutDeviceSessionUI(encodedSessionID) {
+            let sessionID = "";
+            try {
+                sessionID = decodeURIComponent((encodedSessionID || "").trim());
+            } catch (_) {
+                sessionID = (encodedSessionID || "").trim();
+            }
+            if (!sessionID) {
+                showMessage("Не удалось определить сессию.", "text-yellow-400");
+                return;
+            }
+
+            try {
+                const payload = await logoutDeviceSession({ session_id: sessionID });
+                if (payload.current_logged_out) {
+                    closeProfileModal();
+                    closeRecoveryModal();
+                    closeQRLoginModal();
+                    pendingOidcReturn = null;
+                    renderOidcReturnButton();
+                    applySessionState(false, "");
+                    showMessage("Вы вышли из текущей сессии.", "text-green-400");
+                    history.replaceState({}, "", "/");
+                    return;
+                }
+                await loadDevicesForAccountUI();
+                showMessage("Сессия устройства завершена.", "text-green-400");
+            } catch (err) {
+                showMessage("Не удалось завершить сессию: " + err.message, "text-red-400");
             }
         }
 
@@ -720,6 +767,7 @@
         }
 
         function populateAccountUI(profile) {
+            document.getElementById('account-title-name').innerText = ((profile.display_name || profile.email || "User").trim() || "User");
             document.getElementById('account-name').value = profile.display_name || "";
             document.getElementById('account-email').value = profile.profile_email || profile.email || "";
             document.getElementById('account-phone').value = profile.phone || "";
@@ -764,6 +812,7 @@
                     return;
                 }
                 const profile = await res.json();
+                document.getElementById('account-title-name').innerText = ((profile.display_name || profile.email || "User").trim() || "User");
                 document.getElementById('account-name').value = profile.display_name || "";
                 document.getElementById('account-email').value = profile.email || "";
                 document.getElementById('account-phone').value = profile.phone || "";
@@ -809,6 +858,30 @@
             img.classList.add('hidden');
         }
 
+        function onAvatarFileSelected(e) {
+            const input = e && e.target ? e.target : document.getElementById('avatar-file');
+            const preview = document.getElementById('avatar-file-preview');
+            if (!input || !input.files || !input.files[0]) {
+                preview.src = "";
+                preview.classList.add('hidden');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = () => {
+                preview.src = String(reader.result || "");
+                preview.classList.remove('hidden');
+            };
+            reader.readAsDataURL(input.files[0]);
+        }
+
+        function clearAvatarFileSelection() {
+            const input = document.getElementById('avatar-file');
+            const preview = document.getElementById('avatar-file-preview');
+            input.value = "";
+            preview.src = "";
+            preview.classList.add('hidden');
+        }
+
         async function uploadAvatar(e) {
             e.preventDefault();
             const input = document.getElementById('avatar-file');
@@ -825,7 +898,7 @@
                 }
                 const payload = await res.json();
                 setAvatar(payload.picture_url || "");
-                input.value = "";
+                clearAvatarFileSelection();
                 showMessage("Avatar updated.", "text-green-400");
             } catch (err) {
                 showMessage("Avatar upload failed: " + err.message, "text-red-400");
