@@ -19,6 +19,12 @@ const (
 	deviceSessionListLimit  = 50
 )
 
+var (
+	errDeviceNotFound             = errors.New("device not found")
+	errCannotDeleteLastDevice     = errors.New("cannot delete last device")
+	errDeviceSessionAccessDenied  = errors.New("forbidden")
+)
+
 type deviceSessionMeta struct {
 	SessionID    string `json:"session_id"`
 	UserID       string `json:"user_id"`
@@ -40,6 +46,10 @@ type deviceSessionDTO struct {
 }
 
 type deviceLogoutPayload struct {
+	SessionID string `json:"session_id"`
+}
+
+type deviceRemovePayload struct {
 	SessionID string `json:"session_id"`
 }
 
@@ -298,5 +308,117 @@ func (s *Service) LogoutDeviceSession(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":             "ok",
 		"current_logged_out": currentLoggedOut,
+	})
+}
+
+func (s *Service) RemoveDeviceSession(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	var body deviceRemovePayload
+	_ = c.Bind(&body)
+	sessionID, err := normalizeDeviceSessionID(body.SessionID)
+	if err != nil {
+		sessionID, err = normalizeDeviceSessionID(c.FormValue("session_id"))
+		if err != nil {
+			return c.String(http.StatusBadRequest, err.Error())
+		}
+	}
+
+	ctx := c.Request().Context()
+	currentSessionID, _ := s.sessionID(c)
+	removedCurrent := false
+
+	for attempts := 0; attempts < 5; attempts++ {
+		err = s.redis.Watch(ctx, func(tx *redis.Tx) error {
+			listKey := deviceSessionListKey(userID)
+
+				if _, scoreErr := tx.ZScore(ctx, listKey, sessionID).Result(); scoreErr != nil {
+					if errors.Is(scoreErr, redis.Nil) {
+						return errDeviceNotFound
+					}
+					return scoreErr
+				}
+
+				total, totalErr := tx.ZCard(ctx, listKey).Result()
+				if totalErr != nil && !errors.Is(totalErr, redis.Nil) {
+					return totalErr
+				}
+				if total <= 1 {
+					return errCannotDeleteLastDevice
+				}
+
+			metaPayload, metaErr := tx.Get(ctx, deviceSessionMetaKey(sessionID)).Bytes()
+			if metaErr == nil {
+				var meta deviceSessionMeta
+				if json.Unmarshal(metaPayload, &meta) == nil {
+					metaUserID := strings.TrimSpace(meta.UserID)
+					if metaUserID != "" && metaUserID != userID {
+						return errDeviceSessionAccessDenied
+					}
+				}
+			} else if !errors.Is(metaErr, redis.Nil) {
+				return metaErr
+			}
+
+			if ownerID, ownerErr := tx.Get(ctx, "sess:"+sessionID).Result(); ownerErr == nil && strings.TrimSpace(ownerID) != userID {
+				return errDeviceSessionAccessDenied
+			} else if ownerErr != nil && !errors.Is(ownerErr, redis.Nil) {
+				return ownerErr
+			}
+
+			_, txErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Del(ctx, "sess:"+sessionID)
+				pipe.Del(ctx, "recovery:"+sessionID)
+				pipe.Del(ctx, deviceSessionMetaKey(sessionID))
+				pipe.ZRem(ctx, listKey, sessionID)
+				return nil
+			})
+			if txErr != nil && !errors.Is(txErr, redis.Nil) {
+				return txErr
+			}
+
+			return nil
+		}, deviceSessionListKey(userID), deviceSessionMetaKey(sessionID), "sess:"+sessionID)
+
+		if err == nil {
+			removedCurrent = sessionID == currentSessionID
+			break
+		}
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		if errors.Is(err, errCannotDeleteLastDevice) {
+			return c.String(http.StatusConflict, "Нельзя удалить последнее устройство. Если хотите уйти полностью, удалите аккаунт.")
+		}
+		if errors.Is(err, errDeviceNotFound) {
+			return c.String(http.StatusNotFound, "Устройство не найдено")
+		}
+		if errors.Is(err, errDeviceSessionAccessDenied) {
+			return c.String(http.StatusForbidden, "forbidden")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+	if errors.Is(err, redis.TxFailedErr) {
+		return c.String(http.StatusConflict, "Try again")
+	}
+
+	if removedCurrent {
+		c.SetCookie(&http.Cookie{
+			Name:     "user_session",
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":          "removed",
+		"current_removed": removedCurrent,
 	})
 }

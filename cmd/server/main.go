@@ -119,6 +119,7 @@ func main() {
 	e.GET("/auth/profile/email/verify", authService.VerifyProfileEmail, sensitiveLimiter)
 	e.GET("/auth/devices", authService.ListDeviceSessions)
 	e.POST("/auth/devices/logout", authService.LogoutDeviceSession, sensitiveLimiter)
+	e.POST("/auth/devices/remove", authService.RemoveDeviceSession, sensitiveLimiter)
 
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
 	e.POST("/auth/recovery/verify-code", authService.VerifyRecoveryCode, sensitiveLimiter)

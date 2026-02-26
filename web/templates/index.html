@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="/static/js/glue.js?v=20260226e"></script>
+    <script src="/static/js/glue.js?v=20260226f"></script>
     <style>
         #profile-modal,
         #recovery-modal,
@@ -718,11 +718,15 @@
                     ? `<button type="button" onclick="logoutDeviceSessionUI('${encodedSessionID}')"
                         class="px-2 py-1 rounded text-[11px] border border-pink-500/50 text-pink-300 hover:text-pink-200 hover:border-pink-400 transition">Выйти</button>`
                     : "";
+                const removeBtn = encodedSessionID
+                    ? `<button type="button" onclick="removeDeviceSessionUI('${encodedSessionID}')"
+                        class="px-2 py-1 rounded text-[11px] border border-rose-500/50 text-rose-300 hover:text-rose-200 hover:border-rose-400 transition">Удалить</button>`
+                    : "";
                 return `
                     <div class="p-2 rounded border border-gray-700 bg-gray-900/80 space-y-1">
                         <div class="flex items-center justify-between gap-2">
                             <div class="text-gray-100 text-sm">${escapeHTML(device.device || "Unknown device")}</div>
-                            <div class="flex items-center gap-2">${statusBadge}${logoutBtn}</div>
+                            <div class="flex items-center gap-2">${statusBadge}${logoutBtn}${removeBtn}</div>
                         </div>
                         <div class="text-gray-400">Последняя активность: ${escapeHTML(formatDateTime(device.last_seen_at))}</div>
                         <div class="text-gray-500">Создана: ${escapeHTML(formatDateTime(device.created_at))}</div>
@@ -773,6 +777,42 @@
                 showMessage("Сессия устройства завершена.", "text-green-400");
             } catch (err) {
                 showMessage("Не удалось завершить сессию: " + err.message, "text-red-400");
+            }
+        }
+
+        async function removeDeviceSessionUI(encodedSessionID) {
+            let sessionID = "";
+            try {
+                sessionID = decodeURIComponent((encodedSessionID || "").trim());
+            } catch (_) {
+                sessionID = (encodedSessionID || "").trim();
+            }
+            if (!sessionID) {
+                showMessage("Не удалось определить устройство.", "text-yellow-400");
+                return;
+            }
+
+            const ok = window.confirm("Удалить это устройство из списка и завершить его сессию?");
+            if (!ok) return;
+
+            try {
+                const payload = await removeDeviceSession({ session_id: sessionID });
+                if (payload.current_removed) {
+                    closeProfileModal();
+                    closeRecoveryModal();
+                    closeQRLoginModal();
+                    closeDeleteAccountModal();
+                    pendingOidcReturn = null;
+                    renderOidcReturnButton();
+                    applySessionState(false, "");
+                    showMessage("Текущее устройство удалено.", "text-green-400");
+                    history.replaceState({}, "", "/");
+                    return;
+                }
+                await loadDevicesForAccountUI();
+                showMessage("Устройство удалено.", "text-green-400");
+            } catch (err) {
+                showMessage("Не удалось удалить устройство: " + err.message, "text-red-400");
             }
         }
 
