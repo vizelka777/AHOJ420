@@ -149,8 +149,15 @@
                     </div>
                 </div>
                 <div class="space-y-2">
-                    <input id="account-phone" type="tel" placeholder="Телефон (опционально)"
-                        class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                    <div class="flex gap-2">
+                        <select id="account-phone-code"
+                            class="w-28 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                            <option value="+420">+420</option>
+                            <option value="+421">+421</option>
+                        </select>
+                        <input id="account-phone-local" type="tel" inputmode="numeric" maxlength="9" placeholder="777123456"
+                            class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                    </div>
                     <div class="flex items-center justify-between text-xs">
                         <span id="account-phone-status" class="text-yellow-300">Телефон: не подтверждено</span>
                         <button type="button" id="btn-verify-phone" onclick="verifyPhoneStub()"
@@ -206,8 +213,15 @@
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
                 <input id="profile-email" type="email" placeholder="Email (опционально)"
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
-                <input id="profile-phone" type="tel" placeholder="Телефон (опционально)"
-                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                <div class="flex gap-2">
+                    <select id="profile-phone-code"
+                        class="w-28 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                        <option value="+420">+420</option>
+                        <option value="+421">+421</option>
+                    </select>
+                    <input id="profile-phone-local" type="tel" inputmode="numeric" maxlength="9" placeholder="777123456"
+                        class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-teal-500 focus:outline-none">
+                </div>
                 <label class="flex items-start gap-2 text-sm text-gray-300">
                     <input id="profile-share" type="checkbox" class="mt-1">
                     <span>Разрешаю передавать эти данные при входе на другие сервисы.</span>
@@ -237,8 +251,15 @@
                 <input id="recovery-email" type="email" placeholder="Email"
                     class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
                 <div class="text-center text-xs text-gray-400">или</div>
-                <input id="recovery-phone" type="tel" placeholder="Телефон в формате +420777123456"
-                    class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                <div class="flex gap-2">
+                    <select id="recovery-phone-code"
+                        class="w-28 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                        <option value="+420">+420</option>
+                        <option value="+421">+421</option>
+                    </select>
+                    <input id="recovery-phone-local" type="tel" inputmode="numeric" maxlength="9" placeholder="777123456"
+                        class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                </div>
                 <div class="flex gap-2 pt-1">
                     <button id="btn-recovery-submit" type="submit"
                         class="flex-1 py-2 bg-gradient-to-r from-amber-500 to-orange-500 rounded-lg font-semibold hover:from-amber-400 hover:to-orange-400 transition">
@@ -700,6 +721,63 @@
             return dt.toLocaleString();
         }
 
+        function sanitizePhoneLocal(raw) {
+            return String(raw || "").replace(/\D+/g, "").slice(0, 9);
+        }
+
+        function setPhoneFieldValue(prefix, rawPhone) {
+            const codeEl = document.getElementById(prefix + '-phone-code');
+            const localEl = document.getElementById(prefix + '-phone-local');
+            if (!codeEl || !localEl) return;
+
+            const normalized = String(rawPhone || "").trim().replace(/\s+/g, "");
+            codeEl.value = "+420";
+            localEl.value = "";
+            if (!normalized) return;
+
+            if (normalized.startsWith("+420")) {
+                codeEl.value = "+420";
+                localEl.value = sanitizePhoneLocal(normalized.slice(4));
+                return;
+            }
+            if (normalized.startsWith("+421")) {
+                codeEl.value = "+421";
+                localEl.value = sanitizePhoneLocal(normalized.slice(4));
+                return;
+            }
+            localEl.value = sanitizePhoneLocal(normalized);
+        }
+
+        function composePhoneFieldValue(prefix) {
+            const codeEl = document.getElementById(prefix + '-phone-code');
+            const localEl = document.getElementById(prefix + '-phone-local');
+            if (!codeEl || !localEl) return "";
+
+            const code = (codeEl.value === "+421") ? "+421" : "+420";
+            codeEl.value = code;
+            const local = sanitizePhoneLocal(localEl.value);
+            localEl.value = local;
+            if (!local) return "";
+            if (!/^\d{9}$/.test(local)) {
+                throw new Error("Телефон должен содержать ровно 9 цифр.");
+            }
+            return code + local;
+        }
+
+        function initPhoneFields() {
+            ["account", "profile", "recovery"].forEach((prefix) => {
+                const codeEl = document.getElementById(prefix + '-phone-code');
+                const localEl = document.getElementById(prefix + '-phone-local');
+                if (!codeEl || !localEl) return;
+
+                codeEl.value = (codeEl.value === "+421") ? "+421" : "+420";
+                localEl.value = sanitizePhoneLocal(localEl.value);
+                localEl.addEventListener('input', () => {
+                    localEl.value = sanitizePhoneLocal(localEl.value);
+                });
+            });
+        }
+
         function renderDeviceSessions(devices) {
             const list = document.getElementById('device-sessions-list');
             if (!Array.isArray(devices) || devices.length === 0) {
@@ -881,7 +959,7 @@
             document.getElementById('account-title-name').innerText = ((profile.display_name || profile.email || "User").trim() || "User");
             document.getElementById('account-name').value = profile.display_name || "";
             document.getElementById('account-email').value = profile.profile_email || profile.email || "";
-            document.getElementById('account-phone').value = profile.phone || "";
+            setPhoneFieldValue('account', profile.phone || "");
             document.getElementById('account-share').checked = Boolean(profile.share_profile);
             originalAccountProfile = {
                 display_name: (profile.display_name || "").trim(),
@@ -926,7 +1004,7 @@
                 document.getElementById('account-title-name').innerText = ((profile.display_name || profile.email || "User").trim() || "User");
                 document.getElementById('account-name').value = profile.display_name || "";
                 document.getElementById('account-email').value = profile.email || "";
-                document.getElementById('account-phone').value = profile.phone || "";
+                setPhoneFieldValue('account', profile.phone || "");
                 document.getElementById('account-share').checked = Boolean(profile.share_profile);
                 originalAccountProfile = {
                     display_name: (profile.display_name || "").trim(),
@@ -945,7 +1023,7 @@
             return {
                 display_name: document.getElementById('account-name').value.trim(),
                 email: document.getElementById('account-email').value.trim(),
-                phone: document.getElementById('account-phone').value.trim(),
+                phone: composePhoneFieldValue('account'),
                 share_profile: document.getElementById('account-share').checked
             };
         }
@@ -1018,10 +1096,9 @@
 
         async function saveAccountProfile(e) {
             e.preventDefault();
-            const payload = collectAccountPayload();
-            const changed = accountProfileChanged(payload);
-
             try {
+                const payload = collectAccountPayload();
+                const changed = accountProfileChanged(payload);
                 if (changed) {
                     const res = await fetch('/auth/profile', {
                         method: 'POST',
@@ -1249,7 +1326,7 @@
 
         function openRecoveryModal() {
             document.getElementById('recovery-email').value = "";
-            document.getElementById('recovery-phone').value = "";
+            setPhoneFieldValue('recovery', "");
             document.getElementById('recovery-modal').classList.add('open');
         }
 
@@ -1260,7 +1337,13 @@
         async function submitRecoveryRequest(e) {
             e.preventDefault();
             const email = document.getElementById('recovery-email').value.trim();
-            const phone = document.getElementById('recovery-phone').value.trim();
+            let phone = "";
+            try {
+                phone = composePhoneFieldValue('recovery');
+            } catch (err) {
+                showMessage(err.message, "text-yellow-400");
+                return;
+            }
 
             if ((!email && !phone) || (email && phone)) {
                 showMessage("Укажите либо email, либо телефон.", "text-yellow-400");
@@ -1296,7 +1379,7 @@
         function openProfileModal(profile) {
             document.getElementById('profile-name').value = profile.display_name || "";
             document.getElementById('profile-email').value = profile.email || "";
-            document.getElementById('profile-phone').value = profile.phone || "";
+            setPhoneFieldValue('profile', profile.phone || "");
             document.getElementById('profile-share').checked = Boolean(profile.share_profile);
             document.getElementById('profile-modal').classList.add('open');
         }
@@ -1307,13 +1390,13 @@
 
         async function saveProfile(e) {
             e.preventDefault();
-            const payload = {
-                display_name: document.getElementById('profile-name').value.trim(),
-                email: document.getElementById('profile-email').value.trim(),
-                phone: document.getElementById('profile-phone').value.trim(),
-                share_profile: document.getElementById('profile-share').checked
-            };
             try {
+                const payload = {
+                    display_name: document.getElementById('profile-name').value.trim(),
+                    email: document.getElementById('profile-email').value.trim(),
+                    phone: composePhoneFieldValue('profile'),
+                    share_profile: document.getElementById('profile-share').checked
+                };
                 const res = await fetch('/auth/profile', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1336,6 +1419,7 @@
         }
 
         // Resolve session state first, then conditional login.
+        initPhoneFields();
         loadSessionState().then(() => tryConditionalLogin());
     </script>
 </body>
