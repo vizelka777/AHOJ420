@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -709,6 +710,12 @@ func (s *Service) UpdateProfile(c echo.Context) error {
 	}
 
 	if err := s.store.UpdateProfile(userID, normalized.DisplayName, normalized.Email, normalized.Phone, normalized.ShareProfile); err != nil {
+		if errors.Is(err, store.ErrProfileEmailAlreadyUsed) {
+			return c.String(http.StatusConflict, "Profile email is already used")
+		}
+		if errors.Is(err, store.ErrPhoneAlreadyUsed) {
+			return c.String(http.StatusConflict, "Phone is already used")
+		}
 		return c.String(http.StatusInternalServerError, "Failed to save profile")
 	}
 	return c.JSON(http.StatusOK, map[string]any{"status": "ok"})

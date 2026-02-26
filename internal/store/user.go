@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 type Store struct {
@@ -18,6 +19,8 @@ type Store struct {
 var (
 	ErrProfileEmailVerificationMismatch = errors.New("profile email mismatch or nothing to verify")
 	ErrPhoneVerificationMismatch        = errors.New("phone mismatch or nothing to verify")
+	ErrProfileEmailAlreadyUsed          = errors.New("profile email already used")
+	ErrPhoneAlreadyUsed                 = errors.New("phone already used")
 )
 
 func New(db *sql.DB) *Store {
@@ -189,6 +192,7 @@ func (s *Store) GetUserByProfileEmail(profileEmail string) (*User, error) {
 		FROM users
 		WHERE trim(COALESCE(profile_email, '')) <> ''
 		  AND lower(trim(profile_email)) = lower(trim($1))
+		  AND COALESCE(email_verified, false) = true
 		ORDER BY created_at ASC
 		LIMIT 1
 	`, normalizedProfileEmail).Scan(&id)
@@ -272,7 +276,19 @@ func (s *Store) UpdateProfile(userID, displayName, profileEmail, phone string, s
 			profile_completed_at = NOW()
 		WHERE id = $5
 	`, strings.TrimSpace(displayName), strings.TrimSpace(profileEmail), strings.TrimSpace(phone), shareProfile, userID)
-	return err
+	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			switch strings.TrimSpace(pqErr.Constraint) {
+			case "users_profile_email_unique_idx":
+				return ErrProfileEmailAlreadyUsed
+			case "users_phone_unique_idx":
+				return ErrPhoneAlreadyUsed
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) DeleteUser(userID string) error {

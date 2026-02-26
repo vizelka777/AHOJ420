@@ -23,6 +23,11 @@ import (
 	"github.com/houbamydar/AHOJ420/internal/avatar"
 )
 
+const (
+	avatarMaxInputDimension = 4096
+	avatarMaxInputPixels    = int64(4096 * 4096)
+)
+
 func (s *Service) UploadAvatar(c echo.Context) error {
 	if mode, _ := s.isRecoveryMode(c); mode {
 		return c.JSON(http.StatusForbidden, map[string]any{"message": "recovery setup required", "redirect": "/?mode=recovery"})
@@ -108,6 +113,9 @@ func (s *Service) putBunnyObject(ctx context.Context, avatarKey string, data []b
 }
 
 var errTooLarge = errors.New("file too large")
+var errImageTooLargeDimensions = errors.New("image dimensions too large")
+var errImageTooManyPixels = errors.New("image has too many pixels")
+var errInvalidOutputSize = errors.New("invalid output size")
 
 func readLimited(file multipart.File, maxBytes int64) ([]byte, error) {
 	buf, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
@@ -131,12 +139,40 @@ func isAllowedImage(hdr *multipart.FileHeader) bool {
 }
 
 func normalizeToWebP(raw []byte, size int) ([]byte, error) {
+	if size <= 0 {
+		return nil, errInvalidOutputSize
+	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, errImageTooLargeDimensions
+	}
+	if cfg.Width > avatarMaxInputDimension || cfg.Height > avatarMaxInputDimension {
+		return nil, errImageTooLargeDimensions
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > avatarMaxInputPixels {
+		return nil, errImageTooManyPixels
+	}
+
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
 
 	bounds := img.Bounds()
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
+		return nil, errImageTooLargeDimensions
+	}
+	if bounds.Dx() > avatarMaxInputDimension || bounds.Dy() > avatarMaxInputDimension {
+		return nil, errImageTooLargeDimensions
+	}
+	if int64(bounds.Dx())*int64(bounds.Dy()) > avatarMaxInputPixels {
+		return nil, errImageTooManyPixels
+	}
+
 	side := bounds.Dx()
 	if bounds.Dy() < side {
 		side = bounds.Dy()
@@ -145,11 +181,8 @@ func normalizeToWebP(raw []byte, size int) ([]byte, error) {
 	offY := bounds.Min.Y + (bounds.Dy()-side)/2
 	srcRect := image.Rect(offX, offY, offX+side, offY+side)
 
-	cropped := image.NewRGBA(image.Rect(0, 0, side, side))
-	draw.Draw(cropped, cropped.Bounds(), img, srcRect.Min, draw.Src)
-
 	resized := image.NewRGBA(image.Rect(0, 0, size, size))
-	xdraw.ApproxBiLinear.Scale(resized, resized.Bounds(), cropped, cropped.Bounds(), draw.Over, nil)
+	xdraw.ApproxBiLinear.Scale(resized, resized.Bounds(), img, srcRect, draw.Src, nil)
 
 	var out bytes.Buffer
 	if err := webp.Encode(&out, resized, &webp.Options{Lossless: false, Quality: 80}); err != nil {

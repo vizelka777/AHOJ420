@@ -23,6 +23,7 @@ var recoveryRandReader io.Reader = rand.Reader
 
 const (
 	recoveryGenericMessage       = "If this account exists, a recovery message has been sent."
+	recoveryCodeInvalidMessage   = "Recovery code invalid or expired"
 	recoveryTokenTTL             = 15 * time.Minute
 	recoveryPhoneCodePrefix      = "auth:recovery_phone_code:"
 	recoveryPhoneRatePrefix      = "auth:recovery_phone_rate:"
@@ -73,7 +74,7 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 
 		user, err := s.store.GetUserByProfileEmail(email)
 		if err != nil || user == nil {
-			log.Printf("Recovery requested for non-existent email: %s", email)
+			log.Printf("Recovery requested for non-existent or unverified email: %s", email)
 			return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 		}
 
@@ -276,7 +277,7 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 	payload, err := s.redis.Get(ctx, codeKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return c.String(http.StatusBadRequest, "Recovery code expired or missing")
+			return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 		}
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
@@ -284,14 +285,15 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 	var token recoveryPhoneCodeToken
 	if err := json.Unmarshal(payload, &token); err != nil {
 		_ = s.redis.Del(ctx, codeKey).Err()
-		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
 	if strings.TrimSpace(token.UserID) == "" || strings.TrimSpace(token.Phone) == "" || strings.TrimSpace(token.CodeHash) == "" {
 		_ = s.redis.Del(ctx, codeKey).Err()
-		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
 	if token.Phone != phone {
-		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+		_ = s.redis.Del(ctx, codeKey).Err()
+		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
 
 	inputHash := hashPhoneVerifyCode(code)
@@ -301,7 +303,7 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 		token.LastAttemptedAt = time.Now().UTC()
 		if token.AttemptsLeft <= 0 {
 			_ = s.redis.Del(ctx, codeKey).Err()
-			return c.String(http.StatusBadRequest, "Recovery code invalid")
+			return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 		}
 		ttl, ttlErr := s.redis.TTL(ctx, codeKey).Result()
 		if ttlErr != nil || ttl <= 0 {
@@ -309,7 +311,7 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 		}
 		updated, _ := json.Marshal(token)
 		_ = s.redis.Set(ctx, codeKey, updated, ttl).Err()
-		return c.String(http.StatusBadRequest, "Recovery code invalid")
+		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
 
 	_ = s.redis.Del(ctx, codeKey).Err()

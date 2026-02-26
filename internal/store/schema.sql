@@ -30,3 +30,12 @@ CREATE TABLE IF NOT EXISTS credentials (
 UPDATE users
 SET display_name = COALESCE(NULLIF(display_name, ''), 'Ahoj User')
 WHERE display_name IS NULL OR display_name = '';
+
+-- Enforce unique non-empty profile contacts (normalized).
+CREATE UNIQUE INDEX IF NOT EXISTS users_profile_email_unique_idx
+    ON users (lower(trim(profile_email)))
+    WHERE trim(COALESCE(profile_email, '')) <> '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique_idx
+    ON users (trim(phone))
+    WHERE trim(COALESCE(phone, '')) <> '';
