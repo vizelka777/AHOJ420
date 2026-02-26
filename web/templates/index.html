@@ -7,10 +7,12 @@
     <title>Ahoj420 - Passkey Auth</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="/static/js/glue.js?v=20260225a"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <script src="/static/js/glue.js?v=20260226b"></script>
     <style>
         #profile-modal,
-        #recovery-modal {
+        #recovery-modal,
+        #qr-login-modal {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.65);
@@ -21,7 +23,8 @@
             z-index: 50;
         }
         #profile-modal.open,
-        #recovery-modal.open {
+        #recovery-modal.open,
+        #qr-login-modal.open {
             display: flex;
         }
     </style>
@@ -70,8 +73,9 @@
 
             <!-- Extra options -->
             <div class="mt-6 space-y-3">
-                <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
-                    QR Login (coming soon)
+                <button type="button" onclick="openQRLoginModal()"
+                    class="w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-200 hover:text-teal-100 hover:border-teal-300 transition">
+                    Войти по QR
                 </button>
                 <button type="button" onclick="openRecoveryModal()"
                     class="w-full py-2 text-sm border border-amber-500/40 rounded-lg text-amber-200 hover:text-amber-100 hover:border-amber-300 transition">
@@ -90,6 +94,14 @@
                 <button id="btn-recovery-create-passkey" type="button" onclick="createRecoveryPasskey()"
                     class="w-full py-2 border border-amber-300/50 rounded-lg font-semibold text-amber-100 hover:text-white hover:border-amber-200 transition">
                     Создать новый passkey
+                </button>
+            </div>
+            <div id="qr-approve-panel" class="hidden p-3 border border-teal-500/40 rounded-lg bg-teal-500/10 text-teal-100 text-sm space-y-2">
+                <div>Обнаружен QR токен. Подтвердите вход на другом устройстве.</div>
+                <div id="qr-approve-token" class="text-xs text-teal-200 break-all"></div>
+                <button id="btn-qr-approve" type="button" onclick="approveScannedQR()"
+                    class="w-full py-2 border border-teal-300/50 rounded-lg font-semibold text-teal-100 hover:text-white hover:border-teal-200 transition">
+                    Подтвердить QR вход
                 </button>
             </div>
             <div class="flex items-center gap-3">
@@ -213,10 +225,49 @@
         </div>
     </div>
 
+    <div id="qr-login-modal">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
+            <h3 class="text-xl font-semibold mb-3">Вход по QR</h3>
+            <p class="text-sm text-gray-300 mb-4">
+                Отсканируйте QR код авторизованным телефоном и подтвердите вход.
+            </p>
+            <div class="bg-white rounded-xl p-3 flex justify-center items-center mb-3 min-h-[244px]">
+                <div id="qr-login-qrcode"></div>
+            </div>
+            <p id="qr-login-status" class="text-sm text-yellow-300 mb-2">Подготовка QR…</p>
+            <p id="qr-login-url" class="text-xs text-gray-400 break-all mb-4"></p>
+            <div class="flex gap-2">
+                <button id="btn-qr-refresh" type="button" onclick="startQRLoginFlow()"
+                    class="flex-1 py-2 bg-gradient-to-r from-teal-500 to-cyan-500 rounded-lg font-semibold hover:from-teal-400 hover:to-cyan-400 transition">
+                    Обновить
+                </button>
+                <button type="button" onclick="closeQRLoginModal()"
+                    class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
+                    Закрыть
+                </button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let pendingOidcReturn = null;
         let originalAccountProfile = null;
         let recoveryModeActive = false;
+        let qrLoginPollTimer = null;
+        let qrLoginPollInFlight = false;
+        let qrLoginToken = "";
+        let qrLoginAuthRequestID = "";
+        let scannedQRToken = "";
+
+        function normalizeQRToken(raw) {
+            const token = (raw || "").trim().toLowerCase();
+            return /^[a-f0-9]{64}$/.test(token) ? token : "";
+        }
+
+        function refreshScannedQRToken() {
+            const params = new URLSearchParams(window.location.search);
+            scannedQRToken = normalizeQRToken(params.get("token"));
+        }
 
         function switchMode(mode) {
             const regFlow = document.getElementById('register-flow');
@@ -456,6 +507,7 @@
                 }
                 closeProfileModal();
                 closeRecoveryModal();
+                closeQRLoginModal();
                 pendingOidcReturn = null;
                 renderOidcReturnButton();
                 applySessionState(false, "");
@@ -491,10 +543,12 @@
                 guestUI.classList.add('hidden');
                 accountUI.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
+                renderQRApprovePanel(true);
                 showMessage("Session active: " + email, "text-green-400");
                 return;
             }
             renderRecoveryModeUI(false);
+            renderQRApprovePanel(false);
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
@@ -512,7 +566,20 @@
             }
         }
 
+        function renderQRApprovePanel(authenticated) {
+            const panel = document.getElementById('qr-approve-panel');
+            const tokenEl = document.getElementById('qr-approve-token');
+            if (authenticated && scannedQRToken) {
+                tokenEl.innerText = "Token: " + scannedQRToken;
+                panel.classList.remove('hidden');
+                return;
+            }
+            tokenEl.innerText = "";
+            panel.classList.add('hidden');
+        }
+
         async function loadSessionState() {
+            refreshScannedQRToken();
             try {
                 const res = await fetch('/auth/session');
                 if (!res.ok) return;
@@ -527,6 +594,8 @@
                     initializePendingOidcReturnFromQuery();
                     populateAccountUI(data);
                     await loadProfileForAccountUI();
+                } else if (scannedQRToken) {
+                    showMessage("Сначала войдите на этом устройстве, затем подтвердите QR вход.", "text-yellow-300");
                 }
             } catch (_) {
                 applySessionState(false, "");
@@ -735,6 +804,128 @@
                 showMessage("Телефон подтвержден.", "text-green-400");
             } catch (err) {
                 showMessage("Не удалось подтвердить телефон: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function setQRLoginStatus(text, colorClass) {
+            const el = document.getElementById('qr-login-status');
+            el.innerText = text;
+            el.className = "text-sm mb-2 " + colorClass;
+        }
+
+        function stopQRLoginPolling() {
+            if (qrLoginPollTimer) {
+                clearInterval(qrLoginPollTimer);
+                qrLoginPollTimer = null;
+            }
+            qrLoginPollInFlight = false;
+        }
+
+        function openQRLoginModal() {
+            document.getElementById('qr-login-modal').classList.add('open');
+            startQRLoginFlow();
+        }
+
+        function closeQRLoginModal() {
+            stopQRLoginPolling();
+            qrLoginToken = "";
+            qrLoginAuthRequestID = "";
+            document.getElementById('qr-login-modal').classList.remove('open');
+        }
+
+        async function startQRLoginFlow() {
+            stopQRLoginPolling();
+            qrLoginToken = "";
+
+            const btn = document.getElementById('btn-qr-refresh');
+            const urlEl = document.getElementById('qr-login-url');
+            const qrBox = document.getElementById('qr-login-qrcode');
+            btn.disabled = true;
+            urlEl.innerText = "";
+            qrBox.innerHTML = "";
+            setQRLoginStatus("Генерируем QR код...", "text-yellow-300");
+
+            try {
+                const payload = await generateQRLogin();
+                qrLoginToken = payload.token;
+                const params = new URLSearchParams(window.location.search);
+                qrLoginAuthRequestID = (params.get("auth_request_id") || "").trim();
+                urlEl.innerText = payload.qr_url || "";
+
+                if (window.QRCode && typeof window.QRCode === "function") {
+                    new window.QRCode(qrBox, {
+                        text: payload.qr_url,
+                        width: 220,
+                        height: 220,
+                        colorDark: "#0f172a",
+                        colorLight: "#ffffff",
+                        correctLevel: window.QRCode.CorrectLevel.M,
+                    });
+                } else {
+                    qrBox.innerHTML = '<div class="text-xs text-gray-700 font-mono">QR unavailable</div>';
+                }
+
+                setQRLoginStatus("Ожидание подтверждения на телефоне...", "text-teal-300");
+                qrLoginPollTimer = setInterval(pollQRLoginStatus, 2000);
+                await pollQRLoginStatus();
+            } catch (err) {
+                setQRLoginStatus("Не удалось запустить QR вход: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function pollQRLoginStatus() {
+            if (!qrLoginToken || qrLoginPollInFlight) {
+                return;
+            }
+            qrLoginPollInFlight = true;
+            try {
+                const data = await getQRLoginStatus(qrLoginToken, qrLoginAuthRequestID);
+                if (data.status === "pending") {
+                    return;
+                }
+                if (data.status === "approved") {
+                    stopQRLoginPolling();
+                    setQRLoginStatus("Подтверждено. Переход...", "text-green-400");
+                    window.location.href = data.redirect || "/";
+                    return;
+                }
+                if (data.status === "expired") {
+                    stopQRLoginPolling();
+                    setQRLoginStatus("QR код истек. Нажмите «Обновить».", "text-yellow-300");
+                    return;
+                }
+                stopQRLoginPolling();
+                setQRLoginStatus("Неожиданный статус QR входа.", "text-red-400");
+            } catch (err) {
+                setQRLoginStatus("Ошибка проверки QR: " + err.message, "text-red-400");
+            } finally {
+                qrLoginPollInFlight = false;
+            }
+        }
+
+        async function approveScannedQR() {
+            if (!scannedQRToken) {
+                showMessage("QR токен не найден в URL.", "text-yellow-400");
+                return;
+            }
+
+            const btn = document.getElementById('btn-qr-approve');
+            btn.disabled = true;
+            try {
+                const res = await approveQRLogin({ token: scannedQRToken });
+                showMessage(res.message || "QR вход подтвержден.", "text-green-400");
+                scannedQRToken = "";
+                const params = new URLSearchParams(window.location.search);
+                params.delete("token");
+                const qs = params.toString();
+                history.replaceState({}, "", qs ? "/?" + qs : "/");
+                renderQRApprovePanel(true);
+            } catch (err) {
+                showMessage("Не удалось подтвердить QR: " + err.message, "text-red-400");
             } finally {
                 btn.disabled = false;
             }

@@ -70,7 +70,7 @@ func main() {
 		HSTSMaxAge:         int((365 * 24 * time.Hour).Seconds()),
 		HSTSPreloadEnabled: true,
 		ContentSecurityPolicy: "default-src 'self'; " +
-			"script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.tailwindcss.com; " +
+			"script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
 			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; " +
 			"img-src 'self' data: https://avatar.ahoj420.eu; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 	}))
@@ -79,7 +79,7 @@ func main() {
 	oidcHandler := echo.WrapHandler(oidcProvider)
 
 	e.Static("/static", "web/static")
-	e.GET("/", func(c echo.Context) error {
+	landingHandler := func(c echo.Context) error {
 		mode := c.QueryParam("mode")
 		if mode == "login" {
 			editProfile := c.QueryParam("edit_profile") == "1"
@@ -93,7 +93,9 @@ func main() {
 			}
 		}
 		return c.File("web/templates/index.html")
-	})
+	}
+	e.GET("/", landingHandler)
+	e.GET("/qr-login", landingHandler)
 	e.GET("/robots.txt", func(c echo.Context) error {
 		return c.String(http.StatusOK, "User-agent: *\nDisallow: /\n")
 	})
@@ -118,6 +120,9 @@ func main() {
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
 	e.POST("/auth/recovery/verify-code", authService.VerifyRecoveryCode, sensitiveLimiter)
 	e.GET("/auth/recovery/verify", authService.VerifyRecovery, sensitiveLimiter)
+	e.GET("/auth/qr/generate", authService.GenerateQRLogin, sensitiveLimiter)
+	e.POST("/auth/qr/approve", authService.ApproveQRLogin, sensitiveLimiter)
+	e.GET("/auth/qr/status", authService.QRLoginStatus, sensitiveLimiter)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))
 	e.Any("/keys", oidcHandler)

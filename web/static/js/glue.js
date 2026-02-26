@@ -170,3 +170,65 @@ async function verifyRecoveryCode(payload) {
     if (!res.ok) throw new Error(message || ("HTTP " + res.status));
     return data || { message };
 }
+
+async function generateQRLogin() {
+    const res = await fetch('/auth/qr/generate');
+
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    if (!data || !data.token) throw new Error("Invalid QR response");
+    return data;
+}
+
+async function approveQRLogin(payload) {
+    const token = (payload && payload.token ? payload.token : "").trim();
+    const res = await fetch('/auth/qr/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token })
+    });
+
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { message };
+}
+
+async function getQRLoginStatus(token, authRequestID) {
+    const params = new URLSearchParams();
+    params.set('token', (token || "").trim());
+    if ((authRequestID || "").trim()) {
+        params.set('auth_request_id', authRequestID.trim());
+    }
+
+    const res = await fetch('/auth/qr/status?' + params.toString());
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { status: "expired" };
+}
