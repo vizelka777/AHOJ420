@@ -141,7 +141,7 @@ func (s *Service) VerifyProfileEmail(c echo.Context) error {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
-	return c.String(http.StatusOK, "Email confirmed")
+	return c.Redirect(http.StatusFound, recoveryBaseURL())
 }
 
 func (s *Service) logProfileEmailVerifyLink(email, link string) {
