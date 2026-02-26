@@ -220,18 +220,17 @@ func (s *Service) VerifyProfilePhone(c echo.Context) error {
 	inputHash := hashPhoneVerifyCode(code)
 	match := subtle.ConstantTimeCompare([]byte(inputHash), []byte(token.CodeHash)) == 1
 	if !match {
-		token.AttemptsLeft--
-		token.LastAttemptedAt = time.Now().UTC()
-		if token.AttemptsLeft <= 0 {
-			_ = s.redis.Del(ctx, tokenKey).Err()
-			return c.String(http.StatusBadRequest, "Verification code invalid")
+		_, decErr := decrementTokenAttemptsAtomic(ctx, s.redis, tokenKey, profilePhoneVerifyTokenTTL, time.Now())
+		if decErr != nil {
+			if errors.Is(decErr, errVerifyTokenMissing) || errors.Is(decErr, errVerifyAttemptsExhausted) {
+				return c.String(http.StatusBadRequest, "Verification code invalid")
+			}
+			if errors.Is(decErr, errVerifyTokenInvalid) {
+				_ = s.redis.Del(ctx, tokenKey).Err()
+				return c.String(http.StatusBadRequest, "Invalid verification payload")
+			}
+			return c.String(http.StatusInternalServerError, "Internal error")
 		}
-		ttl, ttlErr := s.redis.TTL(ctx, tokenKey).Result()
-		if ttlErr != nil || ttl <= 0 {
-			ttl = profilePhoneVerifyTokenTTL
-		}
-		updated, _ := json.Marshal(token)
-		_ = s.redis.Set(ctx, tokenKey, updated, ttl).Err()
 		return c.String(http.StatusBadRequest, "Verification code invalid")
 	}
 

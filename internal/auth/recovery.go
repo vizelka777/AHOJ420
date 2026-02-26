@@ -299,18 +299,17 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 	inputHash := hashPhoneVerifyCode(code)
 	match := subtle.ConstantTimeCompare([]byte(inputHash), []byte(token.CodeHash)) == 1
 	if !match {
-		token.AttemptsLeft--
-		token.LastAttemptedAt = time.Now().UTC()
-		if token.AttemptsLeft <= 0 {
-			_ = s.redis.Del(ctx, codeKey).Err()
-			return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
+		_, decErr := decrementTokenAttemptsAtomic(ctx, s.redis, codeKey, recoveryPhoneCodeTTL, time.Now())
+		if decErr != nil {
+			if errors.Is(decErr, errVerifyTokenMissing) || errors.Is(decErr, errVerifyAttemptsExhausted) {
+				return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
+			}
+			if errors.Is(decErr, errVerifyTokenInvalid) {
+				_ = s.redis.Del(ctx, codeKey).Err()
+				return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
+			}
+			return c.String(http.StatusInternalServerError, "Internal error")
 		}
-		ttl, ttlErr := s.redis.TTL(ctx, codeKey).Result()
-		if ttlErr != nil || ttl <= 0 {
-			ttl = recoveryPhoneCodeTTL
-		}
-		updated, _ := json.Marshal(token)
-		_ = s.redis.Set(ctx, codeKey, updated, ttl).Err()
 		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
 
