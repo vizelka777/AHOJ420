@@ -116,6 +116,7 @@ func main() {
 	e.GET("/auth/profile/email/verify", authService.VerifyProfileEmail, sensitiveLimiter)
 
 	e.POST("/auth/recovery/request", authService.RequestRecovery, sensitiveLimiter)
+	e.POST("/auth/recovery/verify-code", authService.VerifyRecoveryCode, sensitiveLimiter)
 	e.GET("/auth/recovery/verify", authService.VerifyRecovery, sensitiveLimiter)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))

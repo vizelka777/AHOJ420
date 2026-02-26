@@ -183,7 +183,8 @@
         <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
             <h3 class="text-xl font-semibold mb-3">Восстановление учетной записи</h3>
             <p class="text-sm text-gray-300 mb-4">
-                Укажите email или подтвержденный телефон. На этот контакт придет ссылка для восстановления.
+                Укажите email или подтвержденный телефон.
+                Для email придет ссылка, для телефона придет 6-значный SMS-код.
             </p>
             <form class="space-y-3" onsubmit="submitRecoveryRequest(event)">
                 <input id="recovery-email" type="email" placeholder="Email"
@@ -194,7 +195,7 @@
                 <div class="flex gap-2 pt-1">
                     <button id="btn-recovery-submit" type="submit"
                         class="flex-1 py-2 bg-gradient-to-r from-amber-500 to-orange-500 rounded-lg font-semibold hover:from-amber-400 hover:to-orange-400 transition">
-                        Отправить ссылку
+                        Продолжить
                     </button>
                     <button type="button" onclick="closeRecoveryModal()"
                         class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
@@ -731,6 +732,18 @@
 
             try {
                 const message = await requestRecovery({ email, phone });
+                if (phone) {
+                    const code = (window.prompt("Введите 6-значный код из SMS для восстановления:") || "").trim();
+                    if (!code) {
+                        showMessage("Код не введен.", "text-yellow-400");
+                        return;
+                    }
+                    const verification = await verifyRecoveryCode({ phone, code });
+                    closeRecoveryModal();
+                    showMessage(verification.message || message || "Код подтвержден.", "text-green-400");
+                    window.location.href = verification.redirect || "/?mode=recovery";
+                    return;
+                }
                 closeRecoveryModal();
                 showMessage(message || "Если учетная запись существует, сообщение отправлено.", "text-green-400");
             } catch (err) {

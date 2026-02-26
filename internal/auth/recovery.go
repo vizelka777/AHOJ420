@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +21,41 @@ import (
 
 var recoveryRandReader io.Reader = rand.Reader
 
+const (
+	recoveryGenericMessage       = "If this account exists, a recovery message has been sent."
+	recoveryTokenTTL             = 15 * time.Minute
+	recoveryPhoneCodePrefix      = "auth:recovery_phone_code:"
+	recoveryPhoneRatePrefix      = "auth:recovery_phone_rate:"
+	recoveryPhoneCodeTTL         = 10 * time.Minute
+	recoveryPhoneRateTTL         = 60 * time.Second
+	recoveryPhoneCodeMaxAttempts = 5
+	recoverySMSCodePrefix        = "Ahoj420 recovery code: "
+)
+
+type recoveryPhoneCodeToken struct {
+	UserID          string    `json:"user_id"`
+	Phone           string    `json:"phone"`
+	CodeHash        string    `json:"code_hash"`
+	AttemptsLeft    int       `json:"attempts_left"`
+	IssuedAt        time.Time `json:"issued_at"`
+	LastAttemptedAt time.Time `json:"last_attempted_at,omitempty"`
+}
+
+type recoveryCodePayload struct {
+	Phone string `json:"phone"`
+	Code  string `json:"code"`
+}
+
+func recoveryPhoneCodeKey(phone string) string {
+	return recoveryPhoneCodePrefix + phone
+}
+
+func recoveryPhoneRateKey(phone string) string {
+	return recoveryPhoneRatePrefix + phone
+}
+
 func (s *Service) RequestRecovery(c echo.Context) error {
+	ctx := c.Request().Context()
 	rawEmail := strings.TrimSpace(c.FormValue("email"))
 	rawPhone := strings.TrimSpace(c.FormValue("phone"))
 	if rawEmail == "" && rawPhone == "" {
@@ -38,62 +74,86 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 		user, err := s.store.GetUserByProfileEmail(email)
 		if err != nil || user == nil {
 			log.Printf("Recovery requested for non-existent email: %s", email)
-			return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+			return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 		}
 
-		magicLink, tokenKey, err := s.createRecoveryToken(c, user.ID)
+		magicLink, tokenKey, err := s.createRecoveryToken(ctx, user.ID)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
 
 		if err := s.sendRecoveryLink(email, magicLink); err != nil {
-			_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
+			_ = s.redis.Del(ctx, tokenKey).Err()
 			log.Printf("Recovery mail send failed for %s: %v", email, err)
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
 
-		return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+		return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 	}
 
 	phone, err := normalizePhone(rawPhone)
 	if err != nil {
 		return c.String(http.StatusBadRequest, err.Error())
 	}
-	user, err := s.store.GetUserByVerifiedPhone(phone)
-	if err != nil || user == nil {
-		log.Printf("Recovery requested for non-existent or unverified phone: %s", phone)
-		return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
-	}
 
-	magicLink, tokenKey, err := s.createRecoveryToken(c, user.ID)
+	okRate, err := s.redis.SetNX(ctx, recoveryPhoneRateKey(phone), "1", recoveryPhoneRateTTL).Result()
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
-	if err := s.sendRecoverySMS(c.Request().Context(), phone, magicLink); err != nil {
-		_ = s.redis.Del(c.Request().Context(), tokenKey).Err()
-		log.Printf("Recovery SMS send failed for %s: %v", phone, err)
+	if !okRate {
+		return c.String(http.StatusTooManyRequests, "Try again later")
+	}
+
+	user, err := s.store.GetUserByVerifiedPhone(phone)
+	if err != nil || user == nil {
+		log.Printf("Recovery requested for non-existent or unverified phone: %s", phone)
+		return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
+	}
+
+	code, err := generatePhoneVerifyCode()
+	if err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{"message": "If this account exists, a recovery message has been sent."})
+	token := recoveryPhoneCodeToken{
+		UserID:       user.ID,
+		Phone:        phone,
+		CodeHash:     hashPhoneVerifyCode(code),
+		AttemptsLeft: recoveryPhoneCodeMaxAttempts,
+		IssuedAt:     time.Now().UTC(),
+	}
+	tokenPayload, err := json.Marshal(token)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	codeKey := recoveryPhoneCodeKey(phone)
+	if err := s.redis.Set(ctx, codeKey, tokenPayload, recoveryPhoneCodeTTL).Err(); err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	if err := s.sendRecoverySMSCode(ctx, phone, code); err != nil {
+		_ = s.redis.Del(ctx, codeKey).Err()
+		log.Printf("Recovery SMS code send failed for %s: %v", phone, err)
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 }
 
-func (s *Service) createRecoveryToken(c echo.Context, userID string) (magicLink string, tokenKey string, err error) {
+func (s *Service) createRecoveryToken(ctx context.Context, userID string) (magicLink string, tokenKey string, err error) {
 	token, err := generateRecoveryToken()
 	if err != nil {
 		log.Printf("Recovery token generation failed: %v", err)
 		return "", "", err
 	}
 
-	// 3. Store in Redis (15 min)
-	// Key: recovery_token:<token> -> userID
 	tokenKey = "recovery_token:" + token
-	err = s.redis.Set(c.Request().Context(), tokenKey, userID, 15*time.Minute).Err()
+	err = s.redis.Set(ctx, tokenKey, userID, recoveryTokenTTL).Err()
 	if err != nil {
 		return "", "", err
 	}
 
-	// 4. Send recovery link
 	base := recoveryBaseURL()
 	magicLink = fmt.Sprintf("%s/auth/recovery/verify?token=%s", base, token)
 	return magicLink, tokenKey, nil
@@ -117,14 +177,14 @@ func (s *Service) logRecoveryLink(email, magicLink string) {
 	log.Printf("Recovery link generated for email: %s", email)
 }
 
-func (s *Service) logRecoverySMS(phone, magicLink string) {
+func (s *Service) logRecoverySMSCode(phone, code string) {
 	if s.devMode {
 		log.Println("==================================================")
-		log.Printf("RECOVERY SMS for %s: %s", phone, magicLink)
+		log.Printf("RECOVERY SMS CODE for %s: %s", phone, code)
 		log.Println("==================================================")
 		return
 	}
-	log.Printf("Recovery SMS generated for phone: %s", phone)
+	log.Printf("Recovery SMS code generated for phone: %s", phone)
 }
 
 func recoveryBaseURL() string {
@@ -150,19 +210,19 @@ func (s *Service) sendRecoveryLink(email, magicLink string) error {
 	return nil
 }
 
-func (s *Service) sendRecoverySMS(ctx context.Context, phone, magicLink string) error {
+func (s *Service) sendRecoverySMSCode(ctx context.Context, phone, code string) error {
 	if s.smsSender == nil {
 		if s.devMode {
-			s.logRecoverySMS(phone, magicLink)
+			s.logRecoverySMSCode(phone, code)
 			return nil
 		}
 		return fmt.Errorf("sms sender is not configured")
 	}
-	message := "Ahoj420 recovery link: " + magicLink
+	message := recoverySMSCodePrefix + code
 	if err := s.smsSender.SendSMS(ctx, phone, message); err != nil {
 		return err
 	}
-	s.logRecoverySMS(phone, magicLink)
+	s.logRecoverySMSCode(phone, code)
 	return nil
 }
 
@@ -184,15 +244,91 @@ func (s *Service) VerifyRecovery(c echo.Context) error {
 		return c.String(http.StatusForbidden, "Invalid or expired link")
 	}
 
-	sessionID, err := s.setUserSessionWithID(c, userID)
-	if err != nil {
+	if err := s.startRecoveryMode(c, userID); err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
-	if err := s.redis.Set(ctx, "recovery:"+sessionID, "1", 15*time.Minute).Err(); err != nil {
+	return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
+}
+
+func (s *Service) VerifyRecoveryCode(c echo.Context) error {
+	var body recoveryCodePayload
+	_ = c.Bind(&body)
+
+	phoneRaw := strings.TrimSpace(body.Phone)
+	if phoneRaw == "" {
+		phoneRaw = strings.TrimSpace(c.FormValue("phone"))
+	}
+	code := strings.TrimSpace(body.Code)
+	if code == "" {
+		code = strings.TrimSpace(c.FormValue("code"))
+	}
+
+	phone, err := normalizePhone(phoneRaw)
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
+	if !isNumericCode(code) {
+		return c.String(http.StatusBadRequest, "Invalid recovery code")
+	}
+
+	ctx := c.Request().Context()
+	codeKey := recoveryPhoneCodeKey(phone)
+	payload, err := s.redis.Get(ctx, codeKey).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return c.String(http.StatusBadRequest, "Recovery code expired or missing")
+		}
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
-	return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
+	var token recoveryPhoneCodeToken
+	if err := json.Unmarshal(payload, &token); err != nil {
+		_ = s.redis.Del(ctx, codeKey).Err()
+		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+	}
+	if strings.TrimSpace(token.UserID) == "" || strings.TrimSpace(token.Phone) == "" || strings.TrimSpace(token.CodeHash) == "" {
+		_ = s.redis.Del(ctx, codeKey).Err()
+		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+	}
+	if token.Phone != phone {
+		return c.String(http.StatusBadRequest, "Invalid recovery payload")
+	}
+
+	inputHash := hashPhoneVerifyCode(code)
+	match := subtle.ConstantTimeCompare([]byte(inputHash), []byte(token.CodeHash)) == 1
+	if !match {
+		token.AttemptsLeft--
+		token.LastAttemptedAt = time.Now().UTC()
+		if token.AttemptsLeft <= 0 {
+			_ = s.redis.Del(ctx, codeKey).Err()
+			return c.String(http.StatusBadRequest, "Recovery code invalid")
+		}
+		ttl, ttlErr := s.redis.TTL(ctx, codeKey).Result()
+		if ttlErr != nil || ttl <= 0 {
+			ttl = recoveryPhoneCodeTTL
+		}
+		updated, _ := json.Marshal(token)
+		_ = s.redis.Set(ctx, codeKey, updated, ttl).Err()
+		return c.String(http.StatusBadRequest, "Recovery code invalid")
+	}
+
+	_ = s.redis.Del(ctx, codeKey).Err()
+	if err := s.startRecoveryMode(c, token.UserID); err != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":  "Recovery verified",
+		"redirect": "/?mode=recovery",
+	})
+}
+
+func (s *Service) startRecoveryMode(c echo.Context, userID string) error {
+	ctx := c.Request().Context()
+	sessionID, err := s.setUserSessionWithID(c, userID)
+	if err != nil {
+		return err
+	}
+	return s.redis.Set(ctx, "recovery:"+sessionID, "1", recoveryTokenTTL).Err()
 }
 
 func redisGetDel(ctx context.Context, rdb *redis.Client, key string) (string, error) {

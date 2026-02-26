@@ -143,3 +143,30 @@ async function requestRecovery(payload) {
     if (!res.ok) throw new Error(message || ("HTTP " + res.status));
     return message;
 }
+
+async function verifyRecoveryCode(payload) {
+    const params = new URLSearchParams();
+    const phone = (payload && payload.phone ? payload.phone : "").trim();
+    const code = (payload && payload.code ? payload.code : "").trim();
+    if (phone) params.set('phone', phone);
+    if (code) params.set('code', code);
+
+    const res = await fetch('/auth/recovery/verify-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+    });
+
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { message };
+}
