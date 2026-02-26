@@ -246,6 +246,13 @@ func (u *UserStore) GetUser(userID string) (*store.User, error) {
 	return u.store.GetUser(userID)
 }
 
+func (u *UserStore) TrackOIDCClient(userID, clientID, clientHost string) error {
+	if u == nil || u.store == nil {
+		return nil
+	}
+	return u.store.UpsertUserOIDCClient(userID, clientID, clientHost)
+}
+
 type SimpleKey struct {
 	id  string
 	alg jose.SignatureAlgorithm
@@ -690,7 +697,18 @@ func (s *MemStorage) SetAuthRequestDone(id, userID string) error {
 	req.Subject = userID
 	req.DoneVal = true
 	req.AuthTime = time.Now().UTC()
-	return s.saveAuthRequest(ctx, req, oidcStateTTL)
+	if err := s.saveAuthRequest(ctx, req, oidcStateTTL); err != nil {
+		return err
+	}
+
+	clientHost := ""
+	if parsed, parseErr := url.Parse(req.RedirectURI); parseErr == nil {
+		clientHost = strings.TrimSpace(parsed.Host)
+	}
+	if err := s.userStore.TrackOIDCClient(userID, req.ClientID, clientHost); err != nil {
+		log.Printf("failed to track oidc client usage for user %s and client %s: %v", userID, req.ClientID, err)
+	}
+	return nil
 }
 
 func (s *MemStorage) AuthRequestClientHost(ctx context.Context, id string) (string, error) {

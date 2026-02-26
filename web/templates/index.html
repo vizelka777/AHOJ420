@@ -8,11 +8,12 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="/static/js/glue.js?v=20260226d"></script>
+    <script src="/static/js/glue.js?v=20260226e"></script>
     <style>
         #profile-modal,
         #recovery-modal,
-        #qr-login-modal {
+        #qr-login-modal,
+        #delete-account-modal {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.65);
@@ -24,20 +25,25 @@
         }
         #profile-modal.open,
         #recovery-modal.open,
-        #qr-login-modal.open {
+        #qr-login-modal.open,
+        #delete-account-modal.open {
             display: flex;
         }
     </style>
 </head>
 
-<body class="bg-gray-900 text-white min-h-screen flex items-center justify-center font-sans">
+<body class="bg-gray-900 text-white min-h-screen py-4 flex items-start sm:items-center justify-center font-sans">
 
-    <div class="bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
+    <div class="bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md max-h-[calc(100vh-2rem)] overflow-y-auto border border-gray-700">
         <div class="text-center mb-8">
             <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-teal-400 to-blue-500">
                 Ahoj420
             </h1>
         </div>
+        <button id="oidc-return-btn" onclick="resumeOidcReturn()"
+            class="hidden -mt-4 mb-4 w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-300 hover:text-teal-200 hover:border-teal-400 transition">
+            Вернуться к клиенту
+        </button>
 
         <div id="guest-ui">
             <!-- Tabs -->
@@ -175,20 +181,18 @@
                         Обновить
                     </button>
                 </div>
-                <div id="device-sessions-list" class="space-y-2 text-xs text-gray-300">
+                <div id="device-sessions-list" class="max-h-56 overflow-y-auto pr-1 space-y-2 text-xs text-gray-300">
                     <div class="text-gray-400">Загрузка...</div>
                 </div>
             </div>
-            <button type="button" onclick="handleDeleteAccount()"
-                class="w-full py-2 bg-red-600 rounded-lg font-semibold text-white hover:bg-red-500 transition">
-                Удалить аккаунт и пользователя
-            </button>
+            <div id="danger-zone" class="pt-2 border-t border-red-500/20">
+                <button type="button" onclick="handleDeleteAccount()"
+                    class="w-full py-2 bg-red-600 rounded-lg font-semibold text-white hover:bg-red-500 transition">
+                    Удалить аккаунт и пользователя
+                </button>
+            </div>
         </div>
 
-        <button id="oidc-return-btn" onclick="resumeOidcReturn()"
-            class="hidden mt-2 w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-300 hover:text-teal-200 hover:border-teal-400 transition">
-            Вернуться к клиенту
-        </button>
     </div>
 
     <div id="profile-modal">
@@ -268,6 +272,28 @@
                 <button type="button" onclick="closeQRLoginModal()"
                     class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
                     Закрыть
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="delete-account-modal">
+        <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-red-500/30">
+            <h3 class="text-xl font-semibold mb-3 text-red-300">Подтверждение удаления аккаунта</h3>
+            <p class="text-sm text-gray-200 mb-3">
+                После удаления доступ к этим клиентам будет потерян. Профили в этих клиентах будут анонимизированы через 1 месяц, затем полностью удалены.
+            </p>
+            <div id="delete-impact-list" class="max-h-48 overflow-auto p-3 rounded-lg border border-gray-700 bg-gray-900/70 text-xs text-gray-300 mb-4">
+                Загрузка...
+            </div>
+            <div class="flex gap-2">
+                <button type="button" onclick="closeDeleteAccountModal()"
+                    class="flex-1 py-2 border border-gray-600 rounded-lg font-semibold text-gray-300 hover:text-white hover:border-gray-400 transition">
+                    Отмена
+                </button>
+                <button id="btn-confirm-delete-account" type="button" onclick="confirmDeleteAccount()"
+                    class="flex-1 py-2 bg-red-600 rounded-lg font-semibold text-white hover:bg-red-500 transition">
+                    Подтвердить удаление
                 </button>
             </div>
         </div>
@@ -536,6 +562,7 @@
                 closeProfileModal();
                 closeRecoveryModal();
                 closeQRLoginModal();
+                closeDeleteAccountModal();
                 pendingOidcReturn = null;
                 renderOidcReturnButton();
                 applySessionState(false, "");
@@ -547,19 +574,62 @@
         }
 
         async function handleDeleteAccount() {
-            const ok = window.confirm("Удалить аккаунт и профиль без возможности восстановления?");
-            if (!ok) return;
+            await openDeleteAccountModal();
+        }
+
+        function closeDeleteAccountModal() {
+            document.getElementById('delete-account-modal').classList.remove('open');
+        }
+
+        function renderDeleteImpactClients(clients) {
+            const list = document.getElementById('delete-impact-list');
+            if (!Array.isArray(clients) || clients.length === 0) {
+                list.innerHTML = '<div class="text-gray-400">Клиентские приложения не найдены.</div>';
+                return;
+            }
+            const rows = clients.map((item) => {
+                const host = (item.client_host || "").trim();
+                const clientID = (item.client_id || "").trim();
+                const label = host || clientID || "unknown client";
+                const lastSeen = formatDateTime(item.last_seen_at || "");
+                return `<div class="py-1 border-b border-gray-800 last:border-b-0">
+                    <div class="text-red-200">${escapeHTML(label)}</div>
+                    <div class="text-gray-500">client_id: ${escapeHTML(clientID || "n/a")}</div>
+                    <div class="text-gray-500">последний вход: ${escapeHTML(lastSeen)}</div>
+                </div>`;
+            });
+            list.innerHTML = rows.join("");
+        }
+
+        async function openDeleteAccountModal() {
+            const list = document.getElementById('delete-impact-list');
+            list.innerHTML = '<div class="text-gray-400">Загрузка...</div>';
+            document.getElementById('delete-account-modal').classList.add('open');
+            try {
+                const impact = await getDeleteAccountImpact();
+                renderDeleteImpactClients(impact.clients || []);
+            } catch (err) {
+                list.innerHTML = '<div class="text-red-400">Не удалось загрузить список клиентов: ' + escapeHTML(err.message) + '</div>';
+            }
+        }
+
+        async function confirmDeleteAccount() {
+            const btn = document.getElementById('btn-confirm-delete-account');
+            btn.disabled = true;
             try {
                 const res = await fetch('/auth/delete-account', { method: 'POST' });
                 if (!res.ok) {
                     throw new Error(await res.text());
                 }
+                closeDeleteAccountModal();
                 closeProfileModal();
                 applySessionState(false, "");
                 showMessage("Аккаунт удален.", "text-green-400");
                 history.replaceState({}, "", "/");
             } catch (err) {
                 showMessage("Delete error: " + err.message, "text-red-400");
+            } finally {
+                btn.disabled = false;
             }
         }
 
@@ -579,6 +649,7 @@
             renderQRApprovePanel(false);
             clearDeviceSessionsList();
             clearAvatarFileSelection();
+            closeDeleteAccountModal();
             addDeviceFlowStarted = false;
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');

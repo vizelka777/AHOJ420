@@ -39,3 +39,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_profile_email_unique_idx
 CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique_idx
     ON users (trim(phone))
     WHERE trim(COALESCE(phone, '')) <> '';
+
+CREATE TABLE IF NOT EXISTS user_oidc_clients (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_id TEXT NOT NULL,
+    client_host TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, client_id)
+);

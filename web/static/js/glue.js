@@ -276,3 +276,19 @@ async function logoutDeviceSession(payload) {
     if (!res.ok) throw new Error(message || ("HTTP " + res.status));
     return data || { status: "ok", current_logged_out: false };
 }
+
+async function getDeleteAccountImpact() {
+    const res = await fetch('/auth/delete-impact');
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { clients: [] };
+}

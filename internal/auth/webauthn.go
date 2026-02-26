@@ -51,6 +51,13 @@ type profilePayload struct {
 	ShareProfile bool   `json:"share_profile"`
 }
 
+type deleteImpactClientPayload struct {
+	ClientID   string `json:"client_id"`
+	ClientHost string `json:"client_host"`
+	FirstSeen  string `json:"first_seen_at"`
+	LastSeen   string `json:"last_seen_at"`
+}
+
 type registrationSession struct {
 	UserID  string               `json:"user_id"`
 	Session webauthn.SessionData `json:"session"`
@@ -581,6 +588,32 @@ func safePostLogoutRedirect(raw string) string {
 		return trimmed
 	}
 	return defaultRedirect
+}
+
+func (s *Service) DeleteAccountImpact(c echo.Context) error {
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+
+	clients, err := s.store.ListUserOIDCClients(userID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to load linked clients")
+	}
+
+	out := make([]deleteImpactClientPayload, 0, len(clients))
+	for _, client := range clients {
+		out = append(out, deleteImpactClientPayload{
+			ClientID:   strings.TrimSpace(client.ClientID),
+			ClientHost: strings.TrimSpace(client.ClientHost),
+			FirstSeen:  client.FirstSeenAt.UTC().Format(time.RFC3339),
+			LastSeen:   client.LastSeenAt.UTC().Format(time.RFC3339),
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"clients": out,
+	})
 }
 
 func (s *Service) DeleteAccount(c echo.Context) error {
