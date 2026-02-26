@@ -204,6 +204,7 @@ func (s *Service) clearRecoveryMode(c echo.Context, sessionID string) {
 func (s *Service) BeginRegistration(c echo.Context) error {
 	var user *store.User
 	var err error
+	recoveryMode, _ := s.isRecoveryMode(c)
 
 	// `email` query param is kept for backward compatibility, but it acts as login ID.
 	loginID := strings.TrimSpace(c.QueryParam("email"))
@@ -229,13 +230,16 @@ func (s *Service) BeginRegistration(c echo.Context) error {
 	}
 
 	// 2. Generate Options
-	options, session, err := s.wa.BeginRegistration(user,
+	registrationOptions := []webauthn.RegistrationOption{
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			ResidentKey:      protocol.ResidentKeyRequirementRequired, // For Discoverable Creds later
 			UserVerification: protocol.VerificationRequired,
 		}),
-		webauthn.WithExclusions(exclusions),
-	)
+	}
+	if !recoveryMode {
+		registrationOptions = append(registrationOptions, webauthn.WithExclusions(exclusions))
+	}
+	options, session, err := s.wa.BeginRegistration(user, registrationOptions...)
 	if err != nil {
 		return c.String(http.StatusInternalServerError, err.Error())
 	}
@@ -300,17 +304,26 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "User not found")
 	}
+	recoveryMode, recoverySessionID := s.isRecoveryMode(c)
 
 	credential, err := s.wa.FinishRegistration(user, reg.Session, c.Request())
 	if err != nil {
 		return c.String(http.StatusBadRequest, fmt.Sprintf("Verification failed: %v", err))
 	}
 
+	if recoveryMode {
+		if err := s.store.DeleteCredentialsByUser(user.ID); err != nil {
+			return c.String(http.StatusInternalServerError, "Failed to reset credentials")
+		}
+	}
+
 	if err := s.store.AddCredential(user.ID, credential); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to save credential")
 	}
 
-	if sessionID, ok := s.sessionID(c); ok {
+	if recoveryMode {
+		s.clearRecoveryMode(c, recoverySessionID)
+	} else if sessionID, ok := s.sessionID(c); ok {
 		s.clearRecoveryMode(c, sessionID)
 	}
 

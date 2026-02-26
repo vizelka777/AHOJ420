@@ -85,6 +85,13 @@
 
         <div id="account-ui" class="hidden space-y-4">
             <h2 class="text-xl font-semibold text-center">Ваш профиль</h2>
+            <div id="recovery-passkey-panel" class="hidden p-3 border border-amber-500/40 rounded-lg bg-amber-500/10 text-amber-100 text-sm space-y-2">
+                <div>Режим восстановления активен. Создайте новый passkey, чтобы заменить старые ключи.</div>
+                <button id="btn-recovery-create-passkey" type="button" onclick="createRecoveryPasskey()"
+                    class="w-full py-2 border border-amber-300/50 rounded-lg font-semibold text-amber-100 hover:text-white hover:border-amber-200 transition">
+                    Создать новый passkey
+                </button>
+            </div>
             <div class="flex items-center gap-3">
                 <img id="account-avatar" src="" alt="Avatar"
                     class="w-16 h-16 rounded-full object-cover border border-gray-700 bg-gray-900 hidden">
@@ -209,6 +216,7 @@
     <script>
         let pendingOidcReturn = null;
         let originalAccountProfile = null;
+        let recoveryModeActive = false;
 
         function switchMode(mode) {
             const regFlow = document.getElementById('register-flow');
@@ -247,7 +255,13 @@
 
             try {
                 const res = await registerUser(email);
-                showMessage("Passkey created. You are logged in.", "text-green-400");
+                if (recoveryModeActive) {
+                    showMessage("Новый passkey создан. Режим восстановления завершен.", "text-green-400");
+                    recoveryModeActive = false;
+                    renderRecoveryModeUI(false);
+                } else {
+                    showMessage("Passkey created. You are logged in.", "text-green-400");
+                }
                 applySessionState(true, res.display_name || res.email || "User");
                 await loadProfileForAccountUI();
                 if (res.manual_return_required && res.redirect) {
@@ -265,6 +279,10 @@
                 console.error(err);
                 showMessage("Error: " + err.message, "text-red-400");
             }
+        }
+
+        async function createRecoveryPasskey() {
+            await handleRegister({ preventDefault() { } });
         }
 
         async function handleLogin(e) {
@@ -476,11 +494,22 @@
                 showMessage("Session active: " + email, "text-green-400");
                 return;
             }
+            renderRecoveryModeUI(false);
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
             pendingOidcReturn = null;
             renderOidcReturnButton();
+        }
+
+        function renderRecoveryModeUI(enabled) {
+            recoveryModeActive = Boolean(enabled);
+            const panel = document.getElementById('recovery-passkey-panel');
+            if (recoveryModeActive) {
+                panel.classList.remove('hidden');
+            } else {
+                panel.classList.add('hidden');
+            }
         }
 
         async function loadSessionState() {
@@ -491,6 +520,10 @@
                 const authenticated = Boolean(data.authenticated);
                 applySessionState(authenticated, data.display_name || data.email || "");
                 if (authenticated) {
+                    renderRecoveryModeUI(Boolean(data.recovery_mode));
+                    if (Boolean(data.recovery_mode)) {
+                        showMessage("Режим восстановления: создайте новый passkey.", "text-amber-300");
+                    }
                     initializePendingOidcReturnFromQuery();
                     populateAccountUI(data);
                     await loadProfileForAccountUI();

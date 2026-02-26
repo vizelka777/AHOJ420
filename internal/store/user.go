@@ -236,6 +236,11 @@ func (s *Store) AddCredential(userID string, cred *webauthn.Credential) error {
 	return err
 }
 
+func (s *Store) DeleteCredentialsByUser(userID string) error {
+	_, err := s.db.Exec(`DELETE FROM credentials WHERE user_id = $1`, userID)
+	return err
+}
+
 func (s *Store) UpdateCredential(cred *webauthn.Credential) error {
 	_, err := s.db.Exec(`
         UPDATE credentials 
