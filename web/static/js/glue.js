@@ -171,8 +171,14 @@ async function verifyRecoveryCode(payload) {
     return data || { message };
 }
 
-async function generateQRLogin() {
-    const res = await fetch('/auth/qr/generate');
+async function generateQRLogin(payload) {
+    const purpose = (payload && payload.purpose ? payload.purpose : "").trim();
+    const params = new URLSearchParams();
+    if (purpose) {
+        params.set('purpose', purpose);
+    }
+    const url = params.toString() ? ('/auth/qr/generate?' + params.toString()) : '/auth/qr/generate';
+    const res = await fetch(url);
 
     const contentType = (res.headers.get('content-type') || "").toLowerCase();
     let data = null;
@@ -231,4 +237,20 @@ async function getQRLoginStatus(token, authRequestID) {
 
     if (!res.ok) throw new Error(message || ("HTTP " + res.status));
     return data || { status: "expired" };
+}
+
+async function getDeviceSessions() {
+    const res = await fetch('/auth/devices');
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { devices: [] };
 }

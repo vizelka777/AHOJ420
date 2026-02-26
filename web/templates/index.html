@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="/static/js/glue.js?v=20260226b"></script>
+    <script src="/static/js/glue.js?v=20260226c"></script>
     <style>
         #profile-modal,
         #recovery-modal,
@@ -73,7 +73,7 @@
 
             <!-- Extra options -->
             <div class="mt-6 space-y-3">
-                <button type="button" onclick="openQRLoginModal()"
+                <button type="button" onclick="openQRLoginModal('login')"
                     class="w-full py-2 text-sm border border-teal-500/40 rounded-lg text-teal-200 hover:text-teal-100 hover:border-teal-300 transition">
                     Войти по QR
                 </button>
@@ -81,8 +81,9 @@
                     class="w-full py-2 text-sm border border-amber-500/40 rounded-lg text-amber-200 hover:text-amber-100 hover:border-amber-300 transition">
                     Восстановить учет через email или телефон
                 </button>
-                <button class="w-full py-2 text-sm border border-gray-600 rounded-lg text-gray-300 hover:text-white hover:border-gray-400 transition" disabled>
-                    Add Device (coming soon)
+                <button type="button" onclick="openQRLoginModal('add_device')"
+                    class="w-full py-2 text-sm border border-cyan-500/40 rounded-lg text-cyan-200 hover:text-cyan-100 hover:border-cyan-300 transition">
+                    Add Device
                 </button>
             </div>
         </div>
@@ -103,6 +104,18 @@
                     class="w-full py-2 border border-teal-300/50 rounded-lg font-semibold text-teal-100 hover:text-white hover:border-teal-200 transition">
                     Подтвердить QR вход
                 </button>
+            </div>
+            <div id="device-sessions-panel" class="p-3 border border-gray-700 rounded-lg bg-gray-900/60 space-y-2">
+                <div class="flex items-center justify-between">
+                    <div class="text-sm font-semibold text-gray-100">Устройства и сессии</div>
+                    <button type="button" onclick="loadDevicesForAccountUI()"
+                        class="px-2 py-1 text-xs border border-gray-600 rounded text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        Обновить
+                    </button>
+                </div>
+                <div id="device-sessions-list" class="space-y-2 text-xs text-gray-300">
+                    <div class="text-gray-400">Загрузка...</div>
+                </div>
             </div>
             <div class="flex items-center gap-3">
                 <img id="account-avatar" src="" alt="Avatar"
@@ -227,8 +240,8 @@
 
     <div id="qr-login-modal">
         <div class="bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-700">
-            <h3 class="text-xl font-semibold mb-3">Вход по QR</h3>
-            <p class="text-sm text-gray-300 mb-4">
+            <h3 id="qr-login-title" class="text-xl font-semibold mb-3">Вход по QR</h3>
+            <p id="qr-login-description" class="text-sm text-gray-300 mb-4">
                 Отсканируйте QR код авторизованным телефоном и подтвердите вход.
             </p>
             <div class="bg-white rounded-xl p-3 flex justify-center items-center mb-3 min-h-[244px]">
@@ -257,7 +270,9 @@
         let qrLoginPollInFlight = false;
         let qrLoginToken = "";
         let qrLoginAuthRequestID = "";
+        let qrLoginPurpose = "login";
         let scannedQRToken = "";
+        let addDeviceFlowStarted = false;
 
         function normalizeQRToken(raw) {
             const token = (raw || "").trim().toLowerCase();
@@ -315,6 +330,7 @@
                 }
                 applySessionState(true, res.display_name || res.email || "User");
                 await loadProfileForAccountUI();
+                await loadDevicesForAccountUI();
                 if (res.manual_return_required && res.redirect) {
                     pendingOidcReturn = {
                         url: res.redirect,
@@ -363,6 +379,7 @@
                     return;
                 }
                 await loadProfileForAccountUI();
+                await loadDevicesForAccountUI();
             } catch (err) {
                 console.error(err);
                 showMessage("Error: " + err.message, "text-red-400");
@@ -544,11 +561,14 @@
                 accountUI.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
                 renderQRApprovePanel(true);
+                loadDevicesForAccountUI();
                 showMessage("Session active: " + email, "text-green-400");
                 return;
             }
             renderRecoveryModeUI(false);
             renderQRApprovePanel(false);
+            clearDeviceSessionsList();
+            addDeviceFlowStarted = false;
             guestUI.classList.remove('hidden');
             accountUI.classList.add('hidden');
             logoutBtn.classList.add('hidden');
@@ -578,6 +598,66 @@
             panel.classList.add('hidden');
         }
 
+        function clearDeviceSessionsList() {
+            const list = document.getElementById('device-sessions-list');
+            list.innerHTML = '<div class="text-gray-400">Нет данных.</div>';
+        }
+
+        function escapeHTML(raw) {
+            return (raw || "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll("\"", "&quot;")
+                .replaceAll("'", "&#39;");
+        }
+
+        function formatDateTime(raw) {
+            if (!raw) return "n/a";
+            const dt = new Date(raw);
+            if (Number.isNaN(dt.getTime())) return raw;
+            return dt.toLocaleString();
+        }
+
+        function renderDeviceSessions(devices) {
+            const list = document.getElementById('device-sessions-list');
+            if (!Array.isArray(devices) || devices.length === 0) {
+                list.innerHTML = '<div class="text-gray-400">Сессий пока нет.</div>';
+                return;
+            }
+
+            const rows = devices.map((device) => {
+                const statusBadge = device.current
+                    ? '<span class="px-2 py-0.5 rounded border border-emerald-400/40 text-emerald-300">Текущее</span>'
+                    : (device.active
+                        ? '<span class="px-2 py-0.5 rounded border border-cyan-400/40 text-cyan-300">В сети</span>'
+                        : '<span class="px-2 py-0.5 rounded border border-gray-600 text-gray-400">Не в сети</span>');
+                return `
+                    <div class="p-2 rounded border border-gray-700 bg-gray-900/80 space-y-1">
+                        <div class="flex items-center justify-between gap-2">
+                            <div class="text-gray-100 text-sm">${escapeHTML(device.device || "Unknown device")}</div>
+                            ${statusBadge}
+                        </div>
+                        <div class="text-gray-400">Последняя активность: ${escapeHTML(formatDateTime(device.last_seen_at))}</div>
+                        <div class="text-gray-500">Создана: ${escapeHTML(formatDateTime(device.created_at))}</div>
+                        <div class="text-gray-500 break-all">${escapeHTML(device.ip || "IP n/a")}</div>
+                    </div>
+                `;
+            });
+            list.innerHTML = rows.join("");
+        }
+
+        async function loadDevicesForAccountUI() {
+            const list = document.getElementById('device-sessions-list');
+            list.innerHTML = '<div class="text-gray-400">Загрузка...</div>';
+            try {
+                const payload = await getDeviceSessions();
+                renderDeviceSessions(payload.devices || []);
+            } catch (_) {
+                list.innerHTML = '<div class="text-red-400">Не удалось загрузить устройства.</div>';
+            }
+        }
+
         async function loadSessionState() {
             refreshScannedQRToken();
             try {
@@ -594,11 +674,48 @@
                     initializePendingOidcReturnFromQuery();
                     populateAccountUI(data);
                     await loadProfileForAccountUI();
+                    await loadDevicesForAccountUI();
+                    await maybeStartAddDeviceFlow(true);
                 } else if (scannedQRToken) {
                     showMessage("Сначала войдите на этом устройстве, затем подтвердите QR вход.", "text-yellow-300");
                 }
             } catch (_) {
                 applySessionState(false, "");
+            }
+        }
+
+        async function maybeStartAddDeviceFlow(authenticated) {
+            const params = new URLSearchParams(window.location.search);
+            if ((params.get("mode") || "").trim() !== "add-device") {
+                return;
+            }
+            if (!authenticated) {
+                showMessage("Подтвердите QR на основном устройстве для добавления passkey.", "text-cyan-300");
+                return;
+            }
+            if (recoveryModeActive) {
+                showMessage("Завершите восстановление, затем добавьте устройство.", "text-amber-300");
+                return;
+            }
+            if (addDeviceFlowStarted) {
+                return;
+            }
+
+            addDeviceFlowStarted = true;
+            showMessage("Подтвердите создание passkey для этого устройства...", "text-cyan-300");
+            try {
+                const payload = await registerUser("");
+                applySessionState(true, payload.display_name || payload.email || "User");
+                await loadProfileForAccountUI();
+                await loadDevicesForAccountUI();
+                showMessage("Новое устройство добавлено.", "text-green-400");
+
+                params.delete("mode");
+                const qs = params.toString();
+                history.replaceState({}, "", qs ? "/?" + qs : "/");
+            } catch (err) {
+                addDeviceFlowStarted = false;
+                showMessage("Не удалось добавить устройство: " + err.message, "text-red-400");
             }
         }
 
@@ -823,7 +940,17 @@
             qrLoginPollInFlight = false;
         }
 
-        function openQRLoginModal() {
+        function openQRLoginModal(purpose) {
+            qrLoginPurpose = ((purpose || "login").trim().toLowerCase() === "add_device") ? "add_device" : "login";
+            const title = document.getElementById('qr-login-title');
+            const description = document.getElementById('qr-login-description');
+            if (qrLoginPurpose === "add_device") {
+                title.innerText = "Добавление устройства по QR";
+                description.innerText = "Отсканируйте код авторизованным телефоном, чтобы подтвердить добавление устройства.";
+            } else {
+                title.innerText = "Вход по QR";
+                description.innerText = "Отсканируйте QR код авторизованным телефоном и подтвердите вход.";
+            }
             document.getElementById('qr-login-modal').classList.add('open');
             startQRLoginFlow();
         }
@@ -832,6 +959,7 @@
             stopQRLoginPolling();
             qrLoginToken = "";
             qrLoginAuthRequestID = "";
+            qrLoginPurpose = "login";
             document.getElementById('qr-login-modal').classList.remove('open');
         }
 
@@ -848,7 +976,7 @@
             setQRLoginStatus("Генерируем QR код...", "text-yellow-300");
 
             try {
-                const payload = await generateQRLogin();
+                const payload = await generateQRLogin({ purpose: qrLoginPurpose });
                 qrLoginToken = payload.token;
                 const params = new URLSearchParams(window.location.search);
                 qrLoginAuthRequestID = (params.get("auth_request_id") || "").trim();
@@ -867,7 +995,11 @@
                     qrBox.innerHTML = '<div class="text-xs text-gray-700 font-mono">QR unavailable</div>';
                 }
 
-                setQRLoginStatus("Ожидание подтверждения на телефоне...", "text-teal-300");
+                if (qrLoginPurpose === "add_device") {
+                    setQRLoginStatus("Ожидание подтверждения добавления устройства...", "text-cyan-300");
+                } else {
+                    setQRLoginStatus("Ожидание подтверждения на телефоне...", "text-teal-300");
+                }
                 qrLoginPollTimer = setInterval(pollQRLoginStatus, 2000);
                 await pollQRLoginStatus();
             } catch (err) {

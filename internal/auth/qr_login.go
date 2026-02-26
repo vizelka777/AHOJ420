@@ -17,10 +17,14 @@ import (
 const (
 	qrLoginPrefix       = "auth:qr_login:"
 	qrLoginPending      = "pending"
+	qrLoginApproved     = "approved"
 	qrLoginApprovedTTL  = 1 * time.Minute
 	qrLoginPendingTTL   = 2 * time.Minute
 	qrLoginTokenBytes   = 32
 	qrLoginWatchRetries = 16
+
+	qrPurposeLogin     = "login"
+	qrPurposeAddDevice = "add_device"
 )
 
 var (
@@ -34,12 +38,81 @@ type qrApprovePayload struct {
 	Token string `json:"token"`
 }
 
+type qrTokenState struct {
+	Status  string
+	UserID  string
+	Purpose string
+}
+
 func qrLoginRedisKey(token string) string {
 	return qrLoginPrefix + token
 }
 
 func qrLoginURL(token string) string {
 	return fmt.Sprintf("%s/qr-login?token=%s", recoveryBaseURL(), token)
+}
+
+func normalizeQRLoginPurpose(raw string) (string, error) {
+	purpose := strings.TrimSpace(strings.ToLower(raw))
+	if purpose == "" {
+		return qrPurposeLogin, nil
+	}
+	switch purpose {
+	case qrPurposeLogin, qrPurposeAddDevice:
+		return purpose, nil
+	default:
+		return "", fmt.Errorf("invalid purpose")
+	}
+}
+
+func qrPendingValue(purpose string) string {
+	return qrLoginPending + ":" + purpose
+}
+
+func qrApprovedValue(userID, purpose string) string {
+	return qrLoginApproved + ":" + strings.TrimSpace(userID) + ":" + purpose
+}
+
+func parseQRTokenState(raw string) (qrTokenState, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return qrTokenState{}, errQRLoginTokenInvalid
+	}
+
+	if value == qrLoginPending {
+		return qrTokenState{Status: qrLoginPending, Purpose: qrPurposeLogin}, nil // legacy
+	}
+	if strings.HasPrefix(value, qrLoginPending+":") {
+		purpose, err := normalizeQRLoginPurpose(strings.TrimPrefix(value, qrLoginPending+":"))
+		if err != nil {
+			return qrTokenState{}, errQRLoginTokenInvalid
+		}
+		return qrTokenState{Status: qrLoginPending, Purpose: purpose}, nil
+	}
+
+	if strings.HasPrefix(value, qrLoginApproved+":") {
+		payload := strings.TrimPrefix(value, qrLoginApproved+":")
+		parts := strings.SplitN(payload, ":", 2)
+		userID := strings.TrimSpace(parts[0])
+		if userID == "" {
+			return qrTokenState{}, errQRLoginTokenInvalid
+		}
+		purpose := qrPurposeLogin
+		if len(parts) == 2 {
+			normalized, err := normalizeQRLoginPurpose(parts[1])
+			if err != nil {
+				return qrTokenState{}, errQRLoginTokenInvalid
+			}
+			purpose = normalized
+		}
+		return qrTokenState{
+			Status:  qrLoginApproved,
+			UserID:  userID,
+			Purpose: purpose,
+		}, nil
+	}
+
+	return qrTokenState{}, errQRLoginTokenInvalid
 }
 
 func generateQRLoginToken() (string, error) {
@@ -66,6 +139,10 @@ func normalizeQRLoginToken(raw string) (string, error) {
 
 func (s *Service) GenerateQRLogin(c echo.Context) error {
 	ctx := c.Request().Context()
+	purpose, err := normalizeQRLoginPurpose(c.QueryParam("purpose"))
+	if err != nil {
+		return c.String(http.StatusBadRequest, err.Error())
+	}
 
 	for i := 0; i < 4; i++ {
 		token, err := generateQRLoginToken()
@@ -73,7 +150,7 @@ func (s *Service) GenerateQRLogin(c echo.Context) error {
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
 
-		ok, err := s.redis.SetNX(ctx, qrLoginRedisKey(token), qrLoginPending, qrLoginPendingTTL).Result()
+		ok, err := s.redis.SetNX(ctx, qrLoginRedisKey(token), qrPendingValue(purpose), qrLoginPendingTTL).Result()
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
@@ -82,8 +159,9 @@ func (s *Service) GenerateQRLogin(c echo.Context) error {
 		}
 
 		return c.JSON(http.StatusOK, map[string]string{
-			"token":  token,
-			"qr_url": qrLoginURL(token),
+			"token":   token,
+			"qr_url":  qrLoginURL(token),
+			"purpose": purpose,
 		})
 	}
 
@@ -125,7 +203,6 @@ func (s *Service) ApproveQRLogin(c echo.Context) error {
 
 func (s *Service) approveQRLoginToken(ctx context.Context, token, userID string) error {
 	key := qrLoginRedisKey(token)
-	approvedValue := "approved:" + userID
 
 	for i := 0; i < qrLoginWatchRetries; i++ {
 		err := s.redis.Watch(ctx, func(tx *redis.Tx) error {
@@ -136,19 +213,25 @@ func (s *Service) approveQRLoginToken(ctx context.Context, token, userID string)
 				}
 				return err
 			}
-			switch current {
+			state, err := parseQRTokenState(current)
+			if err != nil {
+				return errQRLoginTokenInvalid
+			}
+
+			switch state.Status {
 			case qrLoginPending:
+				approvedValue := qrApprovedValue(userID, state.Purpose)
 				_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 					pipe.Set(ctx, key, approvedValue, qrLoginApprovedTTL)
 					return nil
 				})
 				return err
-			case approvedValue:
-				return nil
-			default:
-				if strings.HasPrefix(current, "approved:") {
-					return errQRLoginTokenNotPending
+			case qrLoginApproved:
+				if state.UserID == strings.TrimSpace(userID) {
+					return nil
 				}
+				return errQRLoginTokenNotPending
+			default:
 				return errQRLoginTokenInvalid
 			}
 		}, key)
@@ -171,7 +254,7 @@ func (s *Service) QRLoginStatus(c echo.Context) error {
 	}
 	authReqID := strings.TrimSpace(c.QueryParam("auth_request_id"))
 
-	status, userID, err := s.getQRLoginStatus(c.Request().Context(), token)
+	status, userID, purpose, err := s.getQRLoginStatus(c.Request().Context(), token)
 	if err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
@@ -192,6 +275,8 @@ func (s *Service) QRLoginStatus(c echo.Context) error {
 				return c.String(http.StatusBadRequest, "OIDC auth request invalid")
 			}
 			redirect = "/authorize/callback?id=" + authReqID
+		} else if purpose == qrPurposeAddDevice {
+			redirect = "/?mode=add-device"
 		}
 
 		return c.JSON(http.StatusOK, map[string]string{
@@ -203,12 +288,13 @@ func (s *Service) QRLoginStatus(c echo.Context) error {
 	}
 }
 
-func (s *Service) getQRLoginStatus(ctx context.Context, token string) (status string, userID string, err error) {
+func (s *Service) getQRLoginStatus(ctx context.Context, token string) (status string, userID string, purpose string, err error) {
 	key := qrLoginRedisKey(token)
 
 	for i := 0; i < qrLoginWatchRetries; i++ {
 		status = ""
 		userID = ""
+		purpose = qrPurposeLogin
 
 		err = s.redis.Watch(ctx, func(tx *redis.Tx) error {
 			current, err := tx.Get(ctx, key).Result()
@@ -220,12 +306,8 @@ func (s *Service) getQRLoginStatus(ctx context.Context, token string) (status st
 				return err
 			}
 
-			if current == qrLoginPending {
-				status = "pending"
-				return errQRLoginStillPending
-			}
-
-			if !strings.HasPrefix(current, "approved:") {
+			state, parseErr := parseQRTokenState(current)
+			if parseErr != nil {
 				_, delErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 					pipe.Del(ctx, key)
 					return nil
@@ -237,8 +319,13 @@ func (s *Service) getQRLoginStatus(ctx context.Context, token string) (status st
 				return errQRLoginTokenInvalid
 			}
 
-			approvedUserID := strings.TrimSpace(strings.TrimPrefix(current, "approved:"))
-			if approvedUserID == "" {
+			if state.Status == qrLoginPending {
+				status = "pending"
+				purpose = state.Purpose
+				return errQRLoginStillPending
+			}
+
+			if state.Status != qrLoginApproved || strings.TrimSpace(state.UserID) == "" {
 				_, delErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 					pipe.Del(ctx, key)
 					return nil
@@ -259,21 +346,22 @@ func (s *Service) getQRLoginStatus(ctx context.Context, token string) (status st
 			}
 
 			status = "approved"
-			userID = approvedUserID
+			userID = state.UserID
+			purpose = state.Purpose
 			return nil
 		}, key)
 
 		if err == nil {
-			return status, userID, nil
+			return status, userID, purpose, nil
 		}
 		if errors.Is(err, errQRLoginStillPending) || errors.Is(err, errQRLoginTokenExpired) || errors.Is(err, errQRLoginTokenInvalid) {
-			return status, userID, nil
+			return status, userID, purpose, nil
 		}
 		if errors.Is(err, redis.TxFailedErr) {
 			continue
 		}
-		return "", "", err
+		return "", "", "", err
 	}
 
-	return "", "", fmt.Errorf("failed to resolve qr login status atomically")
+	return "", "", "", fmt.Errorf("failed to resolve qr login status atomically")
 }

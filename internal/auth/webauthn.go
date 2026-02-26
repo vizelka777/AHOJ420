@@ -153,6 +153,7 @@ func (s *Service) setUserSessionWithID(c echo.Context, userID string) (string, e
 	if err := s.redis.Set(c.Request().Context(), sessionKey, userID, s.sessionTTL).Err(); err != nil {
 		return "", err
 	}
+	_ = s.touchDeviceSession(c, userSessionID, userID)
 	c.SetCookie(&http.Cookie{
 		Name:     "user_session",
 		Value:    userSessionID,
@@ -625,6 +626,7 @@ func (s *Service) SessionUserID(c echo.Context) (string, bool) {
 	if err != nil || userID == "" {
 		return "", false
 	}
+	_ = s.touchDeviceSession(c, cookie.Value, userID)
 	return userID, true
 }
 
