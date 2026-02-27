@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -21,6 +22,8 @@ var (
 	ErrPhoneVerificationMismatch        = errors.New("phone mismatch or nothing to verify")
 	ErrProfileEmailAlreadyUsed          = errors.New("profile email already used")
 	ErrPhoneAlreadyUsed                 = errors.New("phone already used")
+	ErrCredentialNotFound               = errors.New("credential not found")
+	ErrCannotDeleteLastCredential       = errors.New("cannot delete last credential")
 )
 
 func New(db *sql.DB) *Store {
@@ -41,6 +44,13 @@ type User struct {
 	AvatarMIME      string
 	AvatarBytes     int64
 	Credentials     []webauthn.Credential
+}
+
+type CredentialRecord struct {
+	ID         []byte
+	DeviceName string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
 }
 
 // WebAuthnUser interface implementation
@@ -245,13 +255,108 @@ func (s *Store) DeleteCredentialsByUser(userID string) error {
 	return err
 }
 
+func (s *Store) DeleteCredentialByUserAndID(userID string, credID []byte) error {
+	if strings.TrimSpace(userID) == "" || len(credID) == 0 {
+		return ErrCredentialNotFound
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(`SELECT id FROM credentials WHERE user_id = $1 FOR UPDATE`, userID)
+	if err != nil {
+		return err
+	}
+
+	count := 0
+	found := false
+	for rows.Next() {
+		var id []byte
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		count++
+		if bytes.Equal(id, credID) {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	if !found {
+		return ErrCredentialNotFound
+	}
+	if count <= 1 {
+		return ErrCannotDeleteLastCredential
+	}
+
+	res, err := tx.Exec(`DELETE FROM credentials WHERE user_id = $1 AND id = $2`, userID, credID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrCredentialNotFound
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) UpdateCredential(cred *webauthn.Credential) error {
 	_, err := s.db.Exec(`
-        UPDATE credentials 
-        SET sign_count = $1, last_used_at = NOW()
-        WHERE id = $2
-    `, cred.Authenticator.SignCount, cred.ID)
+	        UPDATE credentials
+	        SET sign_count = $1, last_used_at = NOW()
+	        WHERE id = $2
+	    `, cred.Authenticator.SignCount, cred.ID)
 	return err
+}
+
+func (s *Store) ListCredentialRecords(userID string) ([]CredentialRecord, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []CredentialRecord{}, nil
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, COALESCE(device_name, ''), created_at, last_used_at
+		FROM credentials
+		WHERE user_id = $1
+		ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]CredentialRecord, 0, 8)
+	for rows.Next() {
+		var item CredentialRecord
+		var lastUsed sql.NullTime
+		if err := rows.Scan(&item.ID, &item.DeviceName, &item.CreatedAt, &lastUsed); err != nil {
+			return nil, err
+		}
+		if lastUsed.Valid {
+			ts := lastUsed.Time
+			item.LastUsedAt = &ts
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) UpdateProfile(userID, displayName, profileEmail, phone string, shareProfile bool) error {

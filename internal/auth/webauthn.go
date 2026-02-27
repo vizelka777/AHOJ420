@@ -152,6 +152,10 @@ func newSessionID() (string, error) {
 }
 
 func (s *Service) setUserSessionWithID(c echo.Context, userID string) (string, error) {
+	return s.setUserSessionWithCredentialID(c, userID, "")
+}
+
+func (s *Service) setUserSessionWithCredentialID(c echo.Context, userID, credentialID string) (string, error) {
 	userSessionID, err := newSessionID()
 	if err != nil {
 		return "", err
@@ -160,7 +164,7 @@ func (s *Service) setUserSessionWithID(c echo.Context, userID string) (string, e
 	if err := s.redis.Set(c.Request().Context(), sessionKey, userID, s.sessionTTL).Err(); err != nil {
 		return "", err
 	}
-	_ = s.touchDeviceSession(c, userSessionID, userID)
+	_ = s.touchDeviceSession(c, userSessionID, userID, credentialID)
 	c.SetCookie(&http.Cookie{
 		Name:     "user_session",
 		Value:    userSessionID,
@@ -336,7 +340,7 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 		s.clearRecoveryMode(c, sessionID)
 	}
 
-	if _, err := s.setUserSessionWithID(c, user.ID); err != nil {
+	if _, err := s.setUserSessionWithCredentialID(c, user.ID, encodeCredentialID(credential.ID)); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to create session")
 	}
 
@@ -507,7 +511,7 @@ func (s *Service) FinishLogin(c echo.Context) error {
 		fmt.Printf("Failed to update credential stats: %v\n", err)
 	}
 
-	if err := s.setUserSession(c, user.ID); err != nil {
+	if _, err := s.setUserSessionWithCredentialID(c, user.ID, encodeCredentialID(credential.ID)); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to create session")
 	}
 
@@ -659,7 +663,7 @@ func (s *Service) SessionUserID(c echo.Context) (string, bool) {
 	if err != nil || userID == "" {
 		return "", false
 	}
-	_ = s.touchDeviceSession(c, cookie.Value, userID)
+	_ = s.touchDeviceSession(c, cookie.Value, userID, "")
 	return userID, true
 }
 

@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="/static/js/glue.js?v=20260226f"></script>
+    <script src="/static/js/glue.js?v=20260226g"></script>
     <style>
         #profile-modal,
         #recovery-modal,
@@ -189,6 +189,21 @@
                     </button>
                 </div>
                 <div id="device-sessions-list" class="max-h-56 overflow-y-auto pr-1 space-y-2 text-xs text-gray-300">
+                    <div class="text-gray-400">Загрузка...</div>
+                </div>
+                <div class="text-[11px] text-gray-500">
+                    Потерянные устройства удаляйте в блоке Passkeys.
+                </div>
+            </div>
+            <div id="passkeys-panel" class="p-3 border border-gray-700 rounded-lg bg-gray-900/60 space-y-2">
+                <div class="flex items-center justify-between">
+                    <div class="text-sm font-semibold text-gray-100">Passkeys</div>
+                    <button type="button" onclick="loadPasskeysForAccountUI()"
+                        class="px-2 py-1 text-xs border border-gray-600 rounded text-gray-300 hover:text-white hover:border-gray-400 transition">
+                        Обновить
+                    </button>
+                </div>
+                <div id="passkeys-list" class="max-h-56 overflow-y-auto pr-1 space-y-2 text-xs text-gray-300">
                     <div class="text-gray-400">Загрузка...</div>
                 </div>
             </div>
@@ -669,6 +684,7 @@
             renderRecoveryModeUI(false);
             renderQRApprovePanel(false);
             clearDeviceSessionsList();
+            clearPasskeysList();
             clearAvatarFileSelection();
             closeDeleteAccountModal();
             addDeviceFlowStarted = false;
@@ -702,6 +718,11 @@
 
         function clearDeviceSessionsList() {
             const list = document.getElementById('device-sessions-list');
+            list.innerHTML = '<div class="text-gray-400">Нет данных.</div>';
+        }
+
+        function clearPasskeysList() {
+            const list = document.getElementById('passkeys-list');
             list.innerHTML = '<div class="text-gray-400">Нет данных.</div>';
         }
 
@@ -796,19 +817,46 @@
                     ? `<button type="button" onclick="logoutDeviceSessionUI('${encodedSessionID}')"
                         class="px-2 py-1 rounded text-[11px] border border-pink-500/50 text-pink-300 hover:text-pink-200 hover:border-pink-400 transition">Выйти</button>`
                     : "";
-                const removeBtn = encodedSessionID
-                    ? `<button type="button" onclick="removeDeviceSessionUI('${encodedSessionID}')"
+                return `
+                    <div class="p-2 rounded border border-gray-700 bg-gray-900/80 space-y-1">
+                        <div class="flex items-center justify-between gap-2">
+                            <div class="text-gray-100 text-sm">${escapeHTML(device.device || "Unknown device")}</div>
+                            <div class="flex items-center gap-2">${statusBadge}${logoutBtn}</div>
+                        </div>
+                        <div class="text-gray-400">Последняя активность: ${escapeHTML(formatDateTime(device.last_seen_at))}</div>
+                        <div class="text-gray-500">Создана: ${escapeHTML(formatDateTime(device.created_at))}</div>
+                        <div class="text-gray-500 break-all">${escapeHTML(device.ip || "IP n/a")}</div>
+                    </div>
+                `;
+            });
+            list.innerHTML = rows.join("");
+        }
+
+        function renderPasskeys(passkeys) {
+            const list = document.getElementById('passkeys-list');
+            if (!Array.isArray(passkeys) || passkeys.length === 0) {
+                list.innerHTML = '<div class="text-gray-400">Passkeys пока нет.</div>';
+                return;
+            }
+            const rows = passkeys.map((item) => {
+                const credentialID = (item.credential_id || "").trim();
+                const encodedCredentialID = encodeURIComponent(credentialID);
+                const label = (item.label || "").trim() || "Passkey";
+                const createdAt = formatDateTime(item.created_at || "");
+                const lastUsedAt = formatDateTime(item.last_used_at || "");
+                const removeBtn = encodedCredentialID
+                    ? `<button type="button" onclick="deletePasskeyUI('${encodedCredentialID}')"
                         class="px-2 py-1 rounded text-[11px] border border-rose-500/50 text-rose-300 hover:text-rose-200 hover:border-rose-400 transition">Удалить</button>`
                     : "";
                 return `
                     <div class="p-2 rounded border border-gray-700 bg-gray-900/80 space-y-1">
                         <div class="flex items-center justify-between gap-2">
-                            <div class="text-gray-100 text-sm">${escapeHTML(device.device || "Unknown device")}</div>
-                            <div class="flex items-center gap-2">${statusBadge}${logoutBtn}${removeBtn}</div>
+                            <div class="text-gray-100 text-sm">${escapeHTML(label)}</div>
+                            <div class="flex items-center gap-2">${removeBtn}</div>
                         </div>
-                        <div class="text-gray-400">Последняя активность: ${escapeHTML(formatDateTime(device.last_seen_at))}</div>
-                        <div class="text-gray-500">Создана: ${escapeHTML(formatDateTime(device.created_at))}</div>
-                        <div class="text-gray-500 break-all">${escapeHTML(device.ip || "IP n/a")}</div>
+                        <div class="text-gray-500 break-all">id: ${escapeHTML(credentialID || "n/a")}</div>
+                        <div class="text-gray-500">Создан: ${escapeHTML(createdAt)}</div>
+                        <div class="text-gray-400">Последний вход: ${escapeHTML(lastUsedAt)}</div>
                     </div>
                 `;
             });
@@ -823,6 +871,17 @@
                 renderDeviceSessions(payload.devices || []);
             } catch (_) {
                 list.innerHTML = '<div class="text-red-400">Не удалось загрузить устройства.</div>';
+            }
+        }
+
+        async function loadPasskeysForAccountUI() {
+            const list = document.getElementById('passkeys-list');
+            list.innerHTML = '<div class="text-gray-400">Загрузка...</div>';
+            try {
+                const payload = await getPasskeys();
+                renderPasskeys(payload.passkeys || []);
+            } catch (_) {
+                list.innerHTML = '<div class="text-red-400">Не удалось загрузить passkeys.</div>';
             }
         }
 
@@ -858,24 +917,24 @@
             }
         }
 
-        async function removeDeviceSessionUI(encodedSessionID) {
-            let sessionID = "";
+        async function deletePasskeyUI(encodedCredentialID) {
+            let credentialID = "";
             try {
-                sessionID = decodeURIComponent((encodedSessionID || "").trim());
+                credentialID = decodeURIComponent((encodedCredentialID || "").trim());
             } catch (_) {
-                sessionID = (encodedSessionID || "").trim();
+                credentialID = (encodedCredentialID || "").trim();
             }
-            if (!sessionID) {
-                showMessage("Не удалось определить устройство.", "text-yellow-400");
+            if (!credentialID) {
+                showMessage("Не удалось определить passkey.", "text-yellow-400");
                 return;
             }
 
-            const ok = window.confirm("Удалить это устройство из списка и завершить его сессию?");
+            const ok = window.confirm("Удалить этот passkey? Потерянное устройство больше не сможет входить этим ключом.");
             if (!ok) return;
 
             try {
-                const payload = await removeDeviceSession({ session_id: sessionID });
-                if (payload.current_removed) {
+                const payload = await deletePasskey({ credential_id: credentialID });
+                if (payload.current_logged_out) {
                     closeProfileModal();
                     closeRecoveryModal();
                     closeQRLoginModal();
@@ -883,14 +942,15 @@
                     pendingOidcReturn = null;
                     renderOidcReturnButton();
                     applySessionState(false, "");
-                    showMessage("Текущее устройство удалено.", "text-green-400");
+                    showMessage("Текущий passkey удалён. Выполнен выход.", "text-green-400");
                     history.replaceState({}, "", "/");
                     return;
                 }
+                await loadPasskeysForAccountUI();
                 await loadDevicesForAccountUI();
-                showMessage("Устройство удалено.", "text-green-400");
+                showMessage("Passkey удалён.", "text-green-400");
             } catch (err) {
-                showMessage("Не удалось удалить устройство: " + err.message, "text-red-400");
+                showMessage("Не удалось удалить passkey: " + err.message, "text-red-400");
             }
         }
 
@@ -911,6 +971,7 @@
                     populateAccountUI(data);
                     await loadProfileForAccountUI();
                     await loadDevicesForAccountUI();
+                    await loadPasskeysForAccountUI();
                     await maybeStartAddDeviceFlow(true);
                 } else if (scannedQRToken) {
                     showMessage("Сначала войдите на этом устройстве, затем подтвердите QR вход.", "text-yellow-300");
@@ -944,6 +1005,7 @@
                 applySessionState(true, payload.display_name || payload.email || "User");
                 await loadProfileForAccountUI();
                 await loadDevicesForAccountUI();
+                await loadPasskeysForAccountUI();
                 showMessage("Новое устройство добавлено.", "text-green-400");
 
                 params.delete("mode");

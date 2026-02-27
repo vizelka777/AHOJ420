@@ -1,6 +1,10 @@
 package auth
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -32,6 +36,7 @@ type deviceSessionMeta struct {
 	SessionID    string `json:"session_id"`
 	UserID       string `json:"user_id"`
 	DeviceID     string `json:"device_id"`
+	CredentialID string `json:"credential_id"`
 	UserAgent    string `json:"user_agent"`
 	IP           string `json:"ip"`
 	CreatedAtUTC int64  `json:"created_at_utc"`
@@ -90,6 +95,111 @@ func (s *Service) ensureDeviceID(c echo.Context) (string, error) {
 		MaxAge:   deviceCookieMaxAgeSec,
 	})
 	return deviceID, nil
+}
+
+func encodeCredentialID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	return hex.EncodeToString(raw)
+}
+
+func decodeCredentialID(encoded string) ([]byte, error) {
+	normalized := strings.TrimSpace(encoded)
+	if normalized == "" {
+		return nil, errors.New("credential_id is empty")
+	}
+	if raw, err := hex.DecodeString(normalized); err == nil {
+		return raw, nil
+	}
+	return base64.RawURLEncoding.DecodeString(normalized)
+}
+
+func credentialIDMatches(rawMeta string, target []byte) bool {
+	if len(target) == 0 {
+		return false
+	}
+	decoded, err := decodeCredentialID(rawMeta)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(decoded, target)
+}
+
+func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string, credentialID []byte, currentSessionID string) (bool, error) {
+	userID = strings.TrimSpace(userID)
+	currentSessionID = strings.TrimSpace(currentSessionID)
+	if userID == "" || len(credentialID) == 0 {
+		return false, nil
+	}
+
+	listKey := deviceSessionListKey(userID)
+	sessionIDs, err := s.redis.ZRange(ctx, listKey, 0, -1).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return false, err
+	}
+	if len(sessionIDs) == 0 {
+		return false, nil
+	}
+
+	pipe := s.redis.Pipeline()
+	metaCmd := make(map[string]*redis.StringCmd, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		metaCmd[sessionID] = pipe.Get(ctx, deviceSessionMetaKey(sessionID))
+	}
+	_, err = pipe.Exec(ctx)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return false, err
+	}
+
+	removedCurrent := false
+	type cleanupTarget struct {
+		sessionID string
+		deviceID  string
+	}
+	targets := make([]cleanupTarget, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		rawMeta, metaErr := metaCmd[sessionID].Bytes()
+		if metaErr != nil {
+			continue
+		}
+		var meta deviceSessionMeta
+		if json.Unmarshal(rawMeta, &meta) != nil {
+			continue
+		}
+		if strings.TrimSpace(meta.UserID) != userID {
+			continue
+		}
+		if !credentialIDMatches(meta.CredentialID, credentialID) {
+			continue
+		}
+		targets = append(targets, cleanupTarget{
+			sessionID: sessionID,
+			deviceID:  strings.TrimSpace(meta.DeviceID),
+		})
+		if sessionID == currentSessionID {
+			removedCurrent = true
+		}
+	}
+	if len(targets) == 0 {
+		return false, nil
+	}
+
+	cleanPipe := s.redis.TxPipeline()
+	for _, t := range targets {
+		cleanPipe.Del(ctx, "sess:"+t.sessionID)
+		cleanPipe.Del(ctx, "recovery:"+t.sessionID)
+		cleanPipe.Del(ctx, deviceSessionMetaKey(t.sessionID))
+		cleanPipe.ZRem(ctx, listKey, t.sessionID)
+		if t.deviceID != "" {
+			cleanPipe.Del(ctx, deviceSessionDeviceKey(userID, t.deviceID))
+		}
+	}
+	if _, err := cleanPipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return false, err
+	}
+
+	return removedCurrent, nil
 }
 
 func requestIP(c echo.Context) string {
@@ -153,9 +263,10 @@ func formatUnixUTC(ts int64) string {
 	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
 }
 
-func (s *Service) touchDeviceSession(c echo.Context, sessionID, userID string) error {
+func (s *Service) touchDeviceSession(c echo.Context, sessionID, userID, credentialID string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	userID = strings.TrimSpace(userID)
+	credentialID = strings.TrimSpace(credentialID)
 	if sessionID == "" || userID == "" {
 		return nil
 	}
@@ -192,6 +303,9 @@ func (s *Service) touchDeviceSession(c echo.Context, sessionID, userID string) e
 	meta.SessionID = sessionID
 	meta.UserID = userID
 	meta.DeviceID = deviceID
+	if credentialID != "" {
+		meta.CredentialID = credentialID
+	}
 	if meta.CreatedAtUTC <= 0 && prevSessionID != "" {
 		if prevPayload, prevErr := s.redis.Get(ctx, deviceSessionMetaKey(prevSessionID)).Bytes(); prevErr == nil {
 			var prevMeta deviceSessionMeta
@@ -511,7 +625,8 @@ func (s *Service) RemoveDeviceSession(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"status":          "removed",
-		"current_removed": removedCurrent,
+		"status":             "removed",
+		"current_removed":    removedCurrent,
+		"credential_revoked": false,
 	})
 }

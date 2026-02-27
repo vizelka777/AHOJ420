@@ -296,7 +296,45 @@ async function removeDeviceSession(payload) {
     }
 
     if (!res.ok) throw new Error(message || ("HTTP " + res.status));
-    return data || { status: "removed", current_removed: false };
+    return data || { status: "removed", current_removed: false, credential_revoked: false };
+}
+
+async function getPasskeys() {
+    const res = await fetch('/auth/passkeys');
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { passkeys: [] };
+}
+
+async function deletePasskey(payload) {
+    const credentialID = (payload && payload.credential_id ? payload.credential_id : "").trim();
+    const res = await fetch('/auth/passkeys/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential_id: credentialID })
+    });
+
+    const contentType = (res.headers.get('content-type') || "").toLowerCase();
+    let data = null;
+    let message = "";
+    if (contentType.includes('application/json')) {
+        data = await res.json();
+        message = data.message || "";
+    } else {
+        message = await res.text();
+    }
+
+    if (!res.ok) throw new Error(message || ("HTTP " + res.status));
+    return data || { status: "deleted", current_logged_out: false };
 }
 
 async function getDeleteAccountImpact() {
