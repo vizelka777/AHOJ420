@@ -17,15 +17,19 @@ Environment variable: `AHOJ_ENV=dev|prod` (default `dev`).
 ### prod requirements (startup fails if missing)
 - `OIDC_PRIVKEY_PATH` must exist and contain an RSA private key.
 - `OIDC_CRYPTO_KEY` must be set and length >= 32 bytes.
-- One client config source must be provided:
-  - `OIDC_CLIENTS_JSON`, or
-  - `OIDC_CLIENTS_FILE`
+- OIDC clients DB registry must be initialized (`oidc_clients` is runtime source of truth).
+- For one-time bootstrap when DB is empty:
+  - `OIDC_CLIENTS_BOOTSTRAP=1`
+  - `OIDC_CLIENTS_JSON` or `OIDC_CLIENTS_FILE`
 - `AVATAR_PUBLIC_BASE` must be set (used for OIDC `picture` claim URL).
 
 ### dev behavior
 - If signing key is missing/invalid, an ephemeral RSA key is generated.
 - If `OIDC_CRYPTO_KEY` is missing/short, an ephemeral key is generated.
 - Both are explicitly logged as DEV-only and invalidate tokens/cookies after restart.
+- If OIDC clients DB is empty:
+  - with `OIDC_CLIENTS_JSON` / `OIDC_CLIENTS_FILE`: bootstrap import to DB
+  - without bootstrap source: built-in dev clients are imported to DB
 
 ## OIDC State Persistence (Redis)
 In-memory OIDC state was removed for auth requests/codes.
@@ -43,13 +47,23 @@ Used by storage methods:
 - `DeleteAuthRequest` -> delete `oidc:ar:<id>`
 - `SetAuthRequestDone` -> update persisted auth request (`subject`, `done`, `auth_time`)
 
-## Client Configuration
-Clients are loaded from JSON (env string or file). Shape:
+## Client Registry (PostgreSQL)
+Runtime clients are loaded from DB tables:
+
+- `oidc_clients` (metadata + auth mode + grant/response/scopes + enabled flag)
+- `oidc_client_redirect_uris` (1:N redirect URIs)
+- `oidc_client_secrets` (hashed secrets with revocation metadata)
+
+`OIDC_CLIENTS_JSON` / `OIDC_CLIENTS_FILE` are bootstrap-only import sources for empty DB.
+
+Bootstrap JSON shape:
 
 ```json
 [
   {
     "id": "client2",
+    "name": "Client 2",
+    "enabled": true,
     "redirect_uris": ["https://houbamzdar.cz/callback2.html"],
     "confidential": false,
     "require_pkce": true,
@@ -62,6 +76,8 @@ Clients are loaded from JSON (env string or file). Shape:
 
 Fields:
 - `id` (required)
+- `name` (optional)
+- `enabled` (optional, default `true`)
 - `redirect_uris` (required)
 - `confidential` (required)
 - `secrets` (required only for confidential clients)
@@ -70,6 +86,18 @@ Fields:
 - `grant_types`: e.g. `authorization_code`
 - `response_types`: e.g. `code`
 - `scopes`: e.g. `openid profile email phone` (defaults to these scopes if omitted)
+
+Bootstrap behavior:
+- If DB is non-empty: bootstrap env is ignored (no overwrite).
+- If DB is empty:
+  - `prod`: requires both `OIDC_CLIENTS_BOOTSTRAP=1` and JSON/file source
+  - `dev`: bootstrap source is optional (dev defaults are imported when source is missing)
+
+Secret storage:
+- plaintext secrets are accepted only at bootstrap / secret creation time
+- DB stores only `secret_hash` (bcrypt)
+- confidential clients can have multiple active secrets for rotation
+- revoked secrets (`revoked_at IS NOT NULL`) are rejected by runtime verification
 
 ## Claims in ID Token and /userinfo
 Mapping from `users` table:
@@ -138,7 +166,10 @@ Now:
 - `AHOJ_ENV=prod`.
 - `OIDC_PRIVKEY_PATH` mounted read-only.
 - `OIDC_CRYPTO_KEY` set (32+ bytes).
-- Clients configured via JSON/file; public clients use `auth_method=none` + `require_pkce=true`.
+- OIDC clients present in DB (`oidc_clients` not empty).
+- First bootstrap executed explicitly with `OIDC_CLIENTS_BOOTSTRAP=1` + JSON/file.
+- Bootstrap env removed from steady-state runtime profile after initial import.
+- Public clients use `auth_method=none` + `require_pkce=true`.
 
 ## Bunny BFF client example
 ```json
@@ -156,4 +187,4 @@ Now:
 ]
 ```
 
-Secret for `mushroom-bff` is read from `OIDC_CLIENT_MUSHROOM_BFF_SECRET` when `secrets` is not present in client config.
+Secret for `mushroom-bff` is read from `OIDC_CLIENT_MUSHROOM_BFF_SECRET` during bootstrap when `secrets` is not present in client config.

@@ -25,6 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -69,7 +70,7 @@ func NewProvider(baseURL string, s *store.Store, r *redis.Client) (*Provider, er
 	if prodMode && avatarPublicBase == "" {
 		return nil, errors.New("AVATAR_PUBLIC_BASE must be set in prod")
 	}
-	storage, err := NewMemStorage(r, userStore, prodMode, avatarPublicBase)
+	storage, err := NewMemStorage(r, userStore, s, prodMode, avatarPublicBase)
 	if err != nil {
 		return nil, err
 	}
@@ -307,10 +308,12 @@ func (r *SimpleAuthRequest) GetClientID() string { return r.ClientID }
 
 type clientConfig struct {
 	ID            string   `json:"id"`
+	Name          string   `json:"name,omitempty"`
+	Enabled       *bool    `json:"enabled,omitempty"`
 	RedirectURIs  []string `json:"redirect_uris"`
 	Confidential  bool     `json:"confidential"`
 	Secrets       []string `json:"secrets,omitempty"`
-	RequirePKCE   bool     `json:"require_pkce"`
+	RequirePKCE   *bool    `json:"require_pkce,omitempty"`
 	AuthMethod    string   `json:"auth_method"`
 	GrantTypes    []string `json:"grant_types"`
 	ResponseTypes []string `json:"response_types"`
@@ -318,63 +321,85 @@ type clientConfig struct {
 }
 
 type MemStorage struct {
-	clients    map[string]*StaticClient
-	redis      *redis.Client
-	userStore  *UserStore
-	avatarBase string
-	signingKey *SimpleKey
-	keys       []*SimpleKey
+	clients     map[string]*StaticClient
+	redis       *redis.Client
+	userStore   *UserStore
+	clientStore OIDCClientStore
+	avatarBase  string
+	signingKey  *SimpleKey
+	keys        []*SimpleKey
 }
 
-func NewMemStorage(rdb *redis.Client, us *UserStore, prodMode bool, avatarBase string) (*MemStorage, error) {
-	clients, err := loadClients(prodMode)
+type OIDCClientStore interface {
+	ListOIDCClients() ([]store.OIDCClient, error)
+	ListEnabledOIDCClients() ([]store.OIDCClient, error)
+	ListOIDCClientSecrets(clientID string) ([]store.OIDCClientSecret, error)
+	BootstrapOIDCClients(clients []store.OIDCClientBootstrapInput) (int, error)
+}
+
+type runtimeClientInput struct {
+	ID            string
+	Confidential  bool
+	SecretHashes  []string
+	RedirectURIs  []string
+	RequirePKCE   bool
+	AuthMethod    string
+	GrantTypes    []string
+	ResponseTypes []string
+	Scopes        []string
+}
+
+func NewMemStorage(rdb *redis.Client, us *UserStore, clientStore OIDCClientStore, prodMode bool, avatarBase string) (*MemStorage, error) {
+	clients, err := loadRuntimeClients(clientStore, prodMode)
 	if err != nil {
 		return nil, err
+	}
+	if len(clients) == 0 {
+		return nil, errors.New("no enabled oidc clients found in database")
 	}
 	log.Printf("OIDC clients loaded: %s", strings.Join(sortedClientIDs(clients), ", "))
 
 	return &MemStorage{
-		clients:    clients,
-		redis:      rdb,
-		userStore:  us,
-		avatarBase: strings.TrimSpace(avatarBase),
+		clients:     clients,
+		redis:       rdb,
+		userStore:   us,
+		clientStore: clientStore,
+		avatarBase:  strings.TrimSpace(avatarBase),
 	}, nil
 }
 
-func loadClients(prodMode bool) (map[string]*StaticClient, error) {
-	rawJSON := strings.TrimSpace(os.Getenv("OIDC_CLIENTS_JSON"))
-	filePath := strings.TrimSpace(os.Getenv("OIDC_CLIENTS_FILE"))
+func loadRuntimeClients(clientStore OIDCClientStore, prodMode bool) (map[string]*StaticClient, error) {
+	if clientStore == nil {
+		return nil, errors.New("oidc client store is nil")
+	}
 
-	switch {
-	case rawJSON != "":
-		return parseClients(rawJSON)
-	case filePath != "":
-		b, err := os.ReadFile(filePath)
-		if err != nil {
-			return nil, fmt.Errorf("read OIDC_CLIENTS_FILE: %w", err)
+	allClients, err := clientStore.ListOIDCClients()
+	if err != nil {
+		return nil, fmt.Errorf("list oidc clients: %w", err)
+	}
+
+	if len(allClients) == 0 {
+		if err := bootstrapOIDCClients(clientStore, prodMode); err != nil {
+			return nil, err
 		}
-		return parseClients(string(b))
-	case prodMode:
-		return nil, errors.New("OIDC_CLIENTS_JSON or OIDC_CLIENTS_FILE is required in prod")
-	default:
-		return defaultDevClients(), nil
-	}
-}
-
-func parseClients(raw string) (map[string]*StaticClient, error) {
-	var cfgs []clientConfig
-	if err := json.Unmarshal([]byte(raw), &cfgs); err != nil {
-		return nil, fmt.Errorf("parse OIDC clients: %w", err)
-	}
-	if len(cfgs) == 0 {
-		return nil, errors.New("OIDC client config is empty")
+	} else if hasOIDCClientBootstrapEnv() {
+		log.Printf("OIDC bootstrap env detected but skipped: database already has %d clients", len(allClients))
 	}
 
-	clients := make(map[string]*StaticClient, len(cfgs))
-	for _, cfg := range cfgs {
-		client, err := buildClient(cfg)
+	enabledClients, err := clientStore.ListEnabledOIDCClients()
+	if err != nil {
+		return nil, fmt.Errorf("list enabled oidc clients: %w", err)
+	}
+
+	clients := make(map[string]*StaticClient, len(enabledClients))
+	for _, dbClient := range enabledClients {
+		secrets, err := clientStore.ListOIDCClientSecrets(dbClient.ID)
 		if err != nil {
-			return nil, fmt.Errorf("client %q: %w", cfg.ID, err)
+			return nil, fmt.Errorf("list oidc client secrets for %q: %w", dbClient.ID, err)
+		}
+		client, err := buildClientFromDB(dbClient, secrets)
+		if err != nil {
+			return nil, fmt.Errorf("client %q: %w", dbClient.ID, err)
 		}
 		if _, exists := clients[client.id]; exists {
 			return nil, fmt.Errorf("duplicate client id %q", client.id)
@@ -384,57 +409,188 @@ func parseClients(raw string) (map[string]*StaticClient, error) {
 	return clients, nil
 }
 
-func defaultDevClients() map[string]*StaticClient {
-	clients := []clientConfig{
+func bootstrapOIDCClients(clientStore OIDCClientStore, prodMode bool) error {
+	bootstrapEnabled := isEnvEnabled("OIDC_CLIENTS_BOOTSTRAP")
+	bootstrapClients, source, explicitSource, err := loadBootstrapClients(prodMode)
+	if err != nil {
+		return err
+	}
+
+	if prodMode {
+		if !bootstrapEnabled {
+			return errors.New("oidc clients table is empty in prod: set OIDC_CLIENTS_BOOTSTRAP=1 and provide OIDC_CLIENTS_JSON or OIDC_CLIENTS_FILE")
+		}
+		if !explicitSource {
+			return errors.New("oidc clients table is empty in prod: OIDC_CLIENTS_JSON or OIDC_CLIENTS_FILE bootstrap source is required")
+		}
+	}
+
+	inserted, err := clientStore.BootstrapOIDCClients(bootstrapClients)
+	if err != nil {
+		return fmt.Errorf("bootstrap oidc clients from %s: %w", source, err)
+	}
+	if inserted == 0 {
+		log.Printf("OIDC bootstrap from %s skipped (database already initialized)", source)
+	} else {
+		log.Printf("OIDC bootstrap from %s inserted %d clients", source, inserted)
+	}
+	return nil
+}
+
+func loadBootstrapClients(prodMode bool) ([]store.OIDCClientBootstrapInput, string, bool, error) {
+	rawJSON := strings.TrimSpace(os.Getenv("OIDC_CLIENTS_JSON"))
+	filePath := strings.TrimSpace(os.Getenv("OIDC_CLIENTS_FILE"))
+
+	switch {
+	case rawJSON != "":
+		clients, err := parseBootstrapClients(rawJSON)
+		return clients, "OIDC_CLIENTS_JSON", true, err
+	case filePath != "":
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, "", true, fmt.Errorf("read OIDC_CLIENTS_FILE: %w", err)
+		}
+		clients, parseErr := parseBootstrapClients(string(b))
+		return clients, fmt.Sprintf("OIDC_CLIENTS_FILE(%s)", filePath), true, parseErr
+	case prodMode:
+		return nil, "", false, nil
+	default:
+		return defaultDevBootstrapClients(), "default-dev", false, nil
+	}
+}
+
+func parseBootstrapClients(raw string) ([]store.OIDCClientBootstrapInput, error) {
+	var cfgs []clientConfig
+	if err := json.Unmarshal([]byte(raw), &cfgs); err != nil {
+		return nil, fmt.Errorf("parse oidc clients bootstrap: %w", err)
+	}
+	if len(cfgs) == 0 {
+		return nil, errors.New("oidc client bootstrap config is empty")
+	}
+
+	clients := make([]store.OIDCClientBootstrapInput, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		clientID := strings.TrimSpace(cfg.ID)
+		secrets := make([]store.OIDCClientSecretInput, 0, len(cfg.Secrets))
+		for idx, secret := range cfg.Secrets {
+			trimmed := strings.TrimSpace(secret)
+			if trimmed == "" {
+				continue
+			}
+			label := ""
+			if len(cfg.Secrets) > 1 {
+				label = fmt.Sprintf("bootstrap-%d", idx+1)
+			}
+			secrets = append(secrets, store.OIDCClientSecretInput{
+				PlainSecret: trimmed,
+				Label:       label,
+			})
+		}
+		if cfg.Confidential && len(secrets) == 0 && strings.EqualFold(clientID, "mushroom-bff") {
+			if secret := strings.TrimSpace(os.Getenv("OIDC_CLIENT_MUSHROOM_BFF_SECRET")); secret != "" {
+				secrets = append(secrets, store.OIDCClientSecretInput{
+					PlainSecret: secret,
+					Label:       "env:OIDC_CLIENT_MUSHROOM_BFF_SECRET",
+				})
+			}
+		}
+		enabled := true
+		if cfg.Enabled != nil {
+			enabled = *cfg.Enabled
+		}
+		requirePKCE := true
+		if cfg.RequirePKCE != nil {
+			requirePKCE = *cfg.RequirePKCE
+		}
+		clients = append(clients, store.OIDCClientBootstrapInput{
+			ID:            clientID,
+			Name:          strings.TrimSpace(cfg.Name),
+			Enabled:       enabled,
+			Confidential:  cfg.Confidential,
+			RequirePKCE:   requirePKCE,
+			AuthMethod:    strings.TrimSpace(cfg.AuthMethod),
+			GrantTypes:    append([]string(nil), cfg.GrantTypes...),
+			ResponseTypes: append([]string(nil), cfg.ResponseTypes...),
+			Scopes:        append([]string(nil), cfg.Scopes...),
+			RedirectURIs:  append([]string(nil), cfg.RedirectURIs...),
+			Secrets:       secrets,
+		})
+	}
+	return clients, nil
+}
+
+func defaultDevBootstrapClients() []store.OIDCClientBootstrapInput {
+	return []store.OIDCClientBootstrapInput{
 		{
 			ID:            "test",
+			Name:          "Postman Test",
+			Enabled:       true,
 			Confidential:  true,
-			Secrets:       []string{"secret"},
 			RedirectURIs:  []string{"https://oauth.pstmn.io/v1/callback", "https://jwt.io", "http://localhost:3000/api/auth/callback/custom"},
 			RequirePKCE:   true,
 			AuthMethod:    "basic",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
+			Secrets: []store.OIDCClientSecretInput{
+				{PlainSecret: "secret", Label: "dev-default"},
+			},
 		},
 		{
 			ID:            "postman",
+			Name:          "Postman",
+			Enabled:       true,
 			Confidential:  true,
-			Secrets:       []string{"secret"},
 			RedirectURIs:  []string{"https://oauth.pstmn.io/v1/callback"},
 			RequirePKCE:   true,
 			AuthMethod:    "basic",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
+			Secrets: []store.OIDCClientSecretInput{
+				{PlainSecret: "secret", Label: "dev-default"},
+			},
 		},
 		{
 			ID:            "houbamzdar",
+			Name:          "Houbamzdar",
+			Enabled:       true,
 			Confidential:  false,
 			RedirectURIs:  []string{"https://houbamzdar.cz/callback.html"},
 			RequirePKCE:   true,
 			AuthMethod:    "none",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 		},
 		{
 			ID:            "client1",
+			Name:          "Client 1",
+			Enabled:       true,
 			Confidential:  false,
 			RedirectURIs:  []string{"https://houbamzdar.cz/callback1.html"},
 			RequirePKCE:   true,
 			AuthMethod:    "none",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 		},
 		{
 			ID:            "client2",
+			Name:          "Client 2",
+			Enabled:       true,
 			Confidential:  false,
 			RedirectURIs:  []string{"https://houbamzdar.cz/callback2.html"},
 			RequirePKCE:   true,
 			AuthMethod:    "none",
 			GrantTypes:    []string{"authorization_code"},
 			ResponseTypes: []string{"code"},
+			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone},
 		},
 		{
 			ID:            "mushroom-bff",
+			Name:          "Mushroom BFF",
+			Enabled:       true,
 			Confidential:  true,
 			RequirePKCE:   true,
 			AuthMethod:    "basic",
@@ -442,55 +598,92 @@ func defaultDevClients() map[string]*StaticClient {
 			ResponseTypes: []string{"code"},
 			RedirectURIs:  []string{"https://api.houbamzdar.cz/auth/callback"},
 			Scopes:        []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeOfflineAccess},
+			Secrets: []store.OIDCClientSecretInput{
+				{PlainSecret: "dev-mushroom-bff-secret", Label: "dev-default"},
+			},
 		},
 	}
-
-	out := make(map[string]*StaticClient, len(clients))
-	for _, cfg := range clients {
-		client, _ := buildClient(cfg)
-		out[client.id] = client
-	}
-	return out
 }
 
-func buildClient(cfg clientConfig) (*StaticClient, error) {
-	cfg.ID = strings.TrimSpace(cfg.ID)
-	if cfg.ID == "" {
+func hasOIDCClientBootstrapEnv() bool {
+	return strings.TrimSpace(os.Getenv("OIDC_CLIENTS_JSON")) != "" ||
+		strings.TrimSpace(os.Getenv("OIDC_CLIENTS_FILE")) != "" ||
+		isEnvEnabled("OIDC_CLIENTS_BOOTSTRAP")
+}
+
+func isEnvEnabled(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildClientFromDB(client store.OIDCClient, secrets []store.OIDCClientSecret) (*StaticClient, error) {
+	secretHashes := make([]string, 0, len(secrets))
+	for _, secret := range secrets {
+		if secret.RevokedAt != nil {
+			continue
+		}
+		hash := strings.TrimSpace(secret.SecretHash)
+		if hash == "" {
+			continue
+		}
+		secretHashes = append(secretHashes, hash)
+	}
+
+	return buildRuntimeClient(runtimeClientInput{
+		ID:            client.ID,
+		Confidential:  client.Confidential,
+		SecretHashes:  secretHashes,
+		RedirectURIs:  client.RedirectURIs,
+		RequirePKCE:   client.RequirePKCE,
+		AuthMethod:    client.AuthMethod,
+		GrantTypes:    client.GrantTypes,
+		ResponseTypes: client.ResponseTypes,
+		Scopes:        client.Scopes,
+	})
+}
+
+func buildRuntimeClient(in runtimeClientInput) (*StaticClient, error) {
+	in.ID = strings.TrimSpace(in.ID)
+	if in.ID == "" {
 		return nil, errors.New("id is required")
 	}
-	if len(cfg.RedirectURIs) == 0 {
+	in.RedirectURIs = uniqueTrimmedStrings(in.RedirectURIs)
+	if len(in.RedirectURIs) == 0 {
 		return nil, errors.New("at least one redirect_uri is required")
 	}
 
-	authMethod, err := parseAuthMethod(cfg.AuthMethod)
+	authMethod, err := parseAuthMethod(in.AuthMethod)
 	if err != nil {
 		return nil, err
 	}
-	if !cfg.Confidential {
+	if !in.Confidential {
 		authMethod = oidc.AuthMethodNone
-		cfg.Secrets = nil
+		in.SecretHashes = nil
 	}
-	if cfg.Confidential && len(cfg.Secrets) == 0 && strings.EqualFold(cfg.ID, "mushroom-bff") {
-		if secret := strings.TrimSpace(os.Getenv("OIDC_CLIENT_MUSHROOM_BFF_SECRET")); secret != "" {
-			cfg.Secrets = []string{secret}
-		}
-	}
-	if cfg.Confidential && authMethod == oidc.AuthMethodNone {
+	in.SecretHashes = uniqueTrimmedStrings(in.SecretHashes)
+	if in.Confidential && authMethod == oidc.AuthMethodNone {
 		return nil, errors.New("confidential client cannot use auth_method none")
 	}
-	if cfg.Confidential && len(cfg.Secrets) == 0 {
+	if in.Confidential && len(in.SecretHashes) == 0 {
 		return nil, errors.New("confidential client requires secrets")
 	}
+	if !in.Confidential && len(in.SecretHashes) > 0 {
+		return nil, errors.New("public client must not define secrets")
+	}
 
-	responseTypes, err := parseResponseTypes(cfg.ResponseTypes)
+	responseTypes, err := parseResponseTypes(in.ResponseTypes)
 	if err != nil {
 		return nil, err
 	}
-	grantTypes, err := parseGrantTypes(cfg.GrantTypes)
+	grantTypes, err := parseGrantTypes(in.GrantTypes)
 	if err != nil {
 		return nil, err
 	}
-	allowedScopes := parseAllowedScopes(cfg.Scopes)
+	allowedScopes := parseAllowedScopes(in.Scopes)
 	for _, gt := range grantTypes {
 		if gt == oidc.GrantTypeRefreshToken {
 			allowedScopes[oidc.ScopeOfflineAccess] = struct{}{}
@@ -499,14 +692,14 @@ func buildClient(cfg clientConfig) (*StaticClient, error) {
 	}
 
 	return &StaticClient{
-		id:              cfg.ID,
-		secrets:         cfg.Secrets,
-		redirectURIs:    cfg.RedirectURIs,
+		id:              in.ID,
+		secretHashes:    in.SecretHashes,
+		redirectURIs:    in.RedirectURIs,
 		responseTypes:   responseTypes,
 		grantTypes:      grantTypes,
 		applicationType: op.ApplicationTypeWeb,
 		authMethod:      authMethod,
-		requirePKCE:     cfg.RequirePKCE,
+		requirePKCE:     in.RequirePKCE,
 		allowedScopes:   allowedScopes,
 	}, nil
 }
@@ -579,6 +772,23 @@ func parseGrantTypes(raw []string) ([]oidc.GrantType, error) {
 		}
 	}
 	return res, nil
+}
+
+func uniqueTrimmedStrings(items []string) []string {
+	out := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func sortedClientIDs(clients map[string]*StaticClient) []string {
@@ -1087,12 +1297,27 @@ func (s *MemStorage) AuthorizeClientIDSecret(ctx context.Context, clientID, clie
 	if client.authMethod == oidc.AuthMethodNone {
 		return nil
 	}
-	for _, secret := range client.secrets {
-		if secret == clientSecret {
+	plainSecret := strings.TrimSpace(clientSecret)
+	if plainSecret == "" {
+		return fmt.Errorf("invalid secret")
+	}
+	material := secretMaterialForBcrypt(plainSecret)
+	for _, secretHash := range client.secretHashes {
+		if bcrypt.CompareHashAndPassword([]byte(secretHash), material) == nil {
 			return nil
 		}
 	}
 	return fmt.Errorf("invalid secret")
+}
+
+func secretMaterialForBcrypt(plainSecret string) []byte {
+	trimmed := strings.TrimSpace(plainSecret)
+	if len(trimmed) <= 72 {
+		return []byte(trimmed)
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	encoded := base64.RawURLEncoding.EncodeToString(sum[:])
+	return []byte("sha256:" + encoded)
 }
 
 func (s *MemStorage) SetUserinfoFromScopes(ctx context.Context, userinfo *oidc.UserInfo, userID, clientID string, scopes []string) error {
@@ -1214,7 +1439,7 @@ func (s *MemStorage) KeySet(ctx context.Context) ([]op.Key, error) {
 
 type StaticClient struct {
 	id              string
-	secrets         []string
+	secretHashes    []string
 	redirectURIs    []string
 	responseTypes   []oidc.ResponseType
 	grantTypes      []oidc.GrantType

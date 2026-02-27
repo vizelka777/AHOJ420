@@ -40,6 +40,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique_idx
     ON users (trim(phone))
     WHERE trim(COALESCE(phone, '')) <> '';
 
+CREATE TABLE IF NOT EXISTS oidc_clients (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    confidential BOOLEAN NOT NULL,
+    require_pkce BOOLEAN NOT NULL DEFAULT true,
+    auth_method TEXT NOT NULL,
+    grant_types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    response_types TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    scopes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT oidc_clients_auth_method_check
+        CHECK (auth_method IN ('none', 'basic', 'post')),
+    CONSTRAINT oidc_clients_grant_types_nonempty
+        CHECK (COALESCE(array_length(grant_types, 1), 0) > 0),
+    CONSTRAINT oidc_clients_response_types_nonempty
+        CHECK (COALESCE(array_length(response_types, 1), 0) > 0),
+    CONSTRAINT oidc_clients_scopes_nonempty
+        CHECK (COALESCE(array_length(scopes, 1), 0) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS oidc_client_redirect_uris (
+    client_id TEXT NOT NULL REFERENCES oidc_clients(id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (client_id, redirect_uri)
+);
+
+CREATE TABLE IF NOT EXISTS oidc_client_secrets (
+    id BIGSERIAL PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES oidc_clients(id) ON DELETE CASCADE,
+    secret_hash TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS oidc_client_secrets_client_idx
+    ON oidc_client_secrets (client_id);
+
+CREATE INDEX IF NOT EXISTS oidc_client_secrets_active_idx
+    ON oidc_client_secrets (client_id)
+    WHERE revoked_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS user_oidc_clients (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_id TEXT NOT NULL,
