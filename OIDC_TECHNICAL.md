@@ -10,6 +10,7 @@
 - JWKS (compat alias): `/jwks`
 - UserInfo: `/userinfo`
 - SSO logout: `/logout` (and `/end_session`)
+- Admin API (internal): `/admin/api/oidc/clients`
 
 ## Runtime Modes
 Environment variable: `AHOJ_ENV=dev|prod` (default `dev`).
@@ -188,3 +189,35 @@ Now:
 ```
 
 Secret for `mushroom-bff` is read from `OIDC_CLIENT_MUSHROOM_BFF_SECRET` during bootstrap when `secrets` is not present in client config.
+
+## Admin API (MVP, Internal)
+This API is intended only for owner/internal admin usage.
+
+Authentication:
+- shared bearer token from env: `ADMIN_API_TOKEN`
+- requests must include `Authorization: Bearer <token>`
+- if `ADMIN_API_TOKEN` is not set, admin API middleware returns `503` for all admin routes
+
+Routes:
+- `GET /admin/api/oidc/clients`
+- `GET /admin/api/oidc/clients/:id`
+- `POST /admin/api/oidc/clients`
+- `PUT /admin/api/oidc/clients/:id`
+- `PUT /admin/api/oidc/clients/:id/redirect-uris`
+- `POST /admin/api/oidc/clients/:id/secrets`
+- `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
+
+Behavior notes:
+- API returns only safe secret metadata (`id`, `label`, `created_at`, `revoked_at`, `status`)
+- plaintext/hash of existing secrets are never returned
+- add-secret endpoint supports generated secret mode (`generate=true`) and returns one-time `plain_secret` only in that creation response
+- for MVP, changing `confidential` flag via update endpoint is blocked (`409`) to avoid unsafe transitions
+
+Audit logging:
+- mutating routes write log events:
+  - `admin.oidc_client.create`
+  - `admin.oidc_client.update`
+  - `admin.oidc_client.redirect_uris.replace`
+  - `admin.oidc_client.secret.add`
+  - `admin.oidc_client.secret.revoke`
+- each log includes action, client id, optional secret id, source IP (`RealIP`), and success/failure.

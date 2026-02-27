@@ -10,8 +10,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
+	"github.com/houbamydar/AHOJ420/internal/admin"
 	"github.com/houbamydar/AHOJ420/internal/auth"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
@@ -54,6 +56,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to init auth: %v", err)
 	}
+	adminToken := strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN"))
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -129,6 +132,11 @@ func main() {
 	e.GET("/auth/qr/generate", authService.GenerateQRLogin, sensitiveLimiter)
 	e.POST("/auth/qr/approve", authService.ApproveQRLogin, sensitiveLimiter)
 	e.GET("/auth/qr/status", authService.QRLoginStatus, sensitiveLimiter)
+
+	adminHandler := admin.NewOIDCClientHandler(userStore)
+	adminGroup := e.Group("/admin/api")
+	adminGroup.Use(admin.AdminAPIMiddleware(adminToken))
+	admin.RegisterOIDCClientRoutes(adminGroup, adminHandler)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))
 	e.Any("/keys", oidcHandler)

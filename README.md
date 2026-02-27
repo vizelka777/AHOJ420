@@ -28,6 +28,25 @@ sudo docker-compose up -d --build
 sudo docker-compose logs -f --tail=200
 ```
 
+## Safe Server Deploy
+For this repository, use the deploy helper to avoid legacy compose issues and accidental `.env` overwrite:
+
+```bash
+./scripts/deploy_server.sh
+```
+
+What it does:
+- syncs project to `sss@46.36.37.243:/home/sss/AHOJ420`
+- excludes `.env` / `.env.*` from sync
+- runs `./scripts/remote_deploy.sh` on server
+- prefers `docker compose` (v2), falls back to `docker-compose` only if needed
+- updates `backend` by default, without restarting `postgres/redis`
+- waits until `https://ahoj420.eu/robots.txt` is healthy before finishing
+
+Optional flags:
+- `DEPLOY_CADDY=1 ./scripts/deploy_server.sh` to refresh caddy too
+- `BUILD_BACKEND=0 ./scripts/deploy_server.sh` to skip backend image rebuild
+
 ## Environment
 Core variables:
 - `POSTGRES_URL=postgres://ahoj:password@postgres:5432/ahoj420?sslmode=disable`
@@ -54,6 +73,10 @@ Optional for key rotation:
 - `OIDC_PREV_PRIVKEY_PATH=/run/secrets/oidc_private_key_prev.pem`
 - `OIDC_PREV_KEY_ID=key-prev`
 - `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (bootstrap compatibility fallback for `mushroom-bff` when JSON has no `secrets`)
+
+Admin API:
+- `ADMIN_API_TOKEN=<long-random-shared-secret>`
+- if unset, `/admin/api/*` returns `503` ("admin api disabled")
 
 Avatar storage:
 - `AVATAR_PUBLIC_BASE=https://avatar.ahoj420.eu/` (required in `prod` to emit `picture` claim)
@@ -202,3 +225,28 @@ By requested scopes:
 - `https://avatar.ahoj420.eu/avatars/<user_id>.webp?v=<avatar_updated_at_unix>`
 
 The `?v=` value is added to force cache refresh after avatar updates.
+
+## Admin OIDC Clients API (MVP)
+Internal-only API for owner/admin usage. Not a public self-service API.
+
+Base path:
+- `/admin/api/oidc/clients`
+
+Auth:
+- `Authorization: Bearer <ADMIN_API_TOKEN>`
+
+Routes:
+- `GET /admin/api/oidc/clients`
+- `GET /admin/api/oidc/clients/:id`
+- `POST /admin/api/oidc/clients`
+- `PUT /admin/api/oidc/clients/:id`
+- `PUT /admin/api/oidc/clients/:id/redirect-uris`
+- `POST /admin/api/oidc/clients/:id/secrets`
+- `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
+
+Security behavior:
+- secret hashes and plaintext secrets are never returned from list/detail endpoints
+- `plain_secret` is returned only one-time in `POST .../secrets` when `generate=true`
+- create endpoint expects explicit `initial_secret` for confidential clients and does not echo it back
+
+Minimal audit logging is emitted on mutating endpoints with action/client/secret/ip/success fields.
