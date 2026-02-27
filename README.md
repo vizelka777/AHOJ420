@@ -42,15 +42,18 @@ OIDC mode:
 Required in `prod`:
 - `OIDC_PRIVKEY_PATH=/run/secrets/oidc_private_key.pem` (no ephemeral fallback in prod)
 - `OIDC_CRYPTO_KEY=<at least 32 bytes>` (no insecure default in prod)
-- one of:
-  - `OIDC_CLIENTS_JSON='[...]'`
-  - `OIDC_CLIENTS_FILE=/run/secrets/oidc_clients.json`
+- OIDC clients registry in PostgreSQL must be initialized (table `oidc_clients` is source of truth)
+- for one-time bootstrap into empty DB:
+  - `OIDC_CLIENTS_BOOTSTRAP=1`
+  - one of:
+    - `OIDC_CLIENTS_JSON='[...]'`
+    - `OIDC_CLIENTS_FILE=/run/secrets/oidc_clients.json`
 
 Optional for key rotation:
 - `OIDC_KEY_ID=key-current`
 - `OIDC_PREV_PRIVKEY_PATH=/run/secrets/oidc_private_key_prev.pem`
 - `OIDC_PREV_KEY_ID=key-prev`
-- `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (used when `mushroom-bff` client has no explicit `secrets` in JSON)
+- `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (bootstrap compatibility fallback for `mushroom-bff` when JSON has no `secrets`)
 
 Avatar storage:
 - `AVATAR_PUBLIC_BASE=https://avatar.ahoj420.eu/` (required in `prod` to emit `picture` claim)
@@ -59,6 +62,14 @@ Avatar storage:
 - `BUNNY_STORAGE_ACCESS_KEY=<bunny-storage-access-key>`
 
 If `AHOJ_ENV=dev` and key/crypto key are missing, ephemeral values are generated and tokens/cookies become invalid after restart.
+
+OIDC client source behavior:
+- runtime source of truth is PostgreSQL (`oidc_clients`, `oidc_client_redirect_uris`, `oidc_client_secrets`)
+- JSON/file is bootstrap/import only (not runtime source)
+- if DB is empty:
+  - `prod`: requires `OIDC_CLIENTS_BOOTSTRAP=1` + JSON/file source
+  - `dev`: auto-seeds DB from JSON/file when provided, otherwise from built-in dev defaults
+- if DB is non-empty, bootstrap env vars are ignored (no silent overwrite)
 
 ## Caddy
 Example (current):
@@ -132,14 +143,26 @@ For backward compatibility we keep the physical DB column name `email` for now. 
 - For production, disable backend port 8080 and keep only Caddy (80/443).
 - Public OIDC clients must use PKCE (`S256`) and no client secret.
 
-## OIDC Clients Config
-Clients are loaded from `OIDC_CLIENTS_JSON` or `OIDC_CLIENTS_FILE` (JSON array).
+## OIDC Clients Bootstrap
+OIDC clients are stored in PostgreSQL and loaded from DB at runtime.
+
+`OIDC_CLIENTS_JSON` / `OIDC_CLIENTS_FILE` are used only for one-time bootstrap into an empty DB.
+
+Recommended first bootstrap:
+1. Set `OIDC_CLIENTS_BOOTSTRAP=1`.
+2. Provide `OIDC_CLIENTS_JSON` or `OIDC_CLIENTS_FILE`.
+3. Start backend once, verify clients were imported.
+4. Remove bootstrap env (`OIDC_CLIENTS_BOOTSTRAP`, `OIDC_CLIENTS_JSON`, `OIDC_CLIENTS_FILE`) from runtime profile.
+
+JSON shape for bootstrap:
 
 Example public client (`client2`) with PKCE:
 ```json
 [
   {
     "id": "client2",
+    "name": "Client 2",
+    "enabled": true,
     "redirect_uris": ["https://houbamzdar.cz/callback2.html"],
     "confidential": false,
     "require_pkce": true,
@@ -155,6 +178,8 @@ Example confidential client:
 [
   {
     "id": "mushroom-bff",
+    "name": "Mushroom BFF",
+    "enabled": true,
     "redirect_uris": ["https://api.houbamzdar.cz/auth/callback"],
     "confidential": true,
     "secrets": ["use OIDC_CLIENT_MUSHROOM_BFF_SECRET in prod"],

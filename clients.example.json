@@ -1,6 +1,8 @@
 [
   {
     "id": "client2",
+    "name": "Client 2",
+    "enabled": true,
     "redirect_uris": ["https://houbamzdar.cz/callback2.html"],
     "confidential": false,
     "require_pkce": true,
@@ -11,8 +13,11 @@
   },
   {
     "id": "mushroom-bff",
+    "name": "Mushroom BFF",
+    "enabled": true,
     "redirect_uris": ["https://api.houbamzdar.cz/auth/callback"],
     "confidential": true,
+    "secrets": ["replace-with-real-bootstrap-secret"],
     "require_pkce": true,
     "auth_method": "basic",
     "grant_types": ["authorization_code", "refresh_token"],

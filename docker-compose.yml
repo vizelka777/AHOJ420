@@ -67,7 +67,8 @@ services:
       - GOSMS_CLIENT_ID=${GOSMS_CLIENT_ID}
       - GOSMS_CLIENT_SECRET=${GOSMS_CLIENT_SECRET}
       - GOSMS_CHANNEL_ID=${GOSMS_CHANNEL_ID}
-      # choose one source for clients:
+      # OIDC client bootstrap/import only (runtime source is PostgreSQL):
+      - OIDC_CLIENTS_BOOTSTRAP=${OIDC_CLIENTS_BOOTSTRAP:-0}
       - OIDC_CLIENTS_FILE=${OIDC_CLIENTS_FILE:-/run/secrets/oidc_clients.json}
       # - OIDC_CLIENTS_JSON=[{"id":"client2","redirect_uris":["https://houbamzdar.cz/callback2.html"],"confidential":false,"require_pkce":true,"auth_method":"none","grant_types":["authorization_code"],"response_types":["code"]}]
     volumes:
