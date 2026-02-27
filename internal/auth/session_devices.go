@@ -17,19 +17,20 @@ import (
 )
 
 const (
-	deviceSessionMetaPrefix = "sessmeta:"
-	deviceSessionListPrefix = "sesslist:"
+	deviceSessionMetaPrefix   = "sessmeta:"
+	deviceSessionListPrefix   = "sesslist:"
+	deviceSessionAllPrefix    = "sessall:"
 	deviceSessionDevicePrefix = "sessdev:"
-	deviceSessionHistoryTTL = 90 * 24 * time.Hour
-	deviceSessionListLimit  = 50
-	deviceCookieName        = "device_id"
-	deviceCookieMaxAgeSec   = 365 * 24 * 60 * 60
+	deviceSessionHistoryTTL   = 90 * 24 * time.Hour
+	deviceSessionListLimit    = 50
+	deviceCookieName          = "device_id"
+	deviceCookieMaxAgeSec     = 365 * 24 * 60 * 60
 )
 
 var (
-	errDeviceNotFound             = errors.New("device not found")
-	errCannotDeleteLastDevice     = errors.New("cannot delete last device")
-	errDeviceSessionAccessDenied  = errors.New("forbidden")
+	errDeviceNotFound            = errors.New("device not found")
+	errCannotDeleteLastDevice    = errors.New("cannot delete last device")
+	errDeviceSessionAccessDenied = errors.New("forbidden")
 )
 
 type deviceSessionMeta struct {
@@ -68,6 +69,10 @@ func deviceSessionMetaKey(sessionID string) string {
 
 func deviceSessionListKey(userID string) string {
 	return deviceSessionListPrefix + userID
+}
+
+func deviceSessionAllKey(userID string) string {
+	return deviceSessionAllPrefix + userID
 }
 
 func deviceSessionDeviceKey(userID, deviceID string) string {
@@ -126,6 +131,164 @@ func credentialIDMatches(rawMeta string, target []byte) bool {
 	return bytes.Equal(decoded, target)
 }
 
+func decodeSessionMeta(payload []byte) (*deviceSessionMeta, error) {
+	var meta deviceSessionMeta
+	if err := json.Unmarshal(payload, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func (s *Service) deleteDeviceMappingIfMatches(ctx context.Context, userID, deviceID, sessionID string) error {
+	userID = strings.TrimSpace(userID)
+	deviceID = strings.TrimSpace(deviceID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" || deviceID == "" || sessionID == "" {
+		return nil
+	}
+
+	mapKey := deviceSessionDeviceKey(userID, deviceID)
+	for attempts := 0; attempts < 5; attempts++ {
+		err := s.redis.Watch(ctx, func(tx *redis.Tx) error {
+			mappedSessionID, err := tx.Get(ctx, mapKey).Result()
+			if errors.Is(err, redis.Nil) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(mappedSessionID) != sessionID {
+				return nil
+			}
+			_, txErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Del(ctx, mapKey)
+				return nil
+			})
+			return txErr
+		}, mapKey)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		return err
+	}
+	return redis.TxFailedErr
+}
+
+func enqueueSessionCleanupArtifacts(ctx context.Context, pipe redis.Pipeliner, userID, sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	pipe.Del(ctx, "sess:"+sessionID)
+	pipe.Del(ctx, "recovery:"+sessionID)
+	pipe.Del(ctx, deviceSessionMetaKey(sessionID))
+
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	pipe.ZRem(ctx, deviceSessionListKey(userID), sessionID)
+	pipe.ZRem(ctx, deviceSessionAllKey(userID), sessionID)
+}
+
+func (s *Service) cleanupSessionArtifacts(ctx context.Context, userID, sessionID string, meta *deviceSessionMeta) error {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+
+	deviceID := ""
+	if meta != nil {
+		if userID == "" {
+			userID = strings.TrimSpace(meta.UserID)
+		}
+		deviceID = strings.TrimSpace(meta.DeviceID)
+	}
+	if userID == "" || deviceID == "" {
+		payload, err := s.redis.Get(ctx, deviceSessionMetaKey(sessionID)).Bytes()
+		if err == nil {
+			if loadedMeta, decodeErr := decodeSessionMeta(payload); decodeErr == nil {
+				if userID == "" {
+					userID = strings.TrimSpace(loadedMeta.UserID)
+				}
+				if deviceID == "" {
+					deviceID = strings.TrimSpace(loadedMeta.DeviceID)
+				}
+			}
+		} else if !errors.Is(err, redis.Nil) {
+			return err
+		}
+	}
+
+	pipe := s.redis.TxPipeline()
+	enqueueSessionCleanupArtifacts(ctx, pipe, userID, sessionID)
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+
+	return s.deleteDeviceMappingIfMatches(ctx, userID, deviceID, sessionID)
+}
+
+func (s *Service) listOwnedSessionIDs(ctx context.Context, userID string) ([]string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, nil
+	}
+
+	out := make([]string, 0, 16)
+	var cursor uint64
+	for {
+		keys, nextCursor, err := s.redis.Scan(ctx, cursor, "sess:*", 128).Result()
+		if err != nil {
+			return nil, err
+		}
+		cursor = nextCursor
+		if len(keys) == 0 {
+			if cursor == 0 {
+				break
+			}
+			continue
+		}
+
+		pipe := s.redis.Pipeline()
+		ownerCmd := make(map[string]*redis.StringCmd, len(keys))
+		for _, key := range keys {
+			ownerCmd[key] = pipe.Get(ctx, key)
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+
+		for _, key := range keys {
+			owner, ownerErr := ownerCmd[key].Result()
+			if errors.Is(ownerErr, redis.Nil) {
+				continue
+			}
+			if ownerErr != nil {
+				return nil, ownerErr
+			}
+			if strings.TrimSpace(owner) != userID {
+				continue
+			}
+			sessionID := strings.TrimSpace(strings.TrimPrefix(key, "sess:"))
+			if sessionID == "" {
+				continue
+			}
+			out = append(out, sessionID)
+		}
+
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return out, nil
+}
+
 func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string, credentialID []byte, currentSessionID string) (bool, error) {
 	userID = strings.TrimSpace(userID)
 	currentSessionID = strings.TrimSpace(currentSessionID)
@@ -133,13 +296,59 @@ func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string
 		return false, nil
 	}
 
-	listKey := deviceSessionListKey(userID)
-	sessionIDs, err := s.redis.ZRange(ctx, listKey, 0, -1).Result()
+	allKey := deviceSessionAllKey(userID)
+	sessionIDs, err := s.redis.ZRange(ctx, allKey, 0, -1).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return false, err
 	}
+	backfillIDs := make([]string, 0, 8)
+
+	// Legacy fallback: visible list might still have entries that were never backfilled to full index.
+	listSessionIDs, listErr := s.redis.ZRange(ctx, deviceSessionListKey(userID), 0, -1).Result()
+	if listErr != nil && !errors.Is(listErr, redis.Nil) {
+		return false, listErr
+	}
+	sessionSeen := make(map[string]struct{}, len(sessionIDs)+len(listSessionIDs))
+	for _, sessionID := range sessionIDs {
+		sessionSeen[sessionID] = struct{}{}
+	}
+	for _, sessionID := range listSessionIDs {
+		if _, exists := sessionSeen[sessionID]; exists {
+			continue
+		}
+		sessionIDs = append(sessionIDs, sessionID)
+		sessionSeen[sessionID] = struct{}{}
+		backfillIDs = append(backfillIDs, sessionID)
+	}
+
+	legacySessionIDs, legacyErr := s.listOwnedSessionIDs(ctx, userID)
+	if legacyErr != nil {
+		return false, legacyErr
+	}
+	for _, sessionID := range legacySessionIDs {
+		if _, exists := sessionSeen[sessionID]; exists {
+			continue
+		}
+		sessionIDs = append(sessionIDs, sessionID)
+		sessionSeen[sessionID] = struct{}{}
+		backfillIDs = append(backfillIDs, sessionID)
+	}
 	if len(sessionIDs) == 0 {
 		return false, nil
+	}
+	if len(backfillIDs) > 0 {
+		nowScore := float64(time.Now().UTC().Unix())
+		backfillPipe := s.redis.TxPipeline()
+		for _, sessionID := range backfillIDs {
+			backfillPipe.ZAdd(ctx, allKey, redis.Z{
+				Score:  nowScore,
+				Member: sessionID,
+			})
+		}
+		backfillPipe.Expire(ctx, allKey, deviceSessionHistoryTTL)
+		if _, err := backfillPipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return false, err
+		}
 	}
 
 	pipe := s.redis.Pipeline()
@@ -153,50 +362,38 @@ func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string
 	}
 
 	removedCurrent := false
-	type cleanupTarget struct {
-		sessionID string
-		deviceID  string
-	}
-	targets := make([]cleanupTarget, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
 		rawMeta, metaErr := metaCmd[sessionID].Bytes()
-		if metaErr != nil {
+		var meta *deviceSessionMeta
+		staleEntry := false
+
+		switch {
+		case metaErr == nil:
+			decodedMeta, decodeErr := decodeSessionMeta(rawMeta)
+			if decodeErr != nil {
+				staleEntry = true
+				break
+			}
+			if strings.TrimSpace(decodedMeta.UserID) != userID {
+				staleEntry = true
+				break
+			}
+			meta = decodedMeta
+		case errors.Is(metaErr, redis.Nil):
+			staleEntry = true
+		default:
+			return false, metaErr
+		}
+
+		if !staleEntry && (meta == nil || !credentialIDMatches(meta.CredentialID, credentialID)) {
 			continue
 		}
-		var meta deviceSessionMeta
-		if json.Unmarshal(rawMeta, &meta) != nil {
-			continue
+		if cleanupErr := s.cleanupSessionArtifacts(ctx, userID, sessionID, meta); cleanupErr != nil {
+			return false, cleanupErr
 		}
-		if strings.TrimSpace(meta.UserID) != userID {
-			continue
-		}
-		if !credentialIDMatches(meta.CredentialID, credentialID) {
-			continue
-		}
-		targets = append(targets, cleanupTarget{
-			sessionID: sessionID,
-			deviceID:  strings.TrimSpace(meta.DeviceID),
-		})
 		if sessionID == currentSessionID {
 			removedCurrent = true
 		}
-	}
-	if len(targets) == 0 {
-		return false, nil
-	}
-
-	cleanPipe := s.redis.TxPipeline()
-	for _, t := range targets {
-		cleanPipe.Del(ctx, "sess:"+t.sessionID)
-		cleanPipe.Del(ctx, "recovery:"+t.sessionID)
-		cleanPipe.Del(ctx, deviceSessionMetaKey(t.sessionID))
-		cleanPipe.ZRem(ctx, listKey, t.sessionID)
-		if t.deviceID != "" {
-			cleanPipe.Del(ctx, deviceSessionDeviceKey(userID, t.deviceID))
-		}
-	}
-	if _, err := cleanPipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return false, err
 	}
 
 	return removedCurrent, nil
@@ -306,14 +503,27 @@ func (s *Service) touchDeviceSession(c echo.Context, sessionID, userID, credenti
 	if credentialID != "" {
 		meta.CredentialID = credentialID
 	}
-	if meta.CreatedAtUTC <= 0 && prevSessionID != "" {
+	var prevMeta *deviceSessionMeta
+	if prevSessionID != "" {
 		if prevPayload, prevErr := s.redis.Get(ctx, deviceSessionMetaKey(prevSessionID)).Bytes(); prevErr == nil {
-			var prevMeta deviceSessionMeta
-			if json.Unmarshal(prevPayload, &prevMeta) == nil && prevMeta.CreatedAtUTC > 0 {
-				meta.CreatedAtUTC = prevMeta.CreatedAtUTC
+			decodedPrevMeta, decodeErr := decodeSessionMeta(prevPayload)
+			if decodeErr == nil {
+				prevMeta = decodedPrevMeta
+				if meta.CreatedAtUTC <= 0 && decodedPrevMeta.CreatedAtUTC > 0 {
+					meta.CreatedAtUTC = decodedPrevMeta.CreatedAtUTC
+				}
 			}
 		} else if !errors.Is(prevErr, redis.Nil) {
 			return prevErr
+		}
+		if prevMeta == nil {
+			prevMeta = &deviceSessionMeta{
+				UserID:   userID,
+				DeviceID: deviceID,
+			}
+		}
+		if cleanupErr := s.cleanupSessionArtifacts(ctx, userID, prevSessionID, prevMeta); cleanupErr != nil {
+			return cleanupErr
 		}
 	}
 	userAgent := strings.TrimSpace(c.Request().UserAgent())
@@ -333,17 +543,19 @@ func (s *Service) touchDeviceSession(c echo.Context, sessionID, userID, credenti
 	}
 
 	listKey := deviceSessionListKey(userID)
+	allKey := deviceSessionAllKey(userID)
 	pipe := s.redis.TxPipeline()
-	if prevSessionID != "" {
-		pipe.Del(ctx, deviceSessionMetaKey(prevSessionID))
-		pipe.ZRem(ctx, listKey, prevSessionID)
-	}
 	pipe.Set(ctx, deviceSessionMetaKey(sessionID), payload, deviceSessionHistoryTTL)
 	pipe.ZAdd(ctx, listKey, redis.Z{
 		Score:  float64(now),
 		Member: sessionID,
 	})
 	pipe.Expire(ctx, listKey, deviceSessionHistoryTTL)
+	pipe.ZAdd(ctx, allKey, redis.Z{
+		Score:  float64(now),
+		Member: sessionID,
+	})
+	pipe.Expire(ctx, allKey, deviceSessionHistoryTTL)
 	pipe.Set(ctx, deviceMapKey, sessionID, deviceSessionHistoryTTL)
 	_, err = pipe.Exec(ctx)
 	if err != nil && !errors.Is(err, redis.Nil) {
@@ -422,12 +634,9 @@ func (s *Service) ListDeviceSessions(c echo.Context) error {
 		})
 	}
 	if len(staleSessionIDs) > 0 {
-		cleanPipe := s.redis.Pipeline()
 		for _, staleSessionID := range staleSessionIDs {
-			cleanPipe.ZRem(ctx, listKey, staleSessionID)
-			cleanPipe.Del(ctx, deviceSessionMetaKey(staleSessionID))
+			_ = s.cleanupSessionArtifacts(ctx, userID, staleSessionID, nil)
 		}
-		_, _ = cleanPipe.Exec(ctx)
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{"devices": devices})
@@ -467,11 +676,12 @@ func (s *Service) LogoutDeviceSession(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
+	var targetMeta *deviceSessionMeta
 	metaPayload, err := s.redis.Get(ctx, deviceSessionMetaKey(sessionID)).Bytes()
 	if err == nil {
-		var meta deviceSessionMeta
-		if json.Unmarshal(metaPayload, &meta) == nil {
-			if strings.TrimSpace(meta.UserID) != "" && strings.TrimSpace(meta.UserID) != userID {
+		if decodedMeta, decodeErr := decodeSessionMeta(metaPayload); decodeErr == nil {
+			targetMeta = decodedMeta
+			if strings.TrimSpace(decodedMeta.UserID) != "" && strings.TrimSpace(decodedMeta.UserID) != userID {
 				return c.String(http.StatusForbidden, "forbidden")
 			}
 		}
@@ -485,10 +695,7 @@ func (s *Service) LogoutDeviceSession(c echo.Context) error {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
-	pipe := s.redis.TxPipeline()
-	pipe.Del(ctx, "sess:"+sessionID)
-	pipe.Del(ctx, "recovery:"+sessionID)
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	if err := s.cleanupSessionArtifacts(ctx, userID, sessionID, targetMeta); err != nil {
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
@@ -574,13 +781,7 @@ func (s *Service) RemoveDeviceSession(c echo.Context) error {
 			}
 
 			_, txErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Del(ctx, "sess:"+sessionID)
-				pipe.Del(ctx, "recovery:"+sessionID)
-				pipe.Del(ctx, deviceSessionMetaKey(sessionID))
-				pipe.ZRem(ctx, listKey, sessionID)
-				if targetDeviceID != "" {
-					pipe.Del(ctx, deviceSessionDeviceKey(userID, targetDeviceID))
-				}
+				enqueueSessionCleanupArtifacts(ctx, pipe, userID, sessionID)
 				return nil
 			})
 			if txErr != nil && !errors.Is(txErr, redis.Nil) {
@@ -610,6 +811,9 @@ func (s *Service) RemoveDeviceSession(c echo.Context) error {
 	}
 	if errors.Is(err, redis.TxFailedErr) {
 		return c.String(http.StatusConflict, "Try again")
+	}
+	if mapErr := s.deleteDeviceMappingIfMatches(ctx, userID, targetDeviceID, sessionID); mapErr != nil {
+		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
 	if removedCurrent {
