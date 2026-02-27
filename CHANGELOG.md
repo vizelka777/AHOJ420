@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-02-27
+
+### Security
+- Removed legacy `?email=` handling from passkey registration start (`GET /auth/register/begin`).
+- Registration begin now ignores external login identifiers and uses only:
+  - active session user (add-passkey flow), or
+  - anonymous user creation (primary passkey registration).
+
 ## 2026-02-26
 
 ### Security

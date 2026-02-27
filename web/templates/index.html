@@ -383,7 +383,6 @@
 
         async function handleRegister(e) {
             e.preventDefault();
-            const email = "";
             showMessage("Requesting creation...", "text-yellow-400");
             if (conditionalAbort) {
                 conditionalAbort.abort();
@@ -392,7 +391,7 @@
             }
 
             try {
-                const res = await registerUser(email);
+                const res = await registerUser();
                 if (recoveryModeActive) {
                     showMessage("Новый passkey создан. Режим восстановления завершен.", "text-green-400");
                     recoveryModeActive = false;
@@ -1001,7 +1000,7 @@
             addDeviceFlowStarted = true;
             showMessage("Подтвердите создание passkey для этого устройства...", "text-cyan-300");
             try {
-                const payload = await registerUser("");
+                const payload = await registerUser();
                 applySessionState(true, payload.display_name || payload.email || "User");
                 await loadProfileForAccountUI();
                 await loadDevicesForAccountUI();

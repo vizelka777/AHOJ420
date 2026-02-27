@@ -214,20 +214,25 @@ func (s *Service) clearRecoveryMode(c echo.Context, sessionID string) {
 	_ = s.redis.Del(c.Request().Context(), "recovery:"+sessionID).Err()
 }
 
+func selectRegistrationUser(
+	sessionUserID string,
+	hasSession bool,
+	getUser func(string) (*store.User, error),
+	createAnonymous func() (*store.User, error),
+) (*store.User, error) {
+	if hasSession {
+		return getUser(strings.TrimSpace(sessionUserID))
+	}
+	return createAnonymous()
+}
+
 func (s *Service) BeginRegistration(c echo.Context) error {
 	var user *store.User
 	var err error
 	recoveryMode, _ := s.isRecoveryMode(c)
 
-	// `email` query param is kept for backward compatibility, but it acts as login ID.
-	loginID := strings.TrimSpace(c.QueryParam("email"))
-	if loginID != "" {
-		user, err = s.store.CreateUser(loginID)
-	} else if userID, ok := s.SessionUserID(c); ok {
-		user, err = s.store.GetUser(userID)
-	} else {
-		user, err = s.store.CreateAnonymousUser()
-	}
+	sessionUserID, hasSession := s.SessionUserID(c)
+	user, err = selectRegistrationUser(sessionUserID, hasSession, s.store.GetUser, s.store.CreateAnonymousUser)
 
 	if err != nil || user == nil {
 		return c.String(http.StatusBadRequest, "Registration session invalid")

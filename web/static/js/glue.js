@@ -23,10 +23,9 @@ function base64URLToBuffer(base64URL) {
     return buffer;
 }
 
-async function registerUser(email) {
+async function registerUser() {
     // 1. Get Challenge from Backend
-    const beginURL = email ? `/auth/register/begin?email=${encodeURIComponent(email)}` : `/auth/register/begin`;
-    const beginRes = await fetch(beginURL);
+    const beginRes = await fetch('/auth/register/begin');
     if (!beginRes.ok) throw new Error("Failed to start registration: " + await beginRes.text());
 
     const options = await beginRes.json();
