@@ -31,6 +31,8 @@ const (
 	flashCookieName       = "admin_ui_flash"
 	auditLogPageSize      = 25
 	usersPageSize         = 25
+	userTimelinePageSize  = 20
+	userTimelineMaxSize   = 100
 	defaultInviteTTLHours = 24
 	dashboardRecentAudit  = 20
 	dashboardRecentFailed = 10
@@ -440,12 +442,44 @@ type userClientView struct {
 	LastSeenAt  time.Time
 }
 
+type userSecurityEvent struct {
+	Time        time.Time
+	Type        string
+	Category    string
+	Success     *bool
+	ActorType   string
+	ActorID     string
+	Description string
+	ResourceID  string
+	Details     map[string]any
+}
+
+type userSecurityEventView struct {
+	Time     time.Time
+	Type     string
+	Category string
+	Label    string
+	Status   string
+	Actor    string
+	Details  string
+}
+
+type userTimelineFilterLink struct {
+	Value  string
+	Label  string
+	URL    string
+	Active bool
+}
+
 type userDetailPageData struct {
 	layoutData
 	User          *store.AdminUserProfile
 	Passkeys      []userPasskeyView
 	Sessions      []userSessionView
 	LinkedClients []userClientView
+	Events        []userSecurityEventView
+	EventsFilter  string
+	EventFilters  []userTimelineFilterLink
 	Error         string
 }
 
@@ -775,10 +809,14 @@ func (h *Handler) UsersList(c echo.Context) error {
 func (h *Handler) UserDetail(c echo.Context) error {
 	adminUser := h.currentAdmin(c)
 	userID := strings.TrimSpace(c.Param("id"))
+	eventsFilter := parseUserEventsFilter(c.QueryParam("events"))
+	eventFilters := buildUserTimelineFilterLinks(userID, eventsFilter)
 	if userID == "" {
 		return h.render(c, http.StatusBadRequest, "user_detail.html", userDetailPageData{
-			layoutData: h.newLayoutData(c, adminUser, "User"),
-			Error:      "User ID is required",
+			layoutData:   h.newLayoutData(c, adminUser, "User"),
+			EventsFilter: eventsFilter,
+			EventFilters: eventFilters,
+			Error:        "User ID is required",
 		})
 	}
 
@@ -791,38 +829,60 @@ func (h *Handler) UserDetail(c echo.Context) error {
 			message = "User not found"
 		}
 		return h.render(c, status, "user_detail.html", userDetailPageData{
-			layoutData: h.newLayoutData(c, adminUser, "User"),
-			Error:      message,
+			layoutData:   h.newLayoutData(c, adminUser, "User"),
+			EventsFilter: eventsFilter,
+			EventFilters: eventFilters,
+			Error:        message,
 		})
 	}
 
 	passkeysRaw, err := h.store.ListCredentialRecords(userID)
 	if err != nil {
 		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
-			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
-			User:       profile,
-			Error:      "Failed to load user passkeys",
+			layoutData:   h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:         profile,
+			EventsFilter: eventsFilter,
+			EventFilters: eventFilters,
+			Error:        "Failed to load user passkeys",
 		})
 	}
 
 	sessionsRaw, err := h.auth.ListUserSessionsForAdmin(c.Request().Context(), userID)
 	if err != nil {
 		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
-			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
-			User:       profile,
-			Passkeys:   buildUserPasskeyViews(passkeysRaw),
-			Error:      "Failed to load user sessions",
+			layoutData:   h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:         profile,
+			Passkeys:     buildUserPasskeyViews(passkeysRaw),
+			EventsFilter: eventsFilter,
+			EventFilters: eventFilters,
+			Error:        "Failed to load user sessions",
 		})
 	}
 
 	linkedClientsRaw, err := h.store.ListUserOIDCClients(userID)
 	if err != nil {
 		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
-			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
-			User:       profile,
-			Passkeys:   buildUserPasskeyViews(passkeysRaw),
-			Sessions:   buildUserSessionViews(sessionsRaw),
-			Error:      "Failed to load linked clients",
+			layoutData:   h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:         profile,
+			Passkeys:     buildUserPasskeyViews(passkeysRaw),
+			Sessions:     buildUserSessionViews(sessionsRaw),
+			EventsFilter: eventsFilter,
+			EventFilters: eventFilters,
+			Error:        "Failed to load linked clients",
+		})
+	}
+
+	events, err := h.listUserSecurityEvents(c.Request().Context(), userID, eventsFilter, userTimelinePageSize, passkeysRaw, sessionsRaw, linkedClientsRaw)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
+			layoutData:    h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:          profile,
+			Passkeys:      buildUserPasskeyViews(passkeysRaw),
+			Sessions:      buildUserSessionViews(sessionsRaw),
+			LinkedClients: buildUserClientViews(linkedClientsRaw),
+			EventsFilter:  eventsFilter,
+			EventFilters:  eventFilters,
+			Error:         "Failed to load user security events",
 		})
 	}
 
@@ -832,6 +892,9 @@ func (h *Handler) UserDetail(c echo.Context) error {
 		Passkeys:      buildUserPasskeyViews(passkeysRaw),
 		Sessions:      buildUserSessionViews(sessionsRaw),
 		LinkedClients: buildUserClientViews(linkedClientsRaw),
+		Events:        events,
+		EventsFilter:  eventsFilter,
+		EventFilters:  eventFilters,
 	})
 }
 
@@ -937,6 +1000,368 @@ func (h *Handler) UserPasskeyRevoke(c echo.Context) error {
 	})
 	h.setFlash(c, "success", "User passkey revoked")
 	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+}
+
+func (h *Handler) listUserSecurityEvents(ctx context.Context, userID string, category string, limit int, passkeys []store.CredentialRecord, sessions []store.UserSessionInfo, linkedClients []store.UserOIDCClient) ([]userSecurityEventView, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []userSecurityEventView{}, nil
+	}
+
+	if limit <= 0 {
+		limit = userTimelinePageSize
+	}
+	if limit > userTimelineMaxSize {
+		limit = userTimelineMaxSize
+	}
+
+	auditLimit := limit * 5
+	if auditLimit < 100 {
+		auditLimit = 100
+	}
+	if auditLimit > 200 {
+		auditLimit = 200
+	}
+	adminAuditEntries, err := h.auditStore.ListAdminAuditEntries(ctx, store.AdminAuditListOptions{
+		Limit:  auditLimit,
+		Offset: 0,
+		Action: "admin.user.",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]userSecurityEvent, 0, len(adminAuditEntries)+len(passkeys)*2+len(sessions)*2+len(linkedClients)*2)
+	events = append(events, buildUserSecurityEventsFromAdminAudit(adminAuditEntries, userID)...)
+	events = append(events, buildUserSecurityEventsFromPasskeys(userID, passkeys)...)
+	events = append(events, buildUserSecurityEventsFromSessions(userID, sessions)...)
+	events = append(events, buildUserSecurityEventsFromLinkedClients(userID, linkedClients)...)
+	events = filterUserSecurityEventsByCategory(events, category)
+
+	sort.Slice(events, func(i, j int) bool {
+		left := events[i]
+		right := events[j]
+		if left.Time.Equal(right.Time) {
+			return left.Type < right.Type
+		}
+		return left.Time.After(right.Time)
+	})
+	if len(events) > limit {
+		events = events[:limit]
+	}
+
+	out := make([]userSecurityEventView, 0, len(events))
+	for _, event := range events {
+		out = append(out, userSecurityEventView{
+			Time:     event.Time,
+			Type:     event.Type,
+			Category: event.Category,
+			Label:    strings.TrimSpace(event.Description),
+			Status:   userSecurityEventStatus(event.Success),
+			Actor:    formatUserSecurityActor(event, userID),
+			Details:  formatUserSecurityEventDetails(event.Details),
+		})
+	}
+	return out, nil
+}
+
+func buildUserSecurityEventsFromAdminAudit(entries []store.AdminAuditEntry, userID string) []userSecurityEvent {
+	out := make([]userSecurityEvent, 0, len(entries))
+	for _, entry := range entries {
+		details := decodeUserSecurityAuditDetails(entry.DetailsJSON)
+		if !adminAuditEntryBelongsToUser(entry, userID, details) {
+			continue
+		}
+
+		action := strings.TrimSpace(entry.Action)
+		var (
+			eventType   string
+			description string
+		)
+		switch action {
+		case "admin.user.session.logout.success", "admin.user.session.logout.failure":
+			eventType = "admin_session_logout"
+			description = "Admin logged out user session"
+		case "admin.user.session.logout_all.success", "admin.user.session.logout_all.failure":
+			eventType = "admin_session_logout_all"
+			description = "Admin logged out all user sessions"
+		case "admin.user.passkey.revoke.success", "admin.user.passkey.revoke.failure":
+			eventType = "admin_passkey_revoke"
+			description = "Admin revoked user passkey"
+		default:
+			if !strings.HasPrefix(action, "admin.user.") {
+				continue
+			}
+			eventType = strings.ReplaceAll(strings.TrimPrefix(action, "admin."), ".", "_")
+			description = "Admin support action"
+		}
+
+		success := entry.Success
+		out = append(out, userSecurityEvent{
+			Time:        entry.CreatedAt,
+			Type:        eventType,
+			Category:    "admin",
+			Success:     &success,
+			ActorType:   strings.TrimSpace(entry.ActorType),
+			ActorID:     strings.TrimSpace(entry.ActorID),
+			Description: description,
+			ResourceID:  strings.TrimSpace(entry.ResourceID),
+			Details:     normalizeUserSecurityEventDetails(details),
+		})
+	}
+	return out
+}
+
+func buildUserSecurityEventsFromPasskeys(userID string, passkeys []store.CredentialRecord) []userSecurityEvent {
+	out := make([]userSecurityEvent, 0, len(passkeys)*2)
+	for _, item := range passkeys {
+		credentialID := hex.EncodeToString(item.ID)
+		credentialTag := shortDisplay(credentialID, 12, 8)
+		out = append(out, userSecurityEvent{
+			Time:        item.CreatedAt,
+			Type:        "passkey_added",
+			Category:    "passkeys",
+			Success:     boolPtr(true),
+			ActorType:   "user",
+			ActorID:     userID,
+			Description: "Passkey registered",
+			ResourceID:  credentialID,
+			Details: map[string]any{
+				"credential": credentialTag,
+			},
+		})
+		if item.LastUsedAt != nil && !item.LastUsedAt.IsZero() {
+			out = append(out, userSecurityEvent{
+				Time:        item.LastUsedAt.UTC(),
+				Type:        "passkey_used",
+				Category:    "auth",
+				Success:     boolPtr(true),
+				ActorType:   "user",
+				ActorID:     userID,
+				Description: "Passkey used for authentication",
+				ResourceID:  credentialID,
+				Details: map[string]any{
+					"credential": credentialTag,
+				},
+			})
+		}
+	}
+	return out
+}
+
+func buildUserSecurityEventsFromSessions(userID string, sessions []store.UserSessionInfo) []userSecurityEvent {
+	out := make([]userSecurityEvent, 0, len(sessions)*2)
+	for _, item := range sessions {
+		sessionID := strings.TrimSpace(item.SessionID)
+		sessionTag := shortDisplay(sessionID, 10, 8)
+		details := map[string]any{
+			"session": sessionTag,
+		}
+		if strings.TrimSpace(item.RemoteIP) != "" {
+			details["remote_ip"] = strings.TrimSpace(item.RemoteIP)
+		}
+
+		if !item.CreatedAt.IsZero() {
+			out = append(out, userSecurityEvent{
+				Time:        item.CreatedAt,
+				Type:        "session_started",
+				Category:    "sessions",
+				Success:     boolPtr(true),
+				ActorType:   "user",
+				ActorID:     userID,
+				Description: "Session started",
+				ResourceID:  sessionID,
+				Details:     details,
+			})
+		}
+		if !item.LastSeenAt.IsZero() && !item.LastSeenAt.Equal(item.CreatedAt) {
+			out = append(out, userSecurityEvent{
+				Time:        item.LastSeenAt,
+				Type:        "session_activity",
+				Category:    "sessions",
+				Success:     nil,
+				ActorType:   "user",
+				ActorID:     userID,
+				Description: "Session activity observed",
+				ResourceID:  sessionID,
+				Details:     details,
+			})
+		}
+	}
+	return out
+}
+
+func buildUserSecurityEventsFromLinkedClients(userID string, linkedClients []store.UserOIDCClient) []userSecurityEvent {
+	out := make([]userSecurityEvent, 0, len(linkedClients)*2)
+	for _, item := range linkedClients {
+		clientID := strings.TrimSpace(item.ClientID)
+		if clientID == "" {
+			continue
+		}
+		details := map[string]any{
+			"client_id": clientID,
+		}
+		if host := strings.TrimSpace(item.ClientHost); host != "" {
+			details["client_host"] = host
+		}
+		if !item.FirstSeenAt.IsZero() {
+			out = append(out, userSecurityEvent{
+				Time:        item.FirstSeenAt,
+				Type:        "client_linked",
+				Category:    "auth",
+				Success:     boolPtr(true),
+				ActorType:   "user",
+				ActorID:     userID,
+				Description: "OIDC client linked to user",
+				ResourceID:  clientID,
+				Details:     details,
+			})
+		}
+		if !item.LastSeenAt.IsZero() && !item.LastSeenAt.Equal(item.FirstSeenAt) {
+			out = append(out, userSecurityEvent{
+				Time:        item.LastSeenAt,
+				Type:        "client_activity",
+				Category:    "auth",
+				Success:     nil,
+				ActorType:   "user",
+				ActorID:     userID,
+				Description: "OIDC client activity observed",
+				ResourceID:  clientID,
+				Details:     details,
+			})
+		}
+	}
+	return out
+}
+
+func decodeUserSecurityAuditDetails(raw json.RawMessage) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return map[string]any{}
+	}
+	sanitized := sanitizeAuditDetails(decoded)
+	asMap, ok := sanitized.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return asMap
+}
+
+func adminAuditEntryBelongsToUser(entry store.AdminAuditEntry, userID string, details map[string]any) bool {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return false
+	}
+	if strings.TrimSpace(entry.ResourceID) == userID {
+		return true
+	}
+	if detailUserID := strings.TrimSpace(anyString(details["user_id"])); detailUserID == userID {
+		return true
+	}
+	return false
+}
+
+func normalizeUserSecurityEventDetails(details map[string]any) map[string]any {
+	if len(details) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(details))
+	for key, value := range details {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		if normalized == "" || normalized == "user_id" || normalized == "recent_reauth" {
+			continue
+		}
+		out[normalized] = sanitizeAuditDetails(value)
+	}
+	return out
+}
+
+func filterUserSecurityEventsByCategory(events []userSecurityEvent, category string) []userSecurityEvent {
+	category = parseUserEventsFilter(category)
+	if category == "all" {
+		return append([]userSecurityEvent(nil), events...)
+	}
+	out := make([]userSecurityEvent, 0, len(events))
+	for _, event := range events {
+		if strings.TrimSpace(event.Category) != category {
+			continue
+		}
+		out = append(out, event)
+	}
+	return out
+}
+
+func userSecurityEventStatus(success *bool) string {
+	if success == nil {
+		return "info"
+	}
+	if *success {
+		return "success"
+	}
+	return "failure"
+}
+
+func formatUserSecurityActor(event userSecurityEvent, userID string) string {
+	actorType := strings.TrimSpace(event.ActorType)
+	actorID := strings.TrimSpace(event.ActorID)
+	switch actorType {
+	case "user":
+		if actorID == "" || actorID == userID {
+			return "user"
+		}
+		return "user:" + actorID
+	case "system":
+		if actorID == "" {
+			return "system"
+		}
+		return "system:" + actorID
+	default:
+		return formatAuditActor(actorType, actorID)
+	}
+}
+
+func formatUserSecurityEventDetails(details map[string]any) string {
+	if len(details) == 0 {
+		return "-"
+	}
+	encoded, err := json.Marshal(details)
+	if err != nil {
+		return "-"
+	}
+	trimmed := strings.TrimSpace(string(encoded))
+	if trimmed == "" || trimmed == "{}" || trimmed == "[]" || trimmed == "null" {
+		return "-"
+	}
+	if len(trimmed) > 220 {
+		return trimmed[:217] + "..."
+	}
+	return trimmed
+}
+
+func anyString(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		rendered := strings.TrimSpace(fmt.Sprintf("%v", typed))
+		if rendered == "<nil>" {
+			return ""
+		}
+		return rendered
+	}
+}
+
+func boolPtr(value bool) *bool {
+	item := value
+	return &item
 }
 
 func (h *Handler) InviteAcceptPage(c echo.Context) error {
@@ -2586,6 +3011,23 @@ func parseListPage(raw string) int {
 	return parseAuditLogPage(raw)
 }
 
+func parseUserEventsFilter(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auth":
+		return "auth"
+	case "recovery":
+		return "recovery"
+	case "passkeys":
+		return "passkeys"
+	case "sessions":
+		return "sessions"
+	case "admin":
+		return "admin"
+	default:
+		return "all"
+	}
+}
+
 func parseAuditSuccessFilter(raw string) (string, *bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "success", "true", "1", "yes":
@@ -2636,6 +3078,44 @@ func usersListURL(page int, query string) string {
 		return "/admin/users"
 	}
 	return "/admin/users?" + encoded
+}
+
+func userDetailEventsURL(userID string, category string) string {
+	base := "/admin/users/" + url.PathEscape(strings.TrimSpace(userID))
+	category = parseUserEventsFilter(category)
+	if category == "all" {
+		return base
+	}
+	params := url.Values{}
+	params.Set("events", category)
+	return base + "?" + params.Encode()
+}
+
+func buildUserTimelineFilterLinks(userID string, selected string) []userTimelineFilterLink {
+	selected = parseUserEventsFilter(selected)
+	options := []struct {
+		Value string
+		Label string
+	}{
+		{Value: "all", Label: "All"},
+		{Value: "auth", Label: "Auth"},
+		{Value: "recovery", Label: "Recovery"},
+		{Value: "passkeys", Label: "Passkeys"},
+		{Value: "sessions", Label: "Sessions"},
+		{Value: "admin", Label: "Admin actions"},
+	}
+
+	out := make([]userTimelineFilterLink, 0, len(options))
+	for _, option := range options {
+		value := parseUserEventsFilter(option.Value)
+		out = append(out, userTimelineFilterLink{
+			Value:  value,
+			Label:  option.Label,
+			URL:    userDetailEventsURL(userID, value),
+			Active: selected == value,
+		})
+	}
+	return out
 }
 
 func buildDashboardAuditPreview(entries []store.AdminAuditEntry, successFilter string) []dashboardAuditPreviewItem {

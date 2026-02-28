@@ -111,3 +111,37 @@
 - `go test ./internal/adminui` (dockerized Go) — `ok`.
 - `go test ./internal/adminauth` (dockerized Go) — `ok`.
 - `go test ./...` (dockerized Go) — `ok`.
+
+### User Security Timeline MVP
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- На странице `GET /admin/users/:id` добавлен read-only блок `Recent security events`.
+- Реализован timeline aggregator в admin UI service layer:
+  - нормализует события к единому виду (time/type/category/status/actor/details)
+  - сортирует по времени `DESC`
+  - ограничивает выдачу (default `20`)
+  - поддерживает category filter: `all|auth|recovery|passkeys|sessions|admin` (`?events=...`)
+- Источники timeline в MVP:
+  - `admin_audit_log` (`admin.user.*` support actions)
+  - user passkey metadata (`created_at`, `last_used_at`)
+  - user session metadata (`created_at`, `last_seen_at`)
+  - linked OIDC client activity (`first_seen_at`, `last_seen_at`)
+- Добавлены event labels для support UX:
+  - `Admin logged out user session`
+  - `Admin logged out all user sessions`
+  - `Admin revoked user passkey`
+  - `Passkey registered`
+  - `Passkey used for authentication`
+  - `Session started` / `Session activity observed`
+  - `OIDC client linked to user` / `OIDC client activity observed`
+- Добавлена санитизация timeline details:
+  - sensitive keys (`secret`, `token`, `password`, `authorization`) отбрасываются.
+- Обновлён шаблон `web/templates/admin/user_detail.html`:
+  - table timeline + status badges + filter chips + empty fallback.
+- Обновлены docs: `ADMIN_UI.md`, `README.md`.
+
+Проверки:
+- `go test ./internal/adminui` (dockerized Go) — `ok`.
+- `go test ./...` (dockerized Go) — `ok`.

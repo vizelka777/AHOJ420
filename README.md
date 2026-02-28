@@ -338,6 +338,15 @@ Security behavior:
 - users support section (`GET /admin/users`, `GET /admin/users/:id`) is available to both `owner` and `admin`
   - mostly read-only support view (search/list/detail)
   - no profile editing, no user deletion, no impersonation
+  - user detail now includes a read-only `Recent security events` timeline
+    - compact user-scoped timeline with event time, label, status, actor, and safe details
+    - category filter: `all|auth|recovery|passkeys|sessions|admin` (`?events=...`)
+    - timeline sources in MVP:
+      - admin support actions from `admin_audit_log` (`admin.user.*`)
+      - user passkey metadata (`created_at`, `last_used_at`)
+      - user session metadata (`created_at`, `last_seen_at`)
+      - linked client activity (`first_seen_at`, `last_seen_at`)
+    - sensitive fields are stripped from rendered details (token/secret/password/authorization)
   - safe support mutations:
     - logout one user session (`POST /admin/users/:id/sessions/:sessionID/logout`)
     - logout all user sessions (`POST /admin/users/:id/sessions/logout-all`)

@@ -535,6 +535,7 @@ func TestUserDetailRendersSummaryPasskeysSessionsAndClients(t *testing.T) {
 	body := rec.Body.String()
 	for _, expected := range []string{
 		"Summary",
+		"Recent security events",
 		"Passkeys",
 		"Sessions",
 		"Linked OIDC Clients",
@@ -546,6 +547,209 @@ func TestUserDetailRendersSummaryPasskeysSessionsAndClients(t *testing.T) {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("expected %q in user detail html, body=%s", expected, body)
 		}
+	}
+}
+
+func TestUserDetailTimelineRendersEvents(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-timeline", "timeline@login.local", "timeline@example.com", "+421")
+	lastUsed := time.Now().UTC().Add(-25 * time.Minute)
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{
+			ID:         []byte{0x10, 0x20, 0x30},
+			DeviceName: "Phone",
+			CreatedAt:  time.Now().UTC().Add(-4 * time.Hour),
+			LastUsedAt: &lastUsed,
+		},
+	}
+
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{
+					SessionID:  "timeline-session",
+					CreatedAt:  time.Now().UTC().Add(-2 * time.Hour),
+					LastSeenAt: time.Now().UTC().Add(-10 * time.Minute),
+				},
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for user detail timeline, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Recent security events",
+		"Passkey registered",
+		"Passkey used for authentication",
+		"Session started",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q in timeline output, body=%s", expected, body)
+		}
+	}
+}
+
+func TestUserDetailTimelineEmptyFallback(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-empty-events", "empty@login.local", "", "")
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID+"?events=recovery", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for empty timeline view, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "No recent security events.") {
+		t.Fatalf("expected empty timeline fallback message, body=%s", rec.Body.String())
+	}
+}
+
+func TestUserDetailTimelineCategoryFilter(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-filter-events", "filter@login.local", "filter@example.com", "+900")
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{ID: []byte{0x21, 0x22, 0x23}, CreatedAt: time.Now().UTC().Add(-4 * time.Hour)},
+	}
+	fakeStore.userLinkedClients[user.ID] = []store.UserOIDCClient{
+		{ClientID: "client-filter", FirstSeenAt: time.Now().UTC().Add(-3 * time.Hour), LastSeenAt: time.Now().UTC().Add(-40 * time.Minute)},
+	}
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	recPasskeys := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID+"?events=passkeys", nil, auth.sessionCookies())
+	if recPasskeys.Code != http.StatusOK {
+		t.Fatalf("expected 200 for passkeys filter, got %d body=%s", recPasskeys.Code, recPasskeys.Body.String())
+	}
+	bodyPasskeys := recPasskeys.Body.String()
+	if !strings.Contains(bodyPasskeys, "Passkey registered") {
+		t.Fatalf("expected passkey event in passkeys filter, body=%s", bodyPasskeys)
+	}
+	if strings.Contains(bodyPasskeys, "OIDC client linked to user") {
+		t.Fatalf("did not expect auth event in passkeys filter, body=%s", bodyPasskeys)
+	}
+
+	recAuth := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID+"?events=auth", nil, auth.sessionCookies())
+	if recAuth.Code != http.StatusOK {
+		t.Fatalf("expected 200 for auth filter, got %d body=%s", recAuth.Code, recAuth.Body.String())
+	}
+	bodyAuth := recAuth.Body.String()
+	if !strings.Contains(bodyAuth, "OIDC client linked to user") {
+		t.Fatalf("expected auth event in auth filter, body=%s", bodyAuth)
+	}
+	if strings.Contains(bodyAuth, "Passkey registered") {
+		t.Fatalf("did not expect passkey-created event in auth filter, body=%s", bodyAuth)
+	}
+}
+
+func TestUserDetailTimelineHidesSensitiveFields(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-sensitive", "sensitive@login.local", "sensitive@example.com", "+901")
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{
+		entries: []store.AdminAuditEntry{
+			{
+				ID:           9001,
+				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+				Action:       "admin.user.passkey.revoke.failure",
+				Success:      false,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "user_credential",
+				ResourceID:   "deadbeef",
+				DetailsJSON:  json.RawMessage(`{"user_id":"user-sensitive","error":"operation_failed","token":"TOP_TOKEN","secret":"TOP_SECRET","authorization":"Bearer leaked"}`),
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for sensitive details test, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "TOP_TOKEN") || strings.Contains(body, "TOP_SECRET") || strings.Contains(body, "Bearer leaked") {
+		t.Fatalf("sensitive details leaked into timeline output: %s", body)
+	}
+	if !strings.Contains(body, "operation_failed") {
+		t.Fatalf("expected safe error detail to remain visible, body=%s", body)
+	}
+}
+
+func TestUserDetailTimelineIncludesAdminSupportActions(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	target := fakeStore.seedSupportUser("user-admin-events", "admin.events@login.local", "admin.events@example.com", "+902")
+	_ = fakeStore.seedSupportUser("user-other-events", "other@login.local", "other@example.com", "+903")
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{
+		entries: []store.AdminAuditEntry{
+			{
+				ID:           1,
+				CreatedAt:    time.Now().UTC().Add(-1 * time.Minute),
+				Action:       "admin.user.session.logout.success",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "user_session",
+				ResourceID:   "sess-1",
+				DetailsJSON:  json.RawMessage(`{"user_id":"user-admin-events"}`),
+			},
+			{
+				ID:           2,
+				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+				Action:       "admin.user.session.logout_all.success",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "user",
+				ResourceID:   "user-admin-events",
+				DetailsJSON:  json.RawMessage(`{"removed_count":2}`),
+			},
+			{
+				ID:           3,
+				CreatedAt:    time.Now().UTC().Add(-3 * time.Minute),
+				Action:       "admin.user.passkey.revoke.success",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "user_credential",
+				ResourceID:   "cred-1",
+				DetailsJSON:  json.RawMessage(`{"user_id":"user-admin-events"}`),
+			},
+			{
+				ID:           4,
+				CreatedAt:    time.Now().UTC().Add(-4 * time.Minute),
+				Action:       "admin.user.session.logout.success",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "user_session",
+				ResourceID:   "sess-foreign",
+				DetailsJSON:  json.RawMessage(`{"user_id":"user-other-events"}`),
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+target.ID+"?events=admin", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin events timeline, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Admin logged out user session",
+		"Admin logged out all user sessions",
+		"Admin revoked user passkey",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected admin support event %q in timeline, body=%s", expected, body)
+		}
+	}
+	if strings.Contains(body, "sess-foreign") {
+		t.Fatalf("timeline should not include admin events for another user, body=%s", body)
 	}
 }
 

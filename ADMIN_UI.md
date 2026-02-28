@@ -178,6 +178,14 @@ Protected (admin session required):
     - linked client count
 - detail page (`GET /admin/users/:id`):
   - summary (id, created_at, profile contacts + verification, avatar presence)
+  - recent security events timeline (read-only, user-scoped):
+    - latest security/auth/support events with time, label, status, actor, safe details
+    - category filter via query param: `?events=all|auth|recovery|passkeys|sessions|admin`
+    - current MVP data sources:
+      - admin support actions from `admin_audit_log` (`admin.user.*`)
+      - user passkey metadata (`created_at`, `last_used_at`)
+      - active user session metadata (`created_at`, `last_seen_at`)
+      - linked OIDC client activity (`first_seen_at`, `last_seen_at`)
   - passkeys list (credential id, label, created_at, last_used_at)
   - active sessions list (session id, created_at, last_seen_at, expires_at, ip, user-agent)
   - linked OIDC clients list (client id, first_seen_at, last_seen_at)
@@ -193,6 +201,7 @@ Protected (admin session required):
 - security posture:
   - all mutating routes are CSRF-protected by existing admin UI CSRF middleware
   - section is mostly read-only (no profile editing, no user deletion, no impersonation)
+  - timeline details are sanitized (secret/token/password/authorization fields are removed)
 
 ## One-time secret reveal
 When creating a secret with `Generate secret automatically`:
