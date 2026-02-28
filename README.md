@@ -242,6 +242,8 @@ Admin auth endpoints (`/admin/auth`):
 - `POST /admin/auth/register/finish`
 - `POST /admin/auth/login/begin`
 - `POST /admin/auth/login/finish`
+- `POST /admin/auth/invite/register/begin` (public invite accept begin)
+- `POST /admin/auth/invite/register/finish` (public invite accept finish)
 - `POST /admin/auth/reauth/begin`
 - `POST /admin/auth/reauth/finish`
 - `POST /admin/auth/passkeys/register/begin` (logged-in admin adds extra passkey)
@@ -259,10 +261,20 @@ Admin OIDC client endpoints (`/admin/api/oidc/clients`):
 
 Admin HTML UI routes (`/admin/*`):
 - `GET /admin/login`
+- `GET /admin/invite`
+- `GET /admin/invite/:token`
 - `POST /admin/logout`
 - `GET /admin/`
 - `GET /admin/audit`
 - `GET /admin/security`
+- `GET /admin/admins`
+- `GET /admin/admins/new`
+- `POST /admin/admins/new`
+- `GET /admin/admins/:id`
+- `POST /admin/admins/:id/invites`
+- `POST /admin/admins/:id/invites/:inviteID/revoke`
+- `POST /admin/admins/:id/enable`
+- `POST /admin/admins/:id/disable`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
 - `POST /admin/clients/new`
@@ -306,6 +318,14 @@ Security behavior:
   - admin can add a second passkey while already logged in (`/admin/auth/passkeys/register/*`)
   - last remaining admin passkey cannot be deleted
   - admin can sign out one session or all other sessions
+- multi-admin model:
+  - admins are separate users in `admin_users`
+  - logged-in admin can create another admin user and generate one-time invite
+  - invite token plaintext is shown only once on immediate success page (never stored in plaintext)
+  - invite accept flow (`/admin/invite/*` + `/admin/auth/invite/register/*`) registers first passkey for invited admin
+  - invite is one-time (`used_at`), revoked/expired/used invites are blocked
+  - invite flow is blocked when target admin already has credentials
+  - disabling admin blocks future login and invalidates active admin sessions for that user
 - sensitive admin actions require recent passkey re-authentication (`/admin/auth/reauth/*`)
   - recent re-auth timestamp is kept in admin session (`recent_auth_at_utc`)
   - TTL is controlled by `ADMIN_REAUTH_TTL_MINUTES` (default `5`)

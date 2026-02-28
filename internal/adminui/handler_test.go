@@ -222,6 +222,137 @@ func TestSecurityPageRequiresSession(t *testing.T) {
 	}
 }
 
+func TestAdminsPageRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/admins", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestCreateSecondAdminUserAndInvite(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/new", auth.sessionCookies())
+
+	form := url.Values{}
+	form.Set("login", "second-admin")
+	form.Set("display_name", "Second Admin")
+	form.Set("invite_note", "oncall")
+	form.Set("invite_ttl_hours", "48")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/new", withCSRF(form, csrfToken), cookies)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on admin create, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	created, err := fakeStore.GetAdminUserByLogin("second-admin")
+	if err != nil {
+		t.Fatalf("expected created admin user, err=%v", err)
+	}
+	invites, err := fakeStore.ListAdminInvites(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list invites failed: %v", err)
+	}
+	if len(invites) != 1 {
+		t.Fatalf("expected one invite for created admin, got %d", len(invites))
+	}
+
+	body := rec.Body.String()
+	token := extractInputValueByID(body, "invite_token_copy")
+	link := extractInputValueByID(body, "invite_link_copy")
+	if token == "" || link == "" {
+		t.Fatalf("expected one-time token and link in invite created page")
+	}
+	if strings.Contains(link, invites[0].TokenHash) {
+		t.Fatalf("invite link should not contain token hash")
+	}
+	if !strings.Contains(link, "/admin/invite/") {
+		t.Fatalf("expected invite URL in body, got %s", link)
+	}
+
+	for _, entry := range auditStore.entries {
+		if strings.Contains(string(entry.DetailsJSON), token) {
+			t.Fatalf("plaintext invite token leaked into audit details")
+		}
+	}
+
+	recDetail := doUIRequest(t, e, http.MethodGet, "/admin/admins/"+created.ID, nil, auth.sessionCookies())
+	if recDetail.Code != http.StatusOK {
+		t.Fatalf("expected admin detail 200, got %d body=%s", recDetail.Code, recDetail.Body.String())
+	}
+	if strings.Contains(recDetail.Body.String(), token) {
+		t.Fatalf("plaintext invite token should not be visible on admin detail page")
+	}
+}
+
+func TestCreateAdminDuplicateLoginBlocked(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/new", auth.sessionCookies())
+	form := url.Values{}
+	form.Set("login", "admin")
+	form.Set("display_name", "Duplicate")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/new", withCSRF(form, csrfToken), cookies)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on duplicate admin login, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "already exists") {
+		t.Fatalf("expected duplicate login error in response body")
+	}
+}
+
+func TestAdminsMutatingRoutesRequireCSRF(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+
+	form := url.Values{}
+	form.Set("login", "no-csrf")
+	form.Set("display_name", "No CSRF")
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/new", form, auth.sessionCookies())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without csrf token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRevokeInviteBlocksPublicAcceptFlow(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	created, err := fakeStore.CreateAdminUser("revokable", "Revokable Admin")
+	if err != nil {
+		t.Fatalf("create admin failed: %v", err)
+	}
+	token := "plain-token-revoke"
+	tokenHash := hashInviteToken(token)
+	invite, err := fakeStore.CreateAdminInvite(context.Background(), created.ID, "admin-1", tokenHash, time.Now().UTC().Add(12*time.Hour), "test")
+	if err != nil {
+		t.Fatalf("create invite failed: %v", err)
+	}
+
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/"+created.ID, auth.sessionCookies())
+	recRevoke := doUIRequest(t, e, http.MethodPost, fmt.Sprintf("/admin/admins/%s/invites/%d/revoke", created.ID, invite.ID), withCSRF(nil, csrfToken), cookies)
+	if recRevoke.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on revoke, got %d body=%s", recRevoke.Code, recRevoke.Body.String())
+	}
+
+	recPublic := doUIRequest(t, e, http.MethodGet, "/admin/invite/"+token, nil, nil)
+	if recPublic.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for revoked invite accept page, got %d body=%s", recPublic.Code, recPublic.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(recPublic.Body.String()), "invalid") {
+		t.Fatalf("expected invalid invite message, got body=%s", recPublic.Body.String())
+	}
+}
+
 func TestSecurityPageRendersPasskeysAndSessions(t *testing.T) {
 	auth := &fakeUIAuth{
 		passkeys: []store.AdminCredentialInfo{
@@ -1255,6 +1386,15 @@ func (a *fakeUIAuth) LogoutOtherSessions(c echo.Context) (int, error) {
 	return removed, nil
 }
 
+func (a *fakeUIAuth) InvalidateSessionsForAdminUser(ctx context.Context, adminUserID string) (int, error) {
+	if strings.TrimSpace(adminUserID) == "" {
+		return 0, errors.New("admin user id is required")
+	}
+	removed := len(a.sessions)
+	a.sessions = []store.AdminSessionInfo{}
+	return removed, nil
+}
+
 func (a *fakeUIAuth) RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -1357,16 +1497,37 @@ func (a *fakeAuditStore) ListAdminAuditEntries(ctx context.Context, opts store.A
 }
 
 type fakeUIStore struct {
-	clients      map[string]store.OIDCClient
-	secrets      map[string][]store.OIDCClientSecret
-	nextSecretID int64
+	clients              map[string]store.OIDCClient
+	secrets              map[string][]store.OIDCClientSecret
+	nextSecretID         int64
+	adminUsers           map[string]*store.AdminUser
+	adminUsersByLogin    map[string]string
+	adminCredentialCount map[string]int
+	adminInvites         map[int64]store.AdminInvite
+	nextAdminUserID      int
+	nextInviteID         int64
 }
 
 func newFakeUIStore() *fakeUIStore {
+	now := time.Now().UTC()
+	rootAdmin := &store.AdminUser{
+		ID:          "admin-1",
+		Login:       "admin",
+		DisplayName: "Admin",
+		Enabled:     true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
 	return &fakeUIStore{
-		clients:      map[string]store.OIDCClient{},
-		secrets:      map[string][]store.OIDCClientSecret{},
-		nextSecretID: 1,
+		clients:              map[string]store.OIDCClient{},
+		secrets:              map[string][]store.OIDCClientSecret{},
+		nextSecretID:         1,
+		adminUsers:           map[string]*store.AdminUser{"admin-1": rootAdmin},
+		adminUsersByLogin:    map[string]string{"admin": "admin-1"},
+		adminCredentialCount: map[string]int{"admin-1": 1},
+		adminInvites:         map[int64]store.AdminInvite{},
+		nextAdminUserID:      1,
+		nextInviteID:         1,
 	}
 }
 
@@ -1566,6 +1727,213 @@ func (s *fakeUIStore) RevokeOIDCClientSecret(clientID string, secretID int64) er
 	return nil
 }
 
+func (s *fakeUIStore) CreateAdminUser(login string, displayName string) (*store.AdminUser, error) {
+	login = strings.ToLower(strings.TrimSpace(login))
+	displayName = strings.TrimSpace(displayName)
+	if login == "" {
+		return nil, errors.New("admin login is required")
+	}
+	if _, exists := s.adminUsersByLogin[login]; exists {
+		return nil, errors.New("admin login already exists")
+	}
+	s.nextAdminUserID++
+	now := time.Now().UTC()
+	user := &store.AdminUser{
+		ID:          fmt.Sprintf("admin-%d", s.nextAdminUserID),
+		Login:       login,
+		DisplayName: displayName,
+		Enabled:     true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if user.DisplayName == "" {
+		user.DisplayName = user.Login
+	}
+	s.adminUsers[user.ID] = user
+	s.adminUsersByLogin[user.Login] = user.ID
+	s.adminCredentialCount[user.ID] = 0
+	copyUser := *user
+	return &copyUser, nil
+}
+
+func (s *fakeUIStore) GetAdminUser(id string) (*store.AdminUser, error) {
+	id = strings.TrimSpace(id)
+	user, ok := s.adminUsers[id]
+	if !ok {
+		return nil, store.ErrAdminUserNotFound
+	}
+	copyUser := *user
+	copyUser.CredentialCount = s.adminCredentialCount[id]
+	return &copyUser, nil
+}
+
+func (s *fakeUIStore) GetAdminUserByLogin(login string) (*store.AdminUser, error) {
+	login = strings.ToLower(strings.TrimSpace(login))
+	id, ok := s.adminUsersByLogin[login]
+	if !ok {
+		return nil, store.ErrAdminUserNotFound
+	}
+	return s.GetAdminUser(id)
+}
+
+func (s *fakeUIStore) ListAdminUsers() ([]store.AdminUser, error) {
+	out := make([]store.AdminUser, 0, len(s.adminUsers))
+	for id, user := range s.adminUsers {
+		item := *user
+		item.CredentialCount = s.adminCredentialCount[id]
+		active := 0
+		now := time.Now().UTC()
+		for _, invite := range s.adminInvites {
+			if strings.TrimSpace(invite.AdminUserID) != id {
+				continue
+			}
+			if invite.UsedAt == nil && invite.RevokedAt == nil && invite.ExpiresAt.After(now) {
+				active++
+			}
+		}
+		item.ActiveInviteCount = active
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(strings.TrimSpace(out[i].Login)) < strings.ToLower(strings.TrimSpace(out[j].Login))
+	})
+	return out, nil
+}
+
+func (s *fakeUIStore) SetAdminUserEnabled(id string, enabled bool) error {
+	id = strings.TrimSpace(id)
+	user, ok := s.adminUsers[id]
+	if !ok {
+		return store.ErrAdminUserNotFound
+	}
+	user.Enabled = enabled
+	user.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+func (s *fakeUIStore) CountEnabledAdminUsers() (int, error) {
+	count := 0
+	for _, user := range s.adminUsers {
+		if user.Enabled {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *fakeUIStore) CountAdminCredentialsForUser(adminUserID string) (int, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return 0, store.ErrAdminUserNotFound
+	}
+	if _, ok := s.adminUsers[adminUserID]; !ok {
+		return 0, store.ErrAdminUserNotFound
+	}
+	return s.adminCredentialCount[adminUserID], nil
+}
+
+func (s *fakeUIStore) CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*store.AdminInvite, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	createdBy = strings.TrimSpace(createdBy)
+	tokenHash = strings.TrimSpace(tokenHash)
+	note = strings.TrimSpace(note)
+	if adminUserID == "" || createdBy == "" || tokenHash == "" {
+		return nil, errors.New("invalid admin invite payload")
+	}
+	if _, ok := s.adminUsers[adminUserID]; !ok {
+		return nil, store.ErrAdminUserNotFound
+	}
+	if _, ok := s.adminUsers[createdBy]; !ok {
+		return nil, store.ErrAdminUserNotFound
+	}
+	for _, existing := range s.adminInvites {
+		if strings.TrimSpace(existing.TokenHash) == tokenHash {
+			return nil, errors.New("invite token already exists")
+		}
+	}
+	now := time.Now().UTC()
+	invite := store.AdminInvite{
+		ID:                   s.nextInviteID,
+		TokenHash:            tokenHash,
+		AdminUserID:          adminUserID,
+		CreatedByAdminUserID: createdBy,
+		CreatedAt:            now,
+		ExpiresAt:            expiresAt.UTC(),
+		Note:                 note,
+	}
+	s.nextInviteID++
+	s.adminInvites[invite.ID] = invite
+	copyInvite := invite
+	return &copyInvite, nil
+}
+
+func (s *fakeUIStore) GetAdminInviteByID(ctx context.Context, inviteID int64) (*store.AdminInvite, error) {
+	if inviteID <= 0 {
+		return nil, store.ErrAdminInviteNotFound
+	}
+	invite, ok := s.adminInvites[inviteID]
+	if !ok {
+		return nil, store.ErrAdminInviteNotFound
+	}
+	copyInvite := invite
+	return &copyInvite, nil
+}
+
+func (s *fakeUIStore) GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error) {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return nil, store.ErrAdminInviteNotFound
+	}
+	now := time.Now().UTC()
+	for _, invite := range s.adminInvites {
+		if strings.TrimSpace(invite.TokenHash) != tokenHash {
+			continue
+		}
+		if invite.UsedAt != nil || invite.RevokedAt != nil || !invite.ExpiresAt.After(now) {
+			return nil, store.ErrAdminInviteNotFound
+		}
+		copyInvite := invite
+		return &copyInvite, nil
+	}
+	return nil, store.ErrAdminInviteNotFound
+}
+
+func (s *fakeUIStore) RevokeAdminInvite(ctx context.Context, inviteID int64) error {
+	if inviteID <= 0 {
+		return store.ErrAdminInviteNotFound
+	}
+	invite, ok := s.adminInvites[inviteID]
+	if !ok {
+		return store.ErrAdminInviteNotFound
+	}
+	now := time.Now().UTC()
+	if invite.UsedAt != nil || invite.RevokedAt != nil || !invite.ExpiresAt.After(now) {
+		return store.ErrAdminInviteInactive
+	}
+	invite.RevokedAt = &now
+	s.adminInvites[inviteID] = invite
+	return nil
+}
+
+func (s *fakeUIStore) ListAdminInvites(ctx context.Context, adminUserID string) ([]store.AdminInvite, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	out := make([]store.AdminInvite, 0, len(s.adminInvites))
+	for _, invite := range s.adminInvites {
+		if strings.TrimSpace(invite.AdminUserID) != adminUserID {
+			continue
+		}
+		copyInvite := invite
+		out = append(out, copyInvite)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 func extractSecretFromPage(body string) string {
 	startMarker := "<textarea readonly style=\"min-height:80px; font-size:16px;\">"
 	endMarker := "</textarea>"
@@ -1593,6 +1961,30 @@ func extractCSRFTokenFromPage(body string) string {
 		return ""
 	}
 	return strings.TrimSpace(body[start : start+end])
+}
+
+func extractInputValueByID(body string, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	marker := `id="` + id + `"`
+	pos := strings.Index(body, marker)
+	if pos < 0 {
+		return ""
+	}
+	slice := body[pos:]
+	valueMarker := `value="`
+	valuePos := strings.Index(slice, valueMarker)
+	if valuePos < 0 {
+		return ""
+	}
+	valuePos += len(valueMarker)
+	valueEnd := strings.Index(slice[valuePos:], `"`)
+	if valueEnd < 0 {
+		return ""
+	}
+	return strings.TrimSpace(slice[valuePos : valuePos+valueEnd])
 }
 
 func TestAuditDetailsJSONNeverContainsSecretMaterial(t *testing.T) {

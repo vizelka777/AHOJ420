@@ -3,7 +3,10 @@ package adminauth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +33,7 @@ const (
 	adminLoginSessionCookieName  = "admin_login_session_id"
 	adminAddPasskeyCookieName    = "admin_passkey_add_session_id"
 	adminReauthSessionCookieName = "admin_reauth_session_id"
+	adminInviteSessionCookieName = "admin_invite_session_id"
 )
 
 var (
@@ -49,6 +53,8 @@ type adminStore interface {
 	ListAdminCredentials(adminUserID string) ([]store.AdminCredentialInfo, error)
 	DeleteAdminCredential(adminUserID string, credentialID int64) error
 	CountAdminCredentialsForUser(adminUserID string) (int, error)
+	GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error)
+	MarkAdminInviteUsed(ctx context.Context, inviteID int64, usedAt time.Time) error
 	CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error
 }
 
@@ -78,6 +84,13 @@ type reauthSession struct {
 	AdminUserID    string               `json:"admin_user_id"`
 	AdminSessionID string               `json:"admin_session_id"`
 	Session        webauthn.SessionData `json:"session"`
+}
+
+type inviteRegistrationSession struct {
+	InviteID    int64                `json:"invite_id"`
+	AdminUserID string               `json:"admin_user_id"`
+	TokenHash   string               `json:"token_hash"`
+	Session     webauthn.SessionData `json:"session"`
 }
 
 type sessionRecord struct {
@@ -194,6 +207,8 @@ func RegisterRoutes(group *echo.Group, svc *Service) {
 	group.POST("/register/finish", svc.FinishRegistration)
 	group.POST("/login/begin", svc.BeginLogin)
 	group.POST("/login/finish", svc.FinishLogin)
+	group.POST("/invite/register/begin", svc.BeginInviteRegistration)
+	group.POST("/invite/register/finish", svc.FinishInviteRegistration)
 	group.POST("/reauth/begin", svc.BeginReauth)
 	group.POST("/reauth/finish", svc.FinishReauth)
 	group.POST("/passkeys/register/begin", svc.BeginAddPasskey)
@@ -448,6 +463,182 @@ func (s *Service) FinishLogin(c echo.Context) error {
 
 	admin.SetAdminActor(c, "admin_user", adminUser.ID)
 	s.auditAuth(c, "admin.auth.login.success", true, "admin_user", adminUser.ID, map[string]any{"login": adminUser.Login})
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":       "ok",
+		"admin_id":     adminUser.ID,
+		"login":        adminUser.Login,
+		"display_name": adminUser.DisplayName,
+	})
+}
+
+func (s *Service) BeginInviteRegistration(c echo.Context) error {
+	token := readInviteToken(c)
+	if token == "" {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "missing_invite_token"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite token is required"})
+	}
+
+	tokenHash := hashInviteToken(token)
+	invite, err := s.store.GetActiveAdminInviteByTokenHash(c.Request().Context(), tokenHash)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "invite_not_found"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite is invalid or expired"})
+	}
+
+	adminUser, err := s.store.GetAdminUser(invite.AdminUserID)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_user_not_found"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite is invalid"})
+	}
+	if !adminUser.Enabled {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_user_disabled"})
+		return c.JSON(http.StatusForbidden, map[string]string{"message": "admin user is disabled"})
+	}
+
+	credentialCount, err := s.store.CountAdminCredentialsForUser(adminUser.ID)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "credential_count_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to verify invite target"})
+	}
+	if credentialCount > 0 {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_credentials_exist"})
+		return c.JSON(http.StatusConflict, map[string]string{"message": "invite can only be used for admin without passkeys"})
+	}
+
+	options, session, err := s.wa.BeginRegistration(adminUser,
+		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+			ResidentKey:      protocol.ResidentKeyRequirementRequired,
+			UserVerification: protocol.VerificationRequired,
+		}),
+	)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "begin_registration_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to begin invite registration"})
+	}
+
+	sessionID, err := newRandomID()
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "session_id_generation_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to create invite registration session"})
+	}
+
+	payload, err := json.Marshal(inviteRegistrationSession{
+		InviteID:    invite.ID,
+		AdminUserID: adminUser.ID,
+		TokenHash:   tokenHash,
+		Session:     *session,
+	})
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "session_encode_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to encode invite session"})
+	}
+	if err := s.stateStore.Set(c.Request().Context(), adminInviteRedisKey(sessionID), payload, 5*time.Minute); err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "session_store_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to store invite session"})
+	}
+
+	setCookie(c, &http.Cookie{
+		Name:     adminInviteSessionCookieName,
+		Value:    sessionID,
+		Path:     "/admin/auth",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   300,
+	})
+	return c.JSON(http.StatusOK, options)
+}
+
+func (s *Service) FinishInviteRegistration(c echo.Context) error {
+	token := readInviteToken(c)
+	if token == "" {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "missing_invite_token"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite token is required"})
+	}
+	tokenHash := hashInviteToken(token)
+
+	inviteCookie, err := c.Cookie(adminInviteSessionCookieName)
+	if err != nil || strings.TrimSpace(inviteCookie.Value) == "" {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "missing_invite_session_cookie"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite registration session is missing"})
+	}
+
+	key := adminInviteRedisKey(strings.TrimSpace(inviteCookie.Value))
+	payload, err := s.stateStore.Get(c.Request().Context(), key)
+	if err != nil {
+		clearCookie(c, adminInviteSessionCookieName, "/admin/auth")
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "invite_session_expired"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite registration session expired"})
+	}
+	_ = s.stateStore.Del(c.Request().Context(), key)
+	clearCookie(c, adminInviteSessionCookieName, "/admin/auth")
+
+	var inviteSession inviteRegistrationSession
+	if err := json.Unmarshal(payload, &inviteSession); err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", "", map[string]any{"error": "invite_session_invalid"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "invite registration session is invalid"})
+	}
+	if !constantTimeEqual(inviteSession.TokenHash, tokenHash) {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", strconv.FormatInt(inviteSession.InviteID, 10), map[string]any{"error": "invite_token_mismatch"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite token mismatch"})
+	}
+
+	invite, err := s.store.GetActiveAdminInviteByTokenHash(c.Request().Context(), tokenHash)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", strconv.FormatInt(inviteSession.InviteID, 10), map[string]any{"error": "invite_not_found"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite is invalid or expired"})
+	}
+	if invite.ID != inviteSession.InviteID || strings.TrimSpace(invite.AdminUserID) != strings.TrimSpace(inviteSession.AdminUserID) {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "invite_session_mismatch"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite session mismatch"})
+	}
+
+	adminUser, err := s.store.GetAdminUser(invite.AdminUserID)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "unknown", "", "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_user_not_found"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite target admin is missing"})
+	}
+	if !adminUser.Enabled {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_user_disabled"})
+		return c.JSON(http.StatusForbidden, map[string]string{"message": "admin user is disabled"})
+	}
+
+	credentialCount, err := s.store.CountAdminCredentialsForUser(adminUser.ID)
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "credential_count_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to verify invite target"})
+	}
+	if credentialCount > 0 {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "admin_credentials_exist"})
+		return c.JSON(http.StatusConflict, map[string]string{"message": "invite can only be used for admin without passkeys"})
+	}
+
+	credential, err := s.wa.FinishRegistration(adminUser, inviteSession.Session, c.Request())
+	if err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "finish_registration_failed"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "invite registration verification failed"})
+	}
+
+	if err := s.store.AddAdminCredential(adminUser.ID, credential); err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "credential_store_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to store admin credential"})
+	}
+
+	if err := s.store.MarkAdminInviteUsed(c.Request().Context(), invite.ID, time.Now().UTC()); err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "invite_mark_used_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to mark invite as used"})
+	}
+
+	if _, err := s.setSession(c, adminUser.ID); err != nil {
+		s.auditAdminAction(c, "admin.invite.accept.failure", false, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{"error": "session_create_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to create admin session"})
+	}
+
+	s.auditAdminAction(c, "admin.invite.accept.success", true, "admin_user", adminUser.ID, "admin_invite", strconv.FormatInt(invite.ID, 10), map[string]any{
+		"invite_id":  invite.ID,
+		"expires_at": invite.ExpiresAt.Format(time.RFC3339),
+	})
+	admin.SetAdminActor(c, "admin_user", adminUser.ID)
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":       "ok",
 		"admin_id":     adminUser.ID,
@@ -843,6 +1034,37 @@ func (s *Service) LogoutOtherSessions(c echo.Context) (int, error) {
 	return removed, nil
 }
 
+func (s *Service) InvalidateSessionsForAdminUser(ctx context.Context, adminUserID string) (int, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return 0, errAdminSessionInvalid
+	}
+
+	keys, err := s.stateStore.Keys(ctx, adminSessionRedisKey("*"))
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, key := range keys {
+		sessionID := strings.TrimPrefix(strings.TrimSpace(key), "admin:sess:")
+		if sessionID == "" {
+			continue
+		}
+		record, _, err := s.loadSessionRecord(ctx, sessionID)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(record.AdminUserID) != adminUserID {
+			continue
+		}
+		if err := s.stateStore.Del(ctx, adminSessionRedisKey(sessionID)); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 func (s *Service) listAdminSessions(ctx context.Context, adminUserID string, currentSessionID string) ([]store.AdminSessionInfo, error) {
 	adminUserID = strings.TrimSpace(adminUserID)
 	if adminUserID == "" {
@@ -1189,6 +1411,10 @@ func adminReauthRedisKey(id string) string {
 	return "admin:reauth:" + strings.TrimSpace(id)
 }
 
+func adminInviteRedisKey(id string) string {
+	return "admin:invite:reg:" + strings.TrimSpace(id)
+}
+
 func adminAddPasskeyRedisKey(id string) string {
 	return "admin:passkey:add:" + strings.TrimSpace(id)
 }
@@ -1232,6 +1458,34 @@ func requestID(c echo.Context) string {
 		return rid
 	}
 	return strings.TrimSpace(c.Request().Header.Get(echo.HeaderXRequestID))
+}
+
+func readInviteToken(c echo.Context) string {
+	if token := strings.TrimSpace(c.QueryParam("token")); token != "" {
+		return token
+	}
+	if token := strings.TrimSpace(c.Request().Header.Get("X-Admin-Invite-Token")); token != "" {
+		return token
+	}
+	return ""
+}
+
+func hashInviteToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func constantTimeEqual(left string, right string) bool {
+	l := []byte(strings.TrimSpace(left))
+	r := []byte(strings.TrimSpace(right))
+	if len(l) == 0 || len(r) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(l, r) == 1
 }
 
 func collectAdminRPOrigins(baseRPOrigin string, adminRPOriginsRaw string, adminAPIHost string) []string {

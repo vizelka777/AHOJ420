@@ -1,0 +1,39 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Create Admin User</h1>
+  <p class="hint">This will create a separate admin account and generate a one-time invite link.</p>
+  {{if .Error}}
+    <div class="error">{{.Error}}</div>
+  {{end}}
+
+  <form method="post" action="/admin/admins/new">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <div class="row">
+      <div>
+        <label for="login">Login</label>
+        <input id="login" type="text" name="login" value="{{.Login}}" required>
+      </div>
+      <div>
+        <label for="display_name">Display name</label>
+        <input id="display_name" type="text" name="display_name" value="{{.DisplayName}}">
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="invite_ttl_hours">Invite TTL (hours)</label>
+        <input id="invite_ttl_hours" type="text" name="invite_ttl_hours" value="{{.InviteTTLHours}}">
+      </div>
+      <div>
+        <label for="invite_note">Invite note (optional)</label>
+        <input id="invite_note" type="text" name="invite_note" value="{{.InviteNote}}">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit">Create admin + invite</button>
+      <a class="btn secondary" href="/admin/admins">Cancel</a>
+    </div>
+  </form>
+</div>
+{{end}}

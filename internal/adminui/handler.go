@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +28,9 @@ import (
 )
 
 const (
-	flashCookieName  = "admin_ui_flash"
-	auditLogPageSize = 25
+	flashCookieName       = "admin_ui_flash"
+	auditLogPageSize      = 25
+	defaultInviteTTLHours = 24
 )
 
 type OIDCClientStore interface {
@@ -39,6 +42,18 @@ type OIDCClientStore interface {
 	ReplaceOIDCClientRedirectURIs(clientID string, uris []string) error
 	AddOIDCClientSecret(clientID string, plainSecret string, label string) error
 	RevokeOIDCClientSecret(clientID string, secretID int64) error
+	CreateAdminUser(login string, displayName string) (*store.AdminUser, error)
+	GetAdminUser(id string) (*store.AdminUser, error)
+	GetAdminUserByLogin(login string) (*store.AdminUser, error)
+	ListAdminUsers() ([]store.AdminUser, error)
+	SetAdminUserEnabled(id string, enabled bool) error
+	CountEnabledAdminUsers() (int, error)
+	CountAdminCredentialsForUser(adminUserID string) (int, error)
+	CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*store.AdminInvite, error)
+	GetAdminInviteByID(ctx context.Context, inviteID int64) (*store.AdminInvite, error)
+	GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error)
+	RevokeAdminInvite(ctx context.Context, inviteID int64) error
+	ListAdminInvites(ctx context.Context, adminUserID string) ([]store.AdminInvite, error)
 }
 
 type OIDCClientReloader interface {
@@ -61,6 +76,7 @@ type SessionAuth interface {
 	ListSessions(c echo.Context) ([]store.AdminSessionInfo, error)
 	LogoutSessionByID(c echo.Context, sessionID string) error
 	LogoutOtherSessions(c echo.Context) (int, error)
+	InvalidateSessionsForAdminUser(ctx context.Context, adminUserID string) (int, error)
 	RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc
 	AttachSessionActorMiddleware() echo.MiddlewareFunc
 }
@@ -263,6 +279,75 @@ type securityPageData struct {
 	Error    string
 }
 
+type adminUserListItem struct {
+	ID                string
+	Login             string
+	DisplayName       string
+	Enabled           bool
+	CreatedAt         time.Time
+	CredentialCount   int
+	ActiveInviteCount int
+}
+
+type adminsListPageData struct {
+	layoutData
+	Admins []adminUserListItem
+	Error  string
+}
+
+type adminNewPageData struct {
+	layoutData
+	Login          string
+	DisplayName    string
+	InviteNote     string
+	InviteTTLHours int
+	Error          string
+}
+
+type adminInviteCreatedPageData struct {
+	layoutData
+	Admin      *store.AdminUser
+	InviteID   int64
+	InviteNote string
+	ExpiresAt  time.Time
+	InviteURL  string
+	Token      string
+}
+
+type adminInviteView struct {
+	ID        int64
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	UsedAt    *time.Time
+	RevokedAt *time.Time
+	Note      string
+	Status    string
+}
+
+type adminDetailPageData struct {
+	layoutData
+	TargetAdmin           *store.AdminUser
+	CredentialCount       int
+	ActiveInviteCount     int
+	Invites               []adminInviteView
+	DefaultInviteNote     string
+	DefaultInviteTTLHours int
+	Error                 string
+}
+
+type inviteAcceptPageData struct {
+	layoutData
+	InviteToken string
+	AdminLogin  string
+	DisplayName string
+	ExpiresAt   time.Time
+}
+
+type inviteInvalidPageData struct {
+	layoutData
+	Error string
+}
+
 func NewHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditStore AdminAuditStore, sessionAuth SessionAuth) (*Handler, error) {
 	if clientStore == nil {
 		return nil, fmt.Errorf("adminui requires oidc client store")
@@ -285,12 +370,22 @@ func NewHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditS
 
 func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/login", handler.LoginPage)
+	group.GET("/invite", handler.InviteAcceptPage)
+	group.GET("/invite/:token", handler.InviteAcceptPage)
 }
 
 func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
 	group.GET("/audit", handler.AuditLog)
 	group.GET("/security", handler.SecurityPage)
+	group.GET("/admins", handler.AdminsList)
+	group.GET("/admins/new", handler.AdminNew)
+	group.POST("/admins/new", handler.AdminCreate)
+	group.GET("/admins/:id", handler.AdminDetail)
+	group.POST("/admins/:id/invites", handler.AdminInviteCreate)
+	group.POST("/admins/:id/invites/:inviteID/revoke", handler.AdminInviteRevoke)
+	group.POST("/admins/:id/disable", handler.AdminDisable)
+	group.POST("/admins/:id/enable", handler.AdminEnable)
 	group.POST("/logout", handler.Logout)
 	group.POST("/security/passkeys/:id/delete", handler.SecurityPasskeyDelete)
 	group.POST("/security/sessions/:id/logout", handler.SecuritySessionLogout)
@@ -478,6 +573,440 @@ func (h *Handler) SecuritySessionsLogoutOthers(c echo.Context) error {
 		h.setFlash(c, "success", fmt.Sprintf("Signed out %d other session(s)", removed))
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/security")
+}
+
+func (h *Handler) InviteAcceptPage(c echo.Context) error {
+	token := strings.TrimSpace(c.Param("token"))
+	if token == "" {
+		token = strings.TrimSpace(c.QueryParam("token"))
+	}
+	if token == "" {
+		return h.render(c, http.StatusBadRequest, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Invite token is missing",
+		})
+	}
+
+	invite, err := h.store.GetActiveAdminInviteByTokenHash(c.Request().Context(), hashInviteToken(token))
+	if err != nil {
+		return h.render(c, http.StatusBadRequest, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Invite is invalid, expired, revoked, or already used",
+		})
+	}
+
+	targetAdmin, err := h.store.GetAdminUser(invite.AdminUserID)
+	if err != nil || targetAdmin == nil {
+		return h.render(c, http.StatusBadRequest, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Invite target admin user does not exist",
+		})
+	}
+	if !targetAdmin.Enabled {
+		return h.render(c, http.StatusForbidden, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Invite target admin user is disabled",
+		})
+	}
+
+	credentialCount, err := h.store.CountAdminCredentialsForUser(targetAdmin.ID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Failed to validate invite target",
+		})
+	}
+	if credentialCount > 0 {
+		return h.render(c, http.StatusConflict, "invite_invalid.html", inviteInvalidPageData{
+			layoutData: layoutData{Title: "Admin Invite"},
+			Error:      "Invite can only be used for admin without passkeys",
+		})
+	}
+
+	return h.render(c, http.StatusOK, "invite_accept.html", inviteAcceptPageData{
+		layoutData:  layoutData{Title: "Admin Invite"},
+		InviteToken: token,
+		AdminLogin:  targetAdmin.Login,
+		DisplayName: targetAdmin.DisplayName,
+		ExpiresAt:   invite.ExpiresAt,
+	})
+}
+
+func (h *Handler) AdminsList(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	admins, err := h.store.ListAdminUsers()
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "admins_list.html", adminsListPageData{
+			layoutData: h.newLayoutData(c, adminUser, "Admins"),
+			Error:      "Failed to load admin users",
+		})
+	}
+
+	items := make([]adminUserListItem, 0, len(admins))
+	for _, item := range admins {
+		items = append(items, adminUserListItem{
+			ID:                strings.TrimSpace(item.ID),
+			Login:             strings.TrimSpace(item.Login),
+			DisplayName:       strings.TrimSpace(item.DisplayName),
+			Enabled:           item.Enabled,
+			CreatedAt:         item.CreatedAt,
+			CredentialCount:   item.CredentialCount,
+			ActiveInviteCount: item.ActiveInviteCount,
+		})
+	}
+
+	return h.render(c, http.StatusOK, "admins_list.html", adminsListPageData{
+		layoutData: h.newLayoutData(c, adminUser, "Admins"),
+		Admins:     items,
+	})
+}
+
+func (h *Handler) AdminNew(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	return h.render(c, http.StatusOK, "admin_new.html", adminNewPageData{
+		layoutData:     h.newLayoutData(c, adminUser, "New Admin"),
+		InviteTTLHours: defaultInviteTTLHours,
+	})
+}
+
+func (h *Handler) AdminCreate(c echo.Context) error {
+	currentAdmin := h.currentAdmin(c)
+	createdByID := ""
+	if currentAdmin != nil {
+		createdByID = strings.TrimSpace(currentAdmin.ID)
+	}
+	if createdByID == "" {
+		return c.String(http.StatusUnauthorized, "admin session is required")
+	}
+	login := strings.TrimSpace(c.FormValue("login"))
+	displayName := strings.TrimSpace(c.FormValue("display_name"))
+	inviteNote := strings.TrimSpace(c.FormValue("invite_note"))
+	inviteTTLHours := parseInviteTTLHours(c.FormValue("invite_ttl_hours"), defaultInviteTTLHours)
+
+	renderFormError := func(message string, status int) error {
+		return h.render(c, status, "admin_new.html", adminNewPageData{
+			layoutData:     h.newLayoutData(c, currentAdmin, "New Admin"),
+			Login:          login,
+			DisplayName:    displayName,
+			InviteNote:     inviteNote,
+			InviteTTLHours: inviteTTLHours,
+			Error:          strings.TrimSpace(message),
+		})
+	}
+
+	if login == "" {
+		return renderFormError("Login is required", http.StatusBadRequest)
+	}
+	if _, err := h.store.GetAdminUserByLogin(login); err == nil {
+		return renderFormError("Admin login already exists", http.StatusConflict)
+	} else if !errors.Is(err, store.ErrAdminUserNotFound) {
+		return renderFormError("Failed to validate admin login uniqueness", http.StatusInternalServerError)
+	}
+
+	targetAdmin, err := h.store.CreateAdminUser(login, displayName)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.create.failure", false, "admin_user", "", err, map[string]any{
+			"login": login,
+		})
+		return renderFormError("Failed to create admin user", http.StatusInternalServerError)
+	}
+	h.auditAdminAction(c, "admin.user.create.success", true, "admin_user", targetAdmin.ID, nil, map[string]any{
+		"login":        targetAdmin.Login,
+		"display_name": targetAdmin.DisplayName,
+	})
+
+	token, err := newInviteToken()
+	if err != nil {
+		h.auditAdminAction(c, "admin.invite.create.failure", false, "admin_invite", "", err, map[string]any{
+			"admin_user_id": targetAdmin.ID,
+		})
+		return renderFormError("Admin created, but failed to generate invite token", http.StatusInternalServerError)
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(inviteTTLHours) * time.Hour)
+	invite, err := h.store.CreateAdminInvite(c.Request().Context(), targetAdmin.ID, createdByID, hashInviteToken(token), expiresAt, inviteNote)
+	if err != nil {
+		h.auditAdminAction(c, "admin.invite.create.failure", false, "admin_invite", "", err, map[string]any{
+			"admin_user_id": targetAdmin.ID,
+			"expires_at":    expiresAt.Format(time.RFC3339),
+		})
+		return renderFormError("Admin created, but failed to create invite", http.StatusInternalServerError)
+	}
+
+	h.auditAdminAction(c, "admin.invite.create.success", true, "admin_invite", strconv.FormatInt(invite.ID, 10), nil, map[string]any{
+		"admin_user_id": targetAdmin.ID,
+		"expires_at":    invite.ExpiresAt.Format(time.RFC3339),
+		"note":          invite.Note,
+	})
+
+	return h.render(c, http.StatusCreated, "admin_invite_created.html", adminInviteCreatedPageData{
+		layoutData: h.newLayoutData(c, currentAdmin, "Admin Invite Created"),
+		Admin:      targetAdmin,
+		InviteID:   invite.ID,
+		InviteNote: invite.Note,
+		ExpiresAt:  invite.ExpiresAt,
+		InviteURL:  buildInviteURL(c, token),
+		Token:      token,
+	})
+}
+
+func (h *Handler) AdminDetail(c echo.Context) error {
+	currentAdmin := h.currentAdmin(c)
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	if targetAdminID == "" {
+		return h.render(c, http.StatusBadRequest, "admin_detail.html", adminDetailPageData{
+			layoutData: h.newLayoutData(c, currentAdmin, "Admin"),
+			Error:      "Admin user ID is required",
+		})
+	}
+
+	targetAdmin, err := h.store.GetAdminUser(targetAdminID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "Failed to load admin user"
+		if errors.Is(err, store.ErrAdminUserNotFound) {
+			status = http.StatusNotFound
+			message = "Admin user not found"
+		}
+		return h.render(c, status, "admin_detail.html", adminDetailPageData{
+			layoutData: h.newLayoutData(c, currentAdmin, "Admin"),
+			Error:      message,
+		})
+	}
+
+	credentialCount, err := h.store.CountAdminCredentialsForUser(targetAdmin.ID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "admin_detail.html", adminDetailPageData{
+			layoutData:  h.newLayoutData(c, currentAdmin, "Admin"),
+			TargetAdmin: targetAdmin,
+			Error:       "Failed to load admin credentials",
+		})
+	}
+
+	invitesRaw, err := h.store.ListAdminInvites(c.Request().Context(), targetAdmin.ID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "admin_detail.html", adminDetailPageData{
+			layoutData:  h.newLayoutData(c, currentAdmin, "Admin"),
+			TargetAdmin: targetAdmin,
+			Error:       "Failed to load admin invites",
+		})
+	}
+
+	now := time.Now().UTC()
+	activeInviteCount := 0
+	invites := make([]adminInviteView, 0, len(invitesRaw))
+	for _, invite := range invitesRaw {
+		status := "active"
+		switch {
+		case invite.UsedAt != nil:
+			status = "used"
+		case invite.RevokedAt != nil:
+			status = "revoked"
+		case !invite.ExpiresAt.After(now):
+			status = "expired"
+		default:
+			activeInviteCount++
+		}
+		invites = append(invites, adminInviteView{
+			ID:        invite.ID,
+			CreatedAt: invite.CreatedAt,
+			ExpiresAt: invite.ExpiresAt,
+			UsedAt:    invite.UsedAt,
+			RevokedAt: invite.RevokedAt,
+			Note:      invite.Note,
+			Status:    status,
+		})
+	}
+
+	return h.render(c, http.StatusOK, "admin_detail.html", adminDetailPageData{
+		layoutData:            h.newLayoutData(c, currentAdmin, "Admin: "+targetAdmin.Login),
+		TargetAdmin:           targetAdmin,
+		CredentialCount:       credentialCount,
+		ActiveInviteCount:     activeInviteCount,
+		Invites:               invites,
+		DefaultInviteTTLHours: defaultInviteTTLHours,
+	})
+}
+
+func (h *Handler) AdminInviteCreate(c echo.Context) error {
+	currentAdmin := h.currentAdmin(c)
+	createdByID := ""
+	if currentAdmin != nil {
+		createdByID = strings.TrimSpace(currentAdmin.ID)
+	}
+	if createdByID == "" {
+		return c.String(http.StatusUnauthorized, "admin session is required")
+	}
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	note := strings.TrimSpace(c.FormValue("note"))
+	ttlHours := parseInviteTTLHours(c.FormValue("ttl_hours"), defaultInviteTTLHours)
+
+	targetAdmin, err := h.store.GetAdminUser(targetAdminID)
+	if err != nil {
+		h.setFlash(c, "error", "Admin user not found")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+	if !targetAdmin.Enabled {
+		h.setFlash(c, "error", "Cannot create invite for disabled admin user")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdmin.ID)
+	}
+
+	credentialCount, err := h.store.CountAdminCredentialsForUser(targetAdmin.ID)
+	if err != nil {
+		h.setFlash(c, "error", "Failed to validate target admin")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdmin.ID)
+	}
+	if credentialCount > 0 {
+		h.setFlash(c, "error", "Invite flow is for admin without passkeys")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdmin.ID)
+	}
+
+	token, err := newInviteToken()
+	if err != nil {
+		h.auditAdminAction(c, "admin.invite.create.failure", false, "admin_invite", "", err, map[string]any{"admin_user_id": targetAdmin.ID})
+		h.setFlash(c, "error", "Failed to generate invite token")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdmin.ID)
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(ttlHours) * time.Hour)
+	invite, err := h.store.CreateAdminInvite(c.Request().Context(), targetAdmin.ID, createdByID, hashInviteToken(token), expiresAt, note)
+	if err != nil {
+		h.auditAdminAction(c, "admin.invite.create.failure", false, "admin_invite", "", err, map[string]any{
+			"admin_user_id": targetAdmin.ID,
+			"expires_at":    expiresAt.Format(time.RFC3339),
+		})
+		h.setFlash(c, "error", "Failed to create invite")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdmin.ID)
+	}
+
+	h.auditAdminAction(c, "admin.invite.create.success", true, "admin_invite", strconv.FormatInt(invite.ID, 10), nil, map[string]any{
+		"admin_user_id": targetAdmin.ID,
+		"expires_at":    invite.ExpiresAt.Format(time.RFC3339),
+		"note":          invite.Note,
+	})
+
+	return h.render(c, http.StatusCreated, "admin_invite_created.html", adminInviteCreatedPageData{
+		layoutData: h.newLayoutData(c, currentAdmin, "Admin Invite Created"),
+		Admin:      targetAdmin,
+		InviteID:   invite.ID,
+		InviteNote: invite.Note,
+		ExpiresAt:  invite.ExpiresAt,
+		InviteURL:  buildInviteURL(c, token),
+		Token:      token,
+	})
+}
+
+func (h *Handler) AdminInviteRevoke(c echo.Context) error {
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	inviteID, err := strconv.ParseInt(strings.TrimSpace(c.Param("inviteID")), 10, 64)
+	if err != nil || inviteID <= 0 {
+		h.setFlash(c, "error", "Invalid invite ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	invite, err := h.store.GetAdminInviteByID(c.Request().Context(), inviteID)
+	if err != nil || strings.TrimSpace(invite.AdminUserID) != targetAdminID {
+		h.auditAdminAction(c, "admin.invite.revoke.failure", false, "admin_invite", strconv.FormatInt(inviteID, 10), err, map[string]any{
+			"admin_user_id": targetAdminID,
+		})
+		h.setFlash(c, "error", "Invite not found")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	if err := h.store.RevokeAdminInvite(c.Request().Context(), inviteID); err != nil {
+		h.auditAdminAction(c, "admin.invite.revoke.failure", false, "admin_invite", strconv.FormatInt(inviteID, 10), err, map[string]any{
+			"admin_user_id": targetAdminID,
+		})
+		h.setFlash(c, "error", "Invite cannot be revoked")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	h.auditAdminAction(c, "admin.invite.revoke.success", true, "admin_invite", strconv.FormatInt(inviteID, 10), nil, map[string]any{
+		"admin_user_id": targetAdminID,
+	})
+	h.setFlash(c, "success", "Invite revoked")
+	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+}
+
+func (h *Handler) AdminDisable(c echo.Context) error {
+	currentAdmin := h.currentAdmin(c)
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	if targetAdminID == "" {
+		h.setFlash(c, "error", "Invalid admin user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+
+	if currentAdmin != nil && strings.TrimSpace(currentAdmin.ID) == targetAdminID {
+		h.setFlash(c, "error", "Self-disable is blocked")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	targetAdmin, err := h.store.GetAdminUser(targetAdminID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.disable.failure", false, "admin_user", targetAdminID, err, nil)
+		h.setFlash(c, "error", "Admin user not found")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+	if !targetAdmin.Enabled {
+		h.setFlash(c, "success", "Admin user is already disabled")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	enabledCount, err := h.store.CountEnabledAdminUsers()
+	if err != nil {
+		h.setFlash(c, "error", "Failed to validate enabled admins")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+	if enabledCount <= 1 {
+		h.setFlash(c, "error", "Cannot disable last enabled admin")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	if err := h.store.SetAdminUserEnabled(targetAdminID, false); err != nil {
+		h.auditAdminAction(c, "admin.user.disable.failure", false, "admin_user", targetAdminID, err, nil)
+		h.setFlash(c, "error", "Failed to disable admin user")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	removedSessions, err := h.auth.InvalidateSessionsForAdminUser(c.Request().Context(), targetAdminID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.disable.failure", false, "admin_user", targetAdminID, err, map[string]any{"phase": "session_invalidation"})
+		h.setFlash(c, "error", "Admin disabled but failed to invalidate sessions")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	h.auditAdminAction(c, "admin.user.disable.success", true, "admin_user", targetAdminID, nil, map[string]any{
+		"invalidated_sessions": removedSessions,
+	})
+	h.setFlash(c, "success", "Admin user disabled")
+	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+}
+
+func (h *Handler) AdminEnable(c echo.Context) error {
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	if targetAdminID == "" {
+		h.setFlash(c, "error", "Invalid admin user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+
+	targetAdmin, err := h.store.GetAdminUser(targetAdminID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.enable.failure", false, "admin_user", targetAdminID, err, nil)
+		h.setFlash(c, "error", "Admin user not found")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+	if targetAdmin.Enabled {
+		h.setFlash(c, "success", "Admin user is already enabled")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	if err := h.store.SetAdminUserEnabled(targetAdminID, true); err != nil {
+		h.auditAdminAction(c, "admin.user.enable.failure", false, "admin_user", targetAdminID, err, nil)
+		h.setFlash(c, "error", "Failed to enable admin user")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	h.auditAdminAction(c, "admin.user.enable.success", true, "admin_user", targetAdminID, nil, nil)
+	h.setFlash(c, "success", "Admin user enabled")
+	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
 }
 
 func (h *Handler) LoginPage(c echo.Context) error {
@@ -1853,6 +2382,104 @@ func (h *Handler) logAndAudit(c echo.Context, action string, clientID string, se
 	if err := h.auditStore.CreateAdminAuditEntry(c.Request().Context(), entry); err != nil {
 		log.Printf("admin ui audit insert failed action=%s client_id=%s request_id=%s error=%v", action, clientID, reqID, err)
 	}
+}
+
+func (h *Handler) auditAdminAction(c echo.Context, action string, success bool, resourceType string, resourceID string, opErr error, details map[string]any) {
+	reqID := requestID(c)
+	realIP := strings.TrimSpace(c.RealIP())
+	actorType, actorID := admin.AdminActorFromContext(c)
+	if actorType == "" {
+		actorType = "unknown"
+	}
+	if actorID == "" {
+		actorID = "unknown"
+	}
+
+	if success {
+		log.Printf("admin ui action=%s actor_type=%s actor_id=%s resource_type=%s resource_id=%s ip=%s request_id=%s success=true", action, actorType, actorID, strings.TrimSpace(resourceType), strings.TrimSpace(resourceID), realIP, reqID)
+	} else {
+		log.Printf("admin ui action=%s actor_type=%s actor_id=%s resource_type=%s resource_id=%s ip=%s request_id=%s success=false error=operation_failed", action, actorType, actorID, strings.TrimSpace(resourceType), strings.TrimSpace(resourceID), realIP, reqID)
+	}
+
+	if h.auditStore == nil {
+		return
+	}
+	payload := map[string]any{}
+	for key, value := range details {
+		trimmed := strings.ToLower(strings.TrimSpace(key))
+		if trimmed == "" {
+			continue
+		}
+		payload[trimmed] = sanitizeAuditDetails(value)
+	}
+	if opErr != nil && payload["error"] == nil {
+		payload["error"] = "operation_failed"
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		encoded = json.RawMessage(`{}`)
+	}
+	entry := store.AdminAuditEntry{
+		Action:       strings.TrimSpace(action),
+		Success:      success,
+		ActorType:    actorType,
+		ActorID:      actorID,
+		RemoteIP:     realIP,
+		RequestID:    reqID,
+		ResourceType: strings.TrimSpace(resourceType),
+		ResourceID:   strings.TrimSpace(resourceID),
+		DetailsJSON:  encoded,
+	}
+	if err := h.auditStore.CreateAdminAuditEntry(c.Request().Context(), entry); err != nil {
+		log.Printf("admin ui audit insert failed action=%s resource_type=%s resource_id=%s request_id=%s error=%v", action, resourceType, resourceID, reqID, err)
+	}
+}
+
+func parseInviteTTLHours(raw string, fallback int) int {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		if fallback > 0 {
+			return fallback
+		}
+		return defaultInviteTTLHours
+	}
+	hours, err := strconv.Atoi(value)
+	if err != nil || hours <= 0 {
+		return fallback
+	}
+	if hours > 24*30 {
+		return 24 * 30
+	}
+	return hours
+}
+
+func newInviteToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func hashInviteToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func buildInviteURL(c echo.Context, token string) string {
+	scheme := strings.TrimSpace(c.Scheme())
+	if scheme == "" {
+		scheme = "https"
+	}
+	host := strings.TrimSpace(c.Request().Host)
+	if host == "" {
+		host = "admin.ahoj420.eu"
+	}
+	return scheme + "://" + host + "/admin/invite/" + url.PathEscape(strings.TrimSpace(token))
 }
 
 func (h *Handler) setFlash(c echo.Context, kind string, message string) {

@@ -1,0 +1,38 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Admin Invite Created</h1>
+  <p class="hint">Copy this invite now. It will not be shown again.</p>
+
+  <div class="grid2" style="margin-top:14px;">
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Target Admin</h2>
+      <dl class="kv">
+        <dt>Login</dt>
+        <dd class="mono">{{.Admin.Login}}</dd>
+        <dt>Display name</dt>
+        <dd>{{if .Admin.DisplayName}}{{.Admin.DisplayName}}{{else}}-{{end}}</dd>
+        <dt>Invite ID</dt>
+        <dd class="mono">{{.InviteID}}</dd>
+        <dt>Expires at</dt>
+        <dd class="mono">{{formatTime .ExpiresAt}}</dd>
+      </dl>
+    </div>
+
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">One-time Token</h2>
+      <label for="invite_token_copy">Invite token</label>
+      <input id="invite_token_copy" type="text" readonly value="{{.Token}}" class="mono">
+      <label for="invite_link_copy" style="margin-top:10px;">Invite URL</label>
+      <input id="invite_link_copy" type="text" readonly value="{{.InviteURL}}" class="mono">
+      {{if .InviteNote}}
+        <p class="hint">Note: {{.InviteNote}}</p>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="actions">
+    <a class="btn secondary" href="/admin/admins/{{.Admin.ID}}">Back to admin detail</a>
+    <a class="btn secondary" href="/admin/admins">Back to admins</a>
+  </div>
+</div>
+{{end}}

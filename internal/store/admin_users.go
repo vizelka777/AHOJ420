@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -21,13 +22,15 @@ var (
 )
 
 type AdminUser struct {
-	ID          string
-	Login       string
-	DisplayName string
-	Enabled     bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	Credentials []webauthn.Credential
+	ID                string
+	Login             string
+	DisplayName       string
+	Enabled           bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	CredentialCount   int
+	ActiveInviteCount int
+	Credentials       []webauthn.Credential
 }
 
 type AdminCredentialInfo struct {
@@ -67,6 +70,72 @@ func (s *Store) CountAdminUsers() (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func (s *Store) CountEnabledAdminUsers() (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admin_users WHERE enabled = true`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) ListAdminUsers() ([]AdminUser, error) {
+	rows, err := s.db.Query(`
+		SELECT
+			u.id::text,
+			u.login,
+			u.display_name,
+			u.enabled,
+			u.created_at,
+			u.updated_at,
+			COALESCE(c.credential_count, 0),
+			COALESCE(i.active_invite_count, 0)
+		FROM admin_users u
+		LEFT JOIN (
+			SELECT admin_user_id, COUNT(*) AS credential_count
+			FROM admin_credentials
+			GROUP BY admin_user_id
+		) c ON c.admin_user_id = u.id
+		LEFT JOIN (
+			SELECT admin_user_id, COUNT(*) AS active_invite_count
+			FROM admin_invites
+			WHERE used_at IS NULL
+			  AND revoked_at IS NULL
+			  AND expires_at > NOW()
+			GROUP BY admin_user_id
+		) i ON i.admin_user_id = u.id
+		ORDER BY u.created_at ASC, lower(u.login) ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]AdminUser, 0, 8)
+	for rows.Next() {
+		var item AdminUser
+		if err := rows.Scan(
+			&item.ID,
+			&item.Login,
+			&item.DisplayName,
+			&item.Enabled,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.CredentialCount,
+			&item.ActiveInviteCount,
+		); err != nil {
+			return nil, err
+		}
+		item.Login = normalizeAdminLogin(item.Login)
+		item.DisplayName = strings.TrimSpace(item.DisplayName)
+		item.Credentials = []webauthn.Credential{}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) CountAdminCredentials() (int, error) {
@@ -138,7 +207,16 @@ func (s *Store) GetAdminUser(id string) (*AdminUser, error) {
 		return nil, err
 	}
 	out.Credentials = credentials
+	out.CredentialCount = len(credentials)
+	activeInvites, err := s.CountActiveAdminInvitesForUser(context.Background(), out.ID)
+	if err == nil {
+		out.ActiveInviteCount = activeInvites
+	}
 	return &out, nil
+}
+
+func (s *Store) GetAdminUserByID(id string) (*AdminUser, error) {
+	return s.GetAdminUser(id)
 }
 
 func (s *Store) GetAdminUserByLogin(login string) (*AdminUser, error) {
@@ -155,6 +233,29 @@ func (s *Store) GetAdminUserByLogin(login string) (*AdminUser, error) {
 		return nil, err
 	}
 	return s.GetAdminUser(id)
+}
+
+func (s *Store) SetAdminUserEnabled(id string, enabled bool) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ErrAdminUserNotFound
+	}
+	res, err := s.db.Exec(`
+		UPDATE admin_users
+		SET enabled = $2, updated_at = NOW()
+		WHERE id = $1
+	`, id, enabled)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrAdminUserNotFound
+	}
+	return nil
 }
 
 func (s *Store) GetAdminUserByCredentialID(credentialID []byte) (*AdminUser, error) {

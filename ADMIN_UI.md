@@ -9,17 +9,27 @@ Internal server-rendered admin panel for OIDC client management.
 - passkey login via `/admin/auth/login/*`
 - admin self-security page (`/admin/security`) for passkeys + sessions
 - step-up re-auth for sensitive actions (recent passkey assertion required)
+- multi-admin management (`/admin/admins`) with one-time invite onboarding
 - no token fallback for browser UI routes
 - no dynamic registration / no self-service onboarding
 
 ## Routes
 Public:
 - `GET /admin/login`
+- `GET /admin/invite/:token`
 
 Protected (admin session required):
 - `GET /admin/`
 - `GET /admin/audit`
 - `GET /admin/security`
+- `GET /admin/admins`
+- `GET /admin/admins/new`
+- `POST /admin/admins/new`
+- `GET /admin/admins/:id`
+- `POST /admin/admins/:id/invites`
+- `POST /admin/admins/:id/invites/:inviteID/revoke`
+- `POST /admin/admins/:id/enable`
+- `POST /admin/admins/:id/disable`
 - `POST /admin/logout`
 - `POST /admin/security/passkeys/:id/delete`
 - `POST /admin/security/sessions/:id/logout`
@@ -62,6 +72,29 @@ Protected (admin session required):
 - audit actions:
   - `admin.auth.reauth.success`
   - `admin.auth.reauth.failure`
+
+## Multi-admin + Invite flow
+- multiple separate `admin_users` are supported (not just multiple passkeys for one user)
+- create admin flow:
+  - `POST /admin/admins/new` creates a new admin user and an invite
+  - plaintext invite token/link is shown only on immediate success page
+  - plaintext token is not stored in DB, only `token_hash` in `admin_invites`
+- invite accept flow:
+  - `POST /admin/auth/invite/register/begin?token=...`
+  - `POST /admin/auth/invite/register/finish?token=...`
+  - invite is one-time (`used_at` set on success), revoked/expired/used invites are rejected
+  - invite flow is for admin users without credentials; if credentials already exist, flow is blocked
+- admin detail actions:
+  - create/revoke invite
+  - enable/disable admin user
+  - disable invalidates all active sessions of that admin user
+- audit actions:
+  - `admin.user.create.success|failure`
+  - `admin.user.enable.success|failure`
+  - `admin.user.disable.success|failure`
+  - `admin.invite.create.success|failure`
+  - `admin.invite.revoke.success|failure`
+  - `admin.invite.accept.success|failure`
 
 ## Admin security page (`/admin/security`)
 - passkeys:
@@ -106,6 +139,12 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/index.html`
 - `web/templates/admin/audit.html`
 - `web/templates/admin/security.html`
+- `web/templates/admin/admins_list.html`
+- `web/templates/admin/admin_new.html`
+- `web/templates/admin/admin_detail.html`
+- `web/templates/admin/admin_invite_created.html`
+- `web/templates/admin/invite_accept.html`
+- `web/templates/admin/invite_invalid.html`
 - `web/templates/admin/clients_list.html`
 - `web/templates/admin/client_detail.html`
 - `web/templates/admin/client_new.html`

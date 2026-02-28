@@ -1,0 +1,133 @@
+{{define "content"}}
+<div class="panel">
+  {{if .Error}}
+    <div class="error">{{.Error}}</div>
+  {{end}}
+  {{if .TargetAdmin}}
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Admin: {{.TargetAdmin.Login}}</h1>
+        <p class="hint" style="margin:6px 0 0;">Created {{formatTime .TargetAdmin.CreatedAt}}</p>
+      </div>
+      <div class="chips">
+        {{if .TargetAdmin.Enabled}}
+          <span class="chip ok">enabled</span>
+        {{else}}
+          <span class="chip warn">disabled</span>
+        {{end}}
+        <span class="chip">passkeys: {{.CredentialCount}}</span>
+        <span class="chip">active invites: {{.ActiveInviteCount}}</span>
+      </div>
+    </div>
+
+    <div class="grid2" style="margin-top:14px;">
+      <div class="panel" style="margin:0;">
+        <h2 style="margin-top:0;">Profile</h2>
+        <dl class="kv">
+          <dt>Login</dt>
+          <dd class="mono">{{.TargetAdmin.Login}}</dd>
+          <dt>Display name</dt>
+          <dd>{{if .TargetAdmin.DisplayName}}{{.TargetAdmin.DisplayName}}{{else}}-{{end}}</dd>
+          <dt>Status</dt>
+          <dd>{{if .TargetAdmin.Enabled}}Enabled{{else}}Disabled{{end}}</dd>
+        </dl>
+      </div>
+
+      <div class="panel" style="margin:0;">
+        <h2 style="margin-top:0;">Account State</h2>
+        <div class="actions" style="margin-top:0;">
+          {{if .TargetAdmin.Enabled}}
+            <form method="post" action="/admin/admins/{{.TargetAdmin.ID}}/disable" style="margin:0;">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <button type="submit" class="warn">Disable admin</button>
+            </form>
+          {{else}}
+            <form method="post" action="/admin/admins/{{.TargetAdmin.ID}}/enable" style="margin:0;">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <button type="submit">Enable admin</button>
+            </form>
+          {{end}}
+          <a class="btn secondary" href="/admin/admins">Back to admins</a>
+        </div>
+      </div>
+    </div>
+  {{end}}
+</div>
+
+{{if .TargetAdmin}}
+<div class="panel">
+  <h2 style="margin-top:0;">Create Invite</h2>
+  <p class="hint">Plaintext invite token will be shown only once on the next page.</p>
+  <form method="post" action="/admin/admins/{{.TargetAdmin.ID}}/invites">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <div class="row">
+      <div>
+        <label for="note">Note</label>
+        <input id="note" type="text" name="note" value="{{.DefaultInviteNote}}">
+      </div>
+      <div>
+        <label for="ttl_hours">TTL (hours)</label>
+        <input id="ttl_hours" type="text" name="ttl_hours" value="{{.DefaultInviteTTLHours}}">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit">Create invite</button>
+    </div>
+  </form>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0;">Invites</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Expires</th>
+          <th>Used</th>
+          <th>Revoked</th>
+          <th>Note</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{if .Invites}}
+          {{range .Invites}}
+            <tr>
+              <td class="mono">{{.ID}}</td>
+              <td>
+                {{if eq .Status "active"}}<span class="chip ok">active</span>{{end}}
+                {{if eq .Status "used"}}<span class="chip">used</span>{{end}}
+                {{if eq .Status "revoked"}}<span class="chip warn">revoked</span>{{end}}
+                {{if eq .Status "expired"}}<span class="chip">expired</span>{{end}}
+              </td>
+              <td class="mono">{{formatTime .CreatedAt}}</td>
+              <td class="mono">{{formatTime .ExpiresAt}}</td>
+              <td class="mono">{{formatTimePtr .UsedAt}}</td>
+              <td class="mono">{{formatTimePtr .RevokedAt}}</td>
+              <td>{{if .Note}}{{.Note}}{{else}}-{{end}}</td>
+              <td>
+                {{if eq .Status "active"}}
+                  <form method="post" action="/admin/admins/{{$.TargetAdmin.ID}}/invites/{{.ID}}/revoke" style="margin:0;">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <button type="submit" class="warn">Revoke</button>
+                  </form>
+                {{else}}
+                  -
+                {{end}}
+              </td>
+            </tr>
+          {{end}}
+        {{else}}
+          <tr>
+            <td colspan="8">No invites found.</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}
+{{end}}

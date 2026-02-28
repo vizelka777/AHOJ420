@@ -109,6 +109,27 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
 CREATE INDEX IF NOT EXISTS admin_credentials_user_idx
     ON admin_credentials (admin_user_id);
 
+CREATE TABLE IF NOT EXISTS admin_invites (
+    id BIGSERIAL PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    admin_user_id UUID NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+    created_by_admin_user_id UUID NOT NULL REFERENCES admin_users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS admin_invites_admin_user_idx
+    ON admin_invites (admin_user_id);
+
+CREATE INDEX IF NOT EXISTS admin_invites_expires_at_idx
+    ON admin_invites (expires_at);
+
+CREATE INDEX IF NOT EXISTS admin_invites_token_hash_idx
+    ON admin_invites (token_hash);
+
 CREATE TABLE IF NOT EXISTS admin_audit_log (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

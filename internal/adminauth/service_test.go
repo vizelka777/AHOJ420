@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -336,6 +337,177 @@ func TestAddPasskeyFlowWhileLoggedIn(t *testing.T) {
 
 	if !auditActionExists(st.auditEntries, "admin.auth.passkey.add.success", true) {
 		t.Fatalf("expected admin.auth.passkey.add.success audit entry")
+	}
+}
+
+func TestInviteAcceptFlowCreatesFirstCredentialAndSession(t *testing.T) {
+	st := newFakeAdminStore()
+	owner, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	target, err := st.CreateAdminUser("second", "Second Admin")
+	if err != nil {
+		t.Fatalf("create target admin: %v", err)
+	}
+	token := "invite-token-1"
+	invite := st.seedInvite(target.ID, owner.ID, hashInviteToken(token), time.Now().UTC().Add(2*time.Hour))
+
+	wa := &fakeWebAuthn{
+		beginRegistrationSession: &webauthn.SessionData{Challenge: "invite-reg"},
+		finishRegistrationCredential: &webauthn.Credential{
+			ID:        []byte("cred-invite"),
+			PublicKey: []byte("pk-invite"),
+		},
+	}
+	svc := newTestAdminAuthService(st, wa)
+	e := echo.New()
+	e.POST("/admin/auth/invite/register/begin", svc.BeginInviteRegistration)
+	e.POST("/admin/auth/invite/register/finish", svc.FinishInviteRegistration)
+
+	beginRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/begin?token="+url.QueryEscape(token), nil, nil, "")
+	if beginRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on invite begin, got %d body=%s", beginRec.Code, beginRec.Body.String())
+	}
+	inviteCookie := responseCookie(beginRec, adminInviteSessionCookieName)
+	if inviteCookie == nil || strings.TrimSpace(inviteCookie.Value) == "" {
+		t.Fatalf("expected %s cookie on invite begin", adminInviteSessionCookieName)
+	}
+
+	finishRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/finish?token="+url.QueryEscape(token), nil, []*http.Cookie{inviteCookie}, "")
+	if finishRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on invite finish, got %d body=%s", finishRec.Code, finishRec.Body.String())
+	}
+	adminSession := responseCookie(finishRec, adminSessionCookieName)
+	if adminSession == nil || strings.TrimSpace(adminSession.Value) == "" {
+		t.Fatalf("expected %s cookie after invite finish", adminSessionCookieName)
+	}
+
+	count, err := st.CountAdminCredentialsForUser(target.ID)
+	if err != nil {
+		t.Fatalf("count target credentials: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected target admin to receive first credential, got %d", count)
+	}
+
+	if _, err := st.GetActiveAdminInviteByTokenHash(context.Background(), hashInviteToken(token)); !errors.Is(err, store.ErrAdminInviteNotFound) {
+		t.Fatalf("expected invite to become inactive after use, err=%v", err)
+	}
+
+	st.mu.Lock()
+	usedAt := st.invites[invite.ID].UsedAt
+	st.mu.Unlock()
+	if usedAt == nil {
+		t.Fatalf("expected invite used_at to be set")
+	}
+
+	if !auditActionExists(st.auditEntries, "admin.invite.accept.success", true) {
+		t.Fatalf("expected admin.invite.accept.success audit entry")
+	}
+}
+
+func TestInviteReuseAndExpiredOrRevokedInviteBlocked(t *testing.T) {
+	st := newFakeAdminStore()
+	owner, _ := st.CreateAdminUser("owner", "Owner")
+	target, _ := st.CreateAdminUser("third", "Third Admin")
+	token := "invite-reuse-token"
+	st.seedInvite(target.ID, owner.ID, hashInviteToken(token), time.Now().UTC().Add(time.Hour))
+
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{
+		beginRegistrationSession: &webauthn.SessionData{Challenge: "invite-reuse"},
+		finishRegistrationCredential: &webauthn.Credential{
+			ID:        []byte("cred-reuse"),
+			PublicKey: []byte("pk-reuse"),
+		},
+	})
+	e := echo.New()
+	e.POST("/admin/auth/invite/register/begin", svc.BeginInviteRegistration)
+	e.POST("/admin/auth/invite/register/finish", svc.FinishInviteRegistration)
+
+	beginRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/begin?token="+url.QueryEscape(token), nil, nil, "")
+	if beginRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on first invite begin, got %d body=%s", beginRec.Code, beginRec.Body.String())
+	}
+	inviteCookie := responseCookie(beginRec, adminInviteSessionCookieName)
+	if inviteCookie == nil {
+		t.Fatalf("expected invite session cookie")
+	}
+	finishRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/finish?token="+url.QueryEscape(token), nil, []*http.Cookie{inviteCookie}, "")
+	if finishRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on first invite finish, got %d body=%s", finishRec.Code, finishRec.Body.String())
+	}
+
+	reuseRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/begin?token="+url.QueryEscape(token), nil, nil, "")
+	if reuseRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invite reuse, got %d body=%s", reuseRec.Code, reuseRec.Body.String())
+	}
+
+	expiredToken := "invite-expired-token"
+	st.seedInvite(target.ID, owner.ID, hashInviteToken(expiredToken), time.Now().UTC().Add(-time.Minute))
+	expiredRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/begin?token="+url.QueryEscape(expiredToken), nil, nil, "")
+	if expiredRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on expired invite, got %d body=%s", expiredRec.Code, expiredRec.Body.String())
+	}
+
+	revokedToken := "invite-revoked-token"
+	revokedInvite := st.seedInvite(target.ID, owner.ID, hashInviteToken(revokedToken), time.Now().UTC().Add(time.Hour))
+	now := time.Now().UTC()
+	st.mu.Lock()
+	item := st.invites[revokedInvite.ID]
+	item.RevokedAt = &now
+	st.invites[revokedInvite.ID] = item
+	st.mu.Unlock()
+
+	revokedRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/invite/register/begin?token="+url.QueryEscape(revokedToken), nil, nil, "")
+	if revokedRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on revoked invite, got %d body=%s", revokedRec.Code, revokedRec.Body.String())
+	}
+}
+
+func TestDisabledAdminCannotLogin(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-disabled"),
+		PublicKey: []byte("pk-disabled"),
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+
+	st.mu.Lock()
+	user := st.users[adminUser.ID]
+	user.Enabled = false
+	st.users[adminUser.ID] = user
+	st.mu.Unlock()
+
+	wa := &fakeWebAuthn{
+		beginLoginSession: &webauthn.SessionData{Challenge: "login-disabled"},
+		finishLoginRawID:  []byte("cred-disabled"),
+		finishLoginCredential: &webauthn.Credential{
+			ID: []byte("cred-disabled"),
+		},
+	}
+	svc := newTestAdminAuthService(st, wa)
+	e := echo.New()
+	e.POST("/admin/auth/login/begin", svc.BeginLogin)
+	e.POST("/admin/auth/login/finish", svc.FinishLogin)
+
+	beginRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/login/begin", nil, nil, "")
+	if beginRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on login begin, got %d body=%s", beginRec.Code, beginRec.Body.String())
+	}
+	loginCookie := responseCookie(beginRec, adminLoginSessionCookieName)
+	if loginCookie == nil {
+		t.Fatalf("expected login session cookie")
+	}
+
+	finishRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/login/finish", nil, []*http.Cookie{loginCookie}, "")
+	if finishRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for disabled admin login, got %d body=%s", finishRec.Code, finishRec.Body.String())
 	}
 }
 
@@ -822,10 +994,12 @@ type fakeAdminStore struct {
 	mu               sync.Mutex
 	nextUserID       int
 	nextCredentialID int64
+	nextInviteID     int64
 	users            map[string]*store.AdminUser
 	usersByLogin     map[string]string
 	credentialOwners map[string]string
 	credentialMeta   map[string]credentialMeta
+	invites          map[int64]store.AdminInvite
 	auditEntries     []store.AdminAuditEntry
 }
 
@@ -842,6 +1016,8 @@ func newFakeAdminStore() *fakeAdminStore {
 		usersByLogin:     make(map[string]string),
 		credentialOwners: make(map[string]string),
 		credentialMeta:   make(map[string]credentialMeta),
+		invites:          make(map[int64]store.AdminInvite),
+		nextInviteID:     1,
 		auditEntries:     make([]store.AdminAuditEntry, 0),
 	}
 }
@@ -1063,6 +1239,73 @@ func (f *fakeAdminStore) CountAdminCredentialsForUser(adminUserID string) (int, 
 		return 0, store.ErrAdminUserNotFound
 	}
 	return len(user.Credentials), nil
+}
+
+func (f *fakeAdminStore) GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return nil, store.ErrAdminInviteNotFound
+	}
+	now := time.Now().UTC()
+	for _, invite := range f.invites {
+		if strings.TrimSpace(invite.TokenHash) != tokenHash {
+			continue
+		}
+		if invite.UsedAt != nil || invite.RevokedAt != nil || !invite.ExpiresAt.After(now) {
+			return nil, store.ErrAdminInviteNotFound
+		}
+		item := invite
+		return &item, nil
+	}
+	return nil, store.ErrAdminInviteNotFound
+}
+
+func (f *fakeAdminStore) MarkAdminInviteUsed(ctx context.Context, inviteID int64, usedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if inviteID <= 0 {
+		return store.ErrAdminInviteNotFound
+	}
+	invite, ok := f.invites[inviteID]
+	if !ok {
+		return store.ErrAdminInviteNotFound
+	}
+	if usedAt.IsZero() {
+		usedAt = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	if invite.UsedAt != nil || invite.RevokedAt != nil || !invite.ExpiresAt.After(now) {
+		return store.ErrAdminInviteInactive
+	}
+	marked := usedAt.UTC()
+	invite.UsedAt = &marked
+	f.invites[inviteID] = invite
+	return nil
+}
+
+func (f *fakeAdminStore) seedInvite(adminUserID string, createdBy string, tokenHash string, expiresAt time.Time) *store.AdminInvite {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.nextInviteID <= 0 {
+		f.nextInviteID = 1
+	}
+	invite := store.AdminInvite{
+		ID:                   f.nextInviteID,
+		TokenHash:            strings.TrimSpace(tokenHash),
+		AdminUserID:          strings.TrimSpace(adminUserID),
+		CreatedByAdminUserID: strings.TrimSpace(createdBy),
+		CreatedAt:            time.Now().UTC(),
+		ExpiresAt:            expiresAt.UTC(),
+	}
+	f.nextInviteID++
+	f.invites[invite.ID] = invite
+	copyInvite := invite
+	return &copyInvite
 }
 
 func (f *fakeAdminStore) CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error {

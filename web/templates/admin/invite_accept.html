@@ -1,0 +1,132 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Admin Invite</h1>
+  <p>You are invited to register as admin <strong>{{.AdminLogin}}</strong>.</p>
+  <p class="hint">Invite expires at {{formatTime .ExpiresAt}}</p>
+
+  <input type="hidden" id="invite_token" value="{{.InviteToken}}">
+  <div id="invite_error" class="error" style="display:none;"></div>
+  <div class="actions">
+    <button type="button" id="invite_register_btn">Register passkey</button>
+    <a class="btn secondary" href="/admin/login">Back to login</a>
+  </div>
+</div>
+
+<script>
+(function () {
+  const btn = document.getElementById("invite_register_btn");
+  const errorBox = document.getElementById("invite_error");
+  const tokenInput = document.getElementById("invite_token");
+  if (!btn || !tokenInput) {
+    return;
+  }
+
+  function showError(message) {
+    errorBox.style.display = "block";
+    errorBox.textContent = message || "Invite registration failed";
+  }
+
+  function hideError() {
+    errorBox.style.display = "none";
+    errorBox.textContent = "";
+  }
+
+  function b64uToBytes(value) {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(base64);
+    return Uint8Array.from(bin, function (ch) { return ch.charCodeAt(0); });
+  }
+
+  function bytesToB64u(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  async function beginInvite(token) {
+    const res = await fetch("/admin/auth/invite/register/begin?token=" + encodeURIComponent(token), {
+      method: "POST",
+      credentials: "include"
+    });
+    if (!res.ok) {
+      const payload = await res.json().catch(function () { return {}; });
+      throw new Error(payload.message || "Failed to begin invite registration");
+    }
+    const payload = await res.json();
+    return payload.publicKey || payload;
+  }
+
+  async function finishInvite(token, credential) {
+    const transports = credential.response && typeof credential.response.getTransports === "function"
+      ? credential.response.getTransports()
+      : [];
+
+    const body = {
+      id: credential.id,
+      type: credential.type,
+      rawId: bytesToB64u(credential.rawId),
+      response: {
+        attestationObject: bytesToB64u(credential.response.attestationObject),
+        clientDataJSON: bytesToB64u(credential.response.clientDataJSON),
+        transports: transports
+      }
+    };
+
+    const res = await fetch("/admin/auth/invite/register/finish?token=" + encodeURIComponent(token), {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const payload = await res.json().catch(function () { return {}; });
+      throw new Error(payload.message || "Failed to complete invite registration");
+    }
+  }
+
+  btn.addEventListener("click", async function () {
+    const token = String(tokenInput.value || "").trim();
+    if (!token) {
+      showError("Invite token is missing");
+      return;
+    }
+    if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.create) {
+      showError("WebAuthn is not available in this browser");
+      return;
+    }
+
+    hideError();
+    btn.disabled = true;
+    btn.textContent = "Registering passkey...";
+
+    try {
+      const publicKey = await beginInvite(token);
+      publicKey.challenge = b64uToBytes(publicKey.challenge);
+      if (publicKey.user && publicKey.user.id) {
+        publicKey.user.id = b64uToBytes(publicKey.user.id);
+      }
+      if (publicKey.excludeCredentials) {
+        publicKey.excludeCredentials = publicKey.excludeCredentials.map(function (item) {
+          return Object.assign({}, item, { id: b64uToBytes(item.id) });
+        });
+      }
+
+      const credential = await navigator.credentials.create({ publicKey: publicKey });
+      if (!credential) {
+        throw new Error("No credential returned");
+      }
+      await finishInvite(token, credential);
+      window.location.href = "/admin/";
+    } catch (err) {
+      showError(err && err.message ? err.message : "Invite registration failed");
+      btn.disabled = false;
+      btn.textContent = "Register passkey";
+    }
+  });
+})();
+</script>
+{{end}}
