@@ -191,6 +191,22 @@ CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx
 CREATE INDEX IF NOT EXISTS admin_audit_log_resource_idx
     ON admin_audit_log (resource_type, resource_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+    id BIGSERIAL PRIMARY KEY,
+    job_name TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    finished_at TIMESTAMPTZ NOT NULL,
+    success BOOLEAN NOT NULL,
+    details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS maintenance_runs_job_finished_idx
+    ON maintenance_runs (job_name, finished_at DESC);
+
+CREATE INDEX IF NOT EXISTS maintenance_runs_success_finished_idx
+    ON maintenance_runs (success, finished_at DESC);
+
 CREATE TABLE IF NOT EXISTS user_security_events (
     id BIGSERIAL PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/houbamydar/AHOJ420/internal/maintenance"
 )
 
 func TestIsSafeReturnTo(t *testing.T) {
@@ -130,5 +135,46 @@ func TestCleanupCommandPathNoSchemaInitReference(t *testing.T) {
 	}
 	if strings.Contains(fnSource, "Schema init error") {
 		t.Fatalf("cleanup command should not execute schema init")
+	}
+}
+
+func TestMailerConfiguredFromEnv(t *testing.T) {
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("SMTP_FROM", "no-reply@example.com")
+	t.Setenv("SMTP_USERNAME", "")
+	t.Setenv("SMTP_PASSWORD", "")
+	if !mailerConfiguredFromEnv() {
+		t.Fatal("expected mailer configured")
+	}
+
+	t.Setenv("SMTP_HOST", "")
+	if mailerConfiguredFromEnv() {
+		t.Fatal("expected mailer not configured when host is empty")
+	}
+}
+
+func TestSMSConfiguredFromEnv(t *testing.T) {
+	t.Setenv("GOSMS_CLIENT_ID", "id")
+	t.Setenv("GOSMS_CLIENT_SECRET", "secret")
+	t.Setenv("GOSMS_CHANNEL_ID", "123")
+	if !smsConfiguredFromEnv() {
+		t.Fatal("expected sms configured")
+	}
+
+	t.Setenv("GOSMS_CHANNEL_ID", "")
+	if smsConfiguredFromEnv() {
+		t.Fatal("expected sms not configured without channel id")
+	}
+}
+
+func TestRecordRetentionMaintenanceRunNilStore(t *testing.T) {
+	err := recordRetentionMaintenanceRun(context.Background(), nil, maintenance.RetentionRunResult{
+		DryRun:     true,
+		StartedAt:  time.Now().UTC(),
+		FinishedAt: time.Now().UTC(),
+	}, errors.New("boom"))
+	if err != nil {
+		t.Fatalf("recordRetentionMaintenanceRun should ignore nil store: %v", err)
 	}
 }

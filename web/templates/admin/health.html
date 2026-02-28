@@ -1,0 +1,170 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Health / Ops</h1>
+        <p class="hint" style="margin:6px 0 0;">Read-only system status snapshot for manual operations.</p>
+      </div>
+      <div class="hint">Generated: <span class="mono">{{formatTime .Snapshot.GeneratedAt}}</span></div>
+    </div>
+    {{if .Error}}
+      <div class="error" style="margin-top:12px;">{{.Error}}</div>
+    {{end}}
+  </div>
+
+  <div class="grid2">
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Infrastructure</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Component</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>Checked</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Postgres</td>
+              <td><span class="chip {{healthStatusChip .Snapshot.Postgres.Status}}">{{healthStatusLabel .Snapshot.Postgres.Status}}</span></td>
+              <td class="mono">{{if gt .Snapshot.Postgres.LatencyMS 0}}{{.Snapshot.Postgres.LatencyMS}} ms{{else}}-{{end}}</td>
+              <td class="mono">{{formatTime .Snapshot.Postgres.CheckedAt}}</td>
+              <td>{{.Snapshot.Postgres.Message}}</td>
+            </tr>
+            <tr>
+              <td>Redis</td>
+              <td><span class="chip {{healthStatusChip .Snapshot.Redis.Status}}">{{healthStatusLabel .Snapshot.Redis.Status}}</span></td>
+              <td class="mono">{{if gt .Snapshot.Redis.LatencyMS 0}}{{.Snapshot.Redis.LatencyMS}} ms{{else}}-{{end}}</td>
+              <td class="mono">{{formatTime .Snapshot.Redis.CheckedAt}}</td>
+              <td>{{.Snapshot.Redis.Message}}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Delivery</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Component</th>
+              <th>Status</th>
+              <th>Checked</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Mailer</td>
+              <td><span class="chip {{healthStatusChip .Snapshot.Mailer.Status}}">{{healthStatusLabel .Snapshot.Mailer.Status}}</span></td>
+              <td class="mono">{{formatTime .Snapshot.Mailer.CheckedAt}}</td>
+              <td>{{.Snapshot.Mailer.Message}}</td>
+            </tr>
+            <tr>
+              <td>SMS</td>
+              <td><span class="chip {{healthStatusChip .Snapshot.SMS.Status}}">{{healthStatusLabel .Snapshot.SMS.Status}}</span></td>
+              <td class="mono">{{formatTime .Snapshot.SMS.CheckedAt}}</td>
+              <td>{{.Snapshot.SMS.Message}}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Retention</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Table</th>
+            <th>Retention days</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">{{.Snapshot.Retention.AdminAudit.Table}}</td>
+            <td class="mono">{{if .Snapshot.Retention.AdminAudit.Enabled}}{{.Snapshot.Retention.AdminAudit.RetentionDays}}{{else}}-{{end}}</td>
+            <td>{{if .Snapshot.Retention.AdminAudit.Enabled}}<span class="chip ok">enabled{{else}}<span class="chip disabled">disabled{{end}}</span></td>
+          </tr>
+          <tr>
+            <td class="mono">{{.Snapshot.Retention.UserSecurityEvents.Table}}</td>
+            <td class="mono">{{if .Snapshot.Retention.UserSecurityEvents.Enabled}}{{.Snapshot.Retention.UserSecurityEvents.RetentionDays}}{{else}}-{{end}}</td>
+            <td>{{if .Snapshot.Retention.UserSecurityEvents.Enabled}}<span class="chip ok">enabled{{else}}<span class="chip disabled">disabled{{end}}</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid2" style="margin-top:12px;">
+      <div>
+        <h3 style="margin:0 0 8px;">Last cleanup run</h3>
+        {{if .Snapshot.Retention.LastRun}}
+          <dl class="kv">
+            <dt>Finished</dt><dd class="mono">{{formatTime .Snapshot.Retention.LastRun.FinishedAt}}</dd>
+            <dt>Status</dt><dd>{{if .Snapshot.Retention.LastRun.Success}}<span class="chip ok">success{{else}}<span class="chip warn">failure{{end}}</span></dd>
+            <dt>Mode</dt><dd>{{if .Snapshot.Retention.LastRun.DryRun}}dry-run{{else}}real cleanup{{end}}</dd>
+            <dt>Deleted rows</dt><dd class="mono">{{.Snapshot.Retention.LastRun.DeletedTotal}}</dd>
+          </dl>
+        {{else}}
+          <p class="hint" style="margin:0;">No cleanup runs recorded yet.</p>
+        {{end}}
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px;">Last failed cleanup</h3>
+        {{if .Snapshot.Retention.LastFailure}}
+          <dl class="kv">
+            <dt>Finished</dt><dd class="mono">{{formatTime .Snapshot.Retention.LastFailure.FinishedAt}}</dd>
+            <dt>Error</dt><dd>{{if .Snapshot.Retention.LastFailure.Error}}{{.Snapshot.Retention.LastFailure.Error}}{{else}}(no error detail){{end}}</dd>
+            <dt>Mode</dt><dd>{{if .Snapshot.Retention.LastFailure.DryRun}}dry-run{{else}}real cleanup{{end}}</dd>
+          </dl>
+        {{else}}
+          <p class="hint" style="margin:0;">No failed cleanup runs.</p>
+        {{end}}
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Recent Failures</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Source</th>
+            <th>Event</th>
+            <th>Message</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Snapshot.RecentFailures}}
+            {{range .Snapshot.RecentFailures}}
+              <tr>
+                <td class="mono">{{formatTime .Time}}</td>
+                <td class="mono">{{.Source}}</td>
+                <td class="mono">{{.Event}}</td>
+                <td>{{.Message}}</td>
+                <td>{{if .Link}}<a class="btn secondary" href="{{.Link}}">View</a>{{else}}-{{end}}</td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr>
+              <td colspan="5">No recent failures.</td>
+            </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{{end}}

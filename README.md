@@ -269,6 +269,7 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/invite/:token`
 - `POST /admin/logout`
 - `GET /admin/`
+- `GET /admin/health`
 - `GET /admin/audit`
 - `GET /admin/security`
 - `GET /admin/users`
@@ -327,6 +328,22 @@ Overview dashboard (`GET /admin/`):
 - owner-only blocks:
   - admin users summary (owners/admins/invites)
   - pending active invites list
+
+Health / Ops page (`GET /admin/health`):
+- read-only operator page for quick status checks
+- infrastructure checks:
+  - Postgres (`SELECT 1`)
+  - Redis (`PING`)
+- delivery checks:
+  - Mailer state based on SMTP config presence
+  - SMS state based on GoSMS config presence
+  - page checks do not send real emails/SMS
+- retention status:
+  - shows policy state for `admin_audit_log` and `user_security_events`
+  - shows last cleanup run and last failed run from `maintenance_runs`
+- recent failures block:
+  - failed admin audit entries
+  - failed maintenance runs
 
 Bootstrap first admin:
 1. Set `ADMIN_BOOTSTRAP_LOGIN`.
@@ -426,6 +443,7 @@ Retention cleanup for event tables:
 - cleanup is batched (`DELETE ... LIMIT N`) to avoid giant table locks/transactions
 - per-table retention can be disabled independently by setting retention days to `<=0`
 - dry-run mode computes eligible rows and logs summary without deleting
+- cleanup runs are persisted in `maintenance_runs` and surfaced in `/admin/health`
 - selective cleanup:
   - `--admin-audit-only` processes only `admin_audit_log`
   - `--user-security-only` processes only `user_security_events`

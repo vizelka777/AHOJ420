@@ -4,6 +4,39 @@
 
 ## 2026-02-28
 
+### Health / Ops Page MVP
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Добавлена read-only страница `GET /admin/health` в admin UI.
+- Добавлен health service (`internal/adminui/health.go`), который собирает snapshot:
+  - Postgres check (`SELECT 1`) + latency
+  - Redis check (`PING`) + latency
+  - delivery status (mailer/sms configured/disabled без test-send)
+  - retention policy status по `admin_audit_log` / `user_security_events`
+  - preview recent failures (admin audit failures + maintenance failures)
+- Добавлена таблица `maintenance_runs` в schema и store-методы:
+  - `CreateMaintenanceRun(...)`
+  - `ListMaintenanceRuns(...)`
+- `cleanup-retention` теперь пишет результат запуска в `maintenance_runs` (success/failure + details JSON), что используется на `/admin/health`.
+- Обновлена навигация admin UI: добавлен пункт `Health`.
+- Обновлены шаблоны:
+  - `web/templates/admin/health.html`
+  - `web/templates/admin/layout.html`
+  - `web/templates/admin/index.html` (быстрый переход на Health)
+- Обновлены docs:
+  - `ADMIN_UI.md`
+  - `README.md`
+
+Тесты:
+- `go test ./internal/adminui ./internal/store ./cmd/server` (dockerized Go) — `ok`
+- Добавлены тесты:
+  - `internal/adminui/health_test.go` (status mapping, delivery status, retention/failures aggregation)
+  - `internal/adminui/handler_test.go` для `/admin/health` (session guard, render блоков, доступ owner/admin)
+  - `internal/store/maintenance_runs_test.go`
+  - `cmd/server/main_test.go` (env helpers + persistence helper nil-store path)
+
 ### User Block/Unblock MVP
 - Ветка: `админ`
 - Статус: `implemented` (`local go toolchain unavailable`, тесты добавлены, но локальный `go test` в этом окружении не выполнен)

@@ -144,6 +144,9 @@
     }
     .chip.ok { background: #ebf8f0; border-color: #bfe3cc; color: var(--ok); }
     .chip.warn { background: #fff0f0; border-color: #f0c2c2; color: var(--warn); }
+    .chip.degraded { background: #fff8ea; border-color: #f3d6a3; color: #8b5c07; }
+    .chip.disabled { background: #f1f4f8; border-color: #d8e0ea; color: var(--muted); }
+    .chip.unknown { background: #f4f6f9; border-color: #d6dee8; color: #4b5b6b; }
     .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
     .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
     .kv { margin: 0; }
@@ -163,6 +166,7 @@
         <a href="/admin/"><strong>AHOJ420 Admin</strong></a>
         {{if .Admin}}
           <a href="/admin/">Overview</a>
+          <a href="/admin/health">Health</a>
           <a href="/admin/users">Users</a>
           <a href="/admin/clients">Clients</a>
           <a href="/admin/audit">Audit log</a>

@@ -79,6 +79,126 @@ func TestOverviewRequiresSession(t *testing.T) {
 	}
 }
 
+func TestHealthRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/health", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestHealthRendersSnapshotBlocks(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e, h := setupTestAdminUIWithHandler(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	h.SetHealthProvider(fakeHealthProvider{
+		snapshot: &SystemHealthSnapshot{
+			GeneratedAt: time.Now().UTC(),
+			Postgres: HealthCheckResult{
+				Status:    HealthStatusOK,
+				Message:   "Postgres query ok",
+				LatencyMS: 2,
+				CheckedAt: time.Now().UTC(),
+			},
+			Redis: HealthCheckResult{
+				Status:    HealthStatusDown,
+				Message:   "connection refused",
+				LatencyMS: 1,
+				CheckedAt: time.Now().UTC(),
+			},
+			Mailer: HealthCheckResult{
+				Status:    HealthStatusDisabled,
+				Message:   "not configured",
+				CheckedAt: time.Now().UTC(),
+			},
+			SMS: HealthCheckResult{
+				Status:    HealthStatusOK,
+				Message:   "configured",
+				CheckedAt: time.Now().UTC(),
+			},
+			Retention: RetentionHealth{
+				AdminAudit: RetentionTableHealth{
+					Table:         "admin_audit_log",
+					RetentionDays: 180,
+					Enabled:       true,
+				},
+				UserSecurityEvents: RetentionTableHealth{
+					Table:         "user_security_events",
+					RetentionDays: 0,
+					Enabled:       false,
+				},
+				LastRun: &MaintenanceRunHealth{
+					FinishedAt:   time.Now().UTC(),
+					Success:      true,
+					DryRun:       false,
+					DeletedTotal: 15,
+				},
+			},
+			RecentFailures: []RecentFailureItem{
+				{
+					Time:    time.Now().UTC(),
+					Source:  "admin_audit",
+					Event:   "admin.user.delete.failure",
+					Message: "session_cleanup_failed",
+					Link:    "/admin/audit?success=failure",
+				},
+			},
+		},
+	})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/health", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Health / Ops",
+		"Postgres",
+		"Redis",
+		"Mailer",
+		"SMS",
+		"Retention",
+		"Recent Failures",
+		"admin_audit_log",
+		"user_security_events",
+		"admin.user.delete.failure",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on health page, body=%s", expected, body)
+		}
+	}
+}
+
+func TestHealthNonOwnerStillAccessible(t *testing.T) {
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-2", Login: "ops-admin", DisplayName: "Ops Admin", Role: store.AdminRoleAdmin},
+	}
+	e, h := setupTestAdminUIWithHandler(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	h.SetHealthProvider(fakeHealthProvider{
+		snapshot: &SystemHealthSnapshot{
+			GeneratedAt: time.Now().UTC(),
+			Postgres: HealthCheckResult{
+				Status:    HealthStatusOK,
+				Message:   "Postgres query ok",
+				CheckedAt: time.Now().UTC(),
+			},
+			Redis: HealthCheckResult{
+				Status:    HealthStatusOK,
+				Message:   "Redis ping ok",
+				CheckedAt: time.Now().UTC(),
+			},
+		},
+	})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/health", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestOverviewRendersSummaryAndRecentBlocks(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -2870,6 +2990,15 @@ func (a *fakeAuditStore) CountAdminAuditFailuresSince(ctx context.Context, since
 		count++
 	}
 	return count, nil
+}
+
+type fakeHealthProvider struct {
+	snapshot *SystemHealthSnapshot
+	err      error
+}
+
+func (f fakeHealthProvider) GetSystemHealthSnapshot(ctx context.Context) (*SystemHealthSnapshot, error) {
+	return f.snapshot, f.err
 }
 
 type fakeUIStore struct {

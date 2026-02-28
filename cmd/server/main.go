@@ -184,6 +184,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to init admin UI: %v", err)
 	}
+	adminUIHandler.SetHealthProvider(adminui.NewSystemHealthService(
+		db,
+		rdb,
+		userStore,
+		userStore,
+		adminui.SystemHealthConfig{
+			MailerConfigured:                mailerConfiguredFromEnv(),
+			SMSConfigured:                   smsConfiguredFromEnv(),
+			AdminAuditRetentionDays:         retentionDaysFromEnv("ADMIN_AUDIT_RETENTION_DAYS", maintenance.DefaultRetentionDays),
+			UserSecurityEventsRetentionDays: retentionDaysFromEnv("USER_SECURITY_EVENTS_RETENTION_DAYS", maintenance.DefaultRetentionDays),
+		},
+	))
 	adminUIGroup := e.Group("/admin")
 	adminUIGroup.Use(admin.AdminRequestIDMiddleware())
 	adminUIGroup.Use(admin.AdminHostGuardMiddleware(adminHost))
@@ -307,9 +319,13 @@ func runRetentionCleanupCommand(args []string) error {
 		cfg.DeleteBatchSize = options.BatchSizeOverride
 	}
 
-	result, err := maintenance.RunRetentionCleanup(context.Background(), store.New(db), cfg, options.DryRun)
-	if err != nil {
-		return err
+	dbStore := store.New(db)
+	result, runErr := maintenance.RunRetentionCleanup(context.Background(), dbStore, cfg, options.DryRun)
+	if persistErr := recordRetentionMaintenanceRun(context.Background(), dbStore, result, runErr); persistErr != nil {
+		log.Printf("retention.cleanup.persist.error err=%v", persistErr)
+	}
+	if runErr != nil {
+		return runErr
 	}
 
 	for _, tableResult := range result.Results {
@@ -415,6 +431,87 @@ func boolFromEnv(raw string) bool {
 	}
 	parsed, err := strconv.ParseBool(raw)
 	return err == nil && parsed
+}
+
+func recordRetentionMaintenanceRun(ctx context.Context, dbStore *store.Store, result maintenance.RetentionRunResult, runErr error) error {
+	if dbStore == nil {
+		return nil
+	}
+	details := map[string]any{
+		"dry_run":          result.DryRun,
+		"batch_size":       result.BatchSize,
+		"tables_processed": result.TablesProcessed,
+		"tables_skipped":   result.TablesSkipped,
+		"eligible_total":   result.TotalEligible,
+		"deleted_total":    result.TotalDeleted,
+	}
+	tableResults := make([]map[string]any, 0, len(result.Results))
+	for _, item := range result.Results {
+		entry := map[string]any{
+			"table":          item.Table,
+			"retention_days": item.RetentionDays,
+			"enabled":        item.Enabled,
+			"skipped":        item.Skipped,
+			"eligible_count": item.EligibleCount,
+			"deleted_count":  item.DeletedCount,
+			"batches":        item.Batches,
+			"dry_run":        item.DryRun,
+		}
+		if !item.Cutoff.IsZero() {
+			entry["cutoff"] = item.Cutoff.UTC().Format(time.RFC3339)
+		}
+		tableResults = append(tableResults, entry)
+	}
+	details["tables"] = tableResults
+	if runErr != nil {
+		details["error"] = runErr.Error()
+	}
+
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+
+	startedAt := result.StartedAt.UTC()
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	finishedAt := result.FinishedAt.UTC()
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
+	}
+	return dbStore.CreateMaintenanceRun(ctx, store.MaintenanceRun{
+		JobName:     "cleanup-retention",
+		StartedAt:   startedAt,
+		FinishedAt:  finishedAt,
+		Success:     runErr == nil,
+		DetailsJSON: detailsJSON,
+	})
+}
+
+func mailerConfiguredFromEnv() bool {
+	host := strings.TrimSpace(os.Getenv("SMTP_HOST"))
+	port := strings.TrimSpace(os.Getenv("SMTP_PORT"))
+	from := strings.TrimSpace(os.Getenv("SMTP_FROM"))
+	username := strings.TrimSpace(os.Getenv("SMTP_USERNAME"))
+	password := strings.TrimSpace(os.Getenv("SMTP_PASSWORD"))
+	if host == "" && port == "" && from == "" && username == "" && password == "" {
+		return false
+	}
+	if host == "" || port == "" || from == "" {
+		return false
+	}
+	if (username == "") != (password == "") {
+		return false
+	}
+	return true
+}
+
+func smsConfiguredFromEnv() bool {
+	clientID := strings.TrimSpace(os.Getenv("GOSMS_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GOSMS_CLIENT_SECRET"))
+	channelID := strings.TrimSpace(os.Getenv("GOSMS_CHANNEL_ID"))
+	return clientID != "" && clientSecret != "" && channelID != ""
 }
 
 func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {

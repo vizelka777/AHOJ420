@@ -7,6 +7,7 @@ Internal server-rendered admin panel for OIDC client management.
 - session-only auth (`admin_session` cookie)
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - overview dashboard (`GET /admin/`) with role-aware operational summary
+- health / ops page (`GET /admin/health`) with dependency and maintenance status
 - users support section (`/admin/users`) for end-user lookup and security actions
 - passkey login via `/admin/auth/login/*`
 - admin self-security page (`/admin/security`) for passkeys + sessions
@@ -22,6 +23,7 @@ Public:
 
 Protected (admin session required):
 - `GET /admin/`
+- `GET /admin/health`
 - `GET /admin/audit`
 - `GET /admin/security`
 - `GET /admin/users`
@@ -81,6 +83,23 @@ Protected (admin session required):
   - recent audit
   - recent failures
   - recent client changes
+
+## Health / Ops (`GET /admin/health`)
+- read-only operator page (session + host guard; no mutating actions)
+- infrastructure checks:
+  - Postgres status via lightweight `SELECT 1`
+  - Redis status via `PING`
+  - both show status + latency + check time
+- delivery checks:
+  - Mailer (`SMTP_*`) configured/disabled status
+  - SMS provider (`GOSMS_*`) configured/disabled status
+  - no real email/SMS is sent by page load checks
+- retention block:
+  - per-table policy status for `admin_audit_log` and `user_security_events`
+  - last cleanup run info from `maintenance_runs` (latest run + latest failure)
+- recent failures block:
+  - latest failed admin audit entries
+  - latest failed maintenance runs (e.g. cleanup-retention)
 
 ## Step-up re-authentication
 - endpoints:
@@ -269,6 +288,7 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/layout.html`
 - `web/templates/admin/login.html`
 - `web/templates/admin/index.html`
+- `web/templates/admin/health.html`
 - `web/templates/admin/audit.html`
 - `web/templates/admin/security.html`
 - `web/templates/admin/users_list.html`

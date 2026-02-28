@@ -112,6 +112,7 @@ type Handler struct {
 	reloader     OIDCClientReloader
 	auditStore   AdminAuditStore
 	auth         SessionAuth
+	health       SystemHealthProvider
 	avatarDelete func(ctx context.Context, avatarKey string) error
 	templatesDir string
 }
@@ -218,6 +219,12 @@ type dashboardPageData struct {
 	RecentFailures      []dashboardAuditPreviewItem
 	RecentClientChanges []dashboardAuditPreviewItem
 	PendingInvites      []dashboardPendingInviteItem
+}
+
+type healthPageData struct {
+	layoutData
+	Snapshot *SystemHealthSnapshot
+	Error    string
 }
 
 type clientDetailPageData struct {
@@ -548,6 +555,10 @@ func NewHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditS
 	}, nil
 }
 
+func (h *Handler) SetHealthProvider(provider SystemHealthProvider) {
+	h.health = provider
+}
+
 func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/login", handler.LoginPage)
 	group.GET("/invite", handler.InviteAcceptPage)
@@ -556,6 +567,7 @@ func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 
 func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
+	group.GET("/health", handler.Health)
 	group.GET("/audit", handler.AuditLog)
 	group.GET("/security", handler.SecurityPage)
 	group.GET("/users", handler.UsersList)
@@ -2348,6 +2360,57 @@ func (h *Handler) Logout(c echo.Context) error {
 	return c.Redirect(http.StatusFound, "/admin/login")
 }
 
+func (h *Handler) Health(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	if h.health == nil {
+		return h.render(c, http.StatusOK, "health.html", healthPageData{
+			layoutData: h.newLayoutData(c, adminUser, "System Health"),
+			Snapshot: &SystemHealthSnapshot{
+				GeneratedAt: time.Now().UTC(),
+				Postgres: HealthCheckResult{
+					Status:    HealthStatusUnknown,
+					Message:   "health provider is not configured",
+					CheckedAt: time.Now().UTC(),
+				},
+				Redis: HealthCheckResult{
+					Status:    HealthStatusUnknown,
+					Message:   "health provider is not configured",
+					CheckedAt: time.Now().UTC(),
+				},
+				Mailer: HealthCheckResult{
+					Status:    HealthStatusUnknown,
+					Message:   "health provider is not configured",
+					CheckedAt: time.Now().UTC(),
+				},
+				SMS: HealthCheckResult{
+					Status:    HealthStatusUnknown,
+					Message:   "health provider is not configured",
+					CheckedAt: time.Now().UTC(),
+				},
+			},
+			Error: "Health provider is not configured",
+		})
+	}
+
+	snapshot, err := h.health.GetSystemHealthSnapshot(c.Request().Context())
+	if err != nil {
+		log.Printf("adminui health snapshot failed error=%v", err)
+	}
+	if snapshot == nil {
+		snapshot = &SystemHealthSnapshot{GeneratedAt: time.Now().UTC()}
+	}
+	pageErr := ""
+	if err != nil {
+		pageErr = "Failed to collect full health snapshot"
+	}
+
+	return h.render(c, http.StatusOK, "health.html", healthPageData{
+		layoutData: h.newLayoutData(c, adminUser, "System Health"),
+		Snapshot:   snapshot,
+		Error:      pageErr,
+	})
+}
+
 func (h *Handler) Dashboard(c echo.Context) error {
 	adminUser := h.currentAdmin(c)
 	clients, err := h.store.ListOIDCClients()
@@ -3227,10 +3290,12 @@ func (h *Handler) render(c echo.Context, status int, pageFile string, data any) 
 	pagePath := filepath.Join(h.templatesDir, strings.TrimSpace(pageFile))
 
 	tmpl, err := template.New("layout").Funcs(template.FuncMap{
-		"formatTime":    formatTime,
-		"formatTimePtr": formatTimePtr,
-		"joinComma":     joinComma,
-		"joinLines":     joinLines,
+		"formatTime":        formatTime,
+		"formatTimePtr":     formatTimePtr,
+		"joinComma":         joinComma,
+		"joinLines":         joinLines,
+		"healthStatusChip":  healthStatusChipClass,
+		"healthStatusLabel": healthStatusLabel,
 		"nowUTC": func() time.Time {
 			return time.Now().UTC()
 		},
