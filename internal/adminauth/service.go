@@ -37,6 +37,9 @@ const (
 	userSessionKeyPrefix         = "sess:"
 	userRecoveryKeyPrefix        = "recovery:"
 	userSessionMetaPrefix        = "sessmeta:"
+	userSessionListPrefix        = "sesslist:"
+	userSessionAllPrefix         = "sessall:"
+	userSessionDevicePrefix      = "sessdev:"
 )
 
 var (
@@ -1164,24 +1167,126 @@ func (s *Service) LogoutAllUserSessionsForAdmin(ctx context.Context, userID stri
 	if userID == "" {
 		return 0, errAdminSessionInvalid
 	}
+	return s.revokeAllUserSessionArtifacts(ctx, userID)
+}
 
-	sessions, err := s.ListUserSessionsForAdmin(ctx, userID)
+func addUserSessionID(set map[string]struct{}, value string) {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return
+	}
+	set[normalized] = struct{}{}
+}
+
+func sessionIDFromKey(key string, prefix string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), strings.TrimSpace(prefix)))
+}
+
+func (s *Service) revokeAllUserSessionArtifacts(ctx context.Context, userID string) (int, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return 0, errAdminSessionInvalid
+	}
+
+	sessionSet := make(map[string]struct{}, 16)
+
+	sessionKeys, err := s.stateStore.Keys(ctx, userSessionRedisKey("*"))
 	if err != nil {
 		return 0, err
 	}
-
-	removed := 0
-	for _, session := range sessions {
-		sessionID := strings.TrimSpace(session.SessionID)
+	for _, key := range sessionKeys {
+		sessionID := sessionIDFromKey(key, userSessionKeyPrefix)
 		if sessionID == "" {
 			continue
 		}
+		ownerPayload, getErr := s.stateStore.Get(ctx, userSessionRedisKey(sessionID))
+		if getErr != nil {
+			continue
+		}
+		if strings.TrimSpace(string(ownerPayload)) != userID {
+			continue
+		}
+		addUserSessionID(sessionSet, sessionID)
+	}
+
+	metaKeys, err := s.stateStore.Keys(ctx, userSessionMetaRedisKey("*"))
+	if err != nil {
+		return 0, err
+	}
+	for _, key := range metaKeys {
+		sessionID := sessionIDFromKey(key, userSessionMetaPrefix)
+		if sessionID == "" {
+			continue
+		}
+		metaPayload, getErr := s.stateStore.Get(ctx, userSessionMetaRedisKey(sessionID))
+		if getErr != nil {
+			continue
+		}
+		var meta userDeviceSessionMeta
+		if err := json.Unmarshal(metaPayload, &meta); err != nil {
+			continue
+		}
+		if strings.TrimSpace(meta.UserID) != userID {
+			continue
+		}
+		addUserSessionID(sessionSet, meta.SessionID)
+		addUserSessionID(sessionSet, sessionID)
+	}
+
+	deviceKeys, err := s.stateStore.Keys(ctx, userSessionDeviceRedisKey(userID, "*"))
+	if err != nil {
+		return 0, err
+	}
+	for _, key := range deviceKeys {
+		sessionIDPayload, getErr := s.stateStore.Get(ctx, strings.TrimSpace(key))
+		if getErr != nil {
+			continue
+		}
+		addUserSessionID(sessionSet, string(sessionIDPayload))
+	}
+
+	sessionIDs := make([]string, 0, len(sessionSet))
+	for sessionID := range sessionSet {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	sort.Strings(sessionIDs)
+
+	removed := 0
+	var firstErr error
+	errCount := 0
+	recordError := func(opErr error) {
+		if opErr == nil {
+			return
+		}
+		errCount++
+		if firstErr == nil {
+			firstErr = opErr
+		}
+	}
+
+	for _, sessionID := range sessionIDs {
 		if err := s.stateStore.Del(ctx, userSessionRedisKey(sessionID)); err != nil {
-			return removed, err
+			recordError(err)
 		}
 		_ = s.stateStore.Del(ctx, userRecoveryRedisKey(sessionID))
 		_ = s.stateStore.Del(ctx, userSessionMetaRedisKey(sessionID))
 		removed++
+	}
+
+	if err := s.stateStore.Del(ctx, userSessionListRedisKey(userID)); err != nil {
+		recordError(err)
+	}
+	if err := s.stateStore.Del(ctx, userSessionAllRedisKey(userID)); err != nil {
+		recordError(err)
+	}
+	for _, key := range deviceKeys {
+		if err := s.stateStore.Del(ctx, strings.TrimSpace(key)); err != nil {
+			recordError(err)
+		}
+	}
+
+	if errCount > 0 {
+		return removed, fmt.Errorf("user session cleanup failed (%d errors): %w", errCount, firstErr)
 	}
 	return removed, nil
 }
@@ -1645,6 +1750,18 @@ func userRecoveryRedisKey(id string) string {
 
 func userSessionMetaRedisKey(id string) string {
 	return userSessionMetaPrefix + strings.TrimSpace(id)
+}
+
+func userSessionListRedisKey(userID string) string {
+	return userSessionListPrefix + strings.TrimSpace(userID)
+}
+
+func userSessionAllRedisKey(userID string) string {
+	return userSessionAllPrefix + strings.TrimSpace(userID)
+}
+
+func userSessionDeviceRedisKey(userID string, deviceID string) string {
+	return userSessionDevicePrefix + strings.TrimSpace(userID) + ":" + strings.TrimSpace(deviceID)
 }
 
 func encodeCredentialID(raw []byte) string {

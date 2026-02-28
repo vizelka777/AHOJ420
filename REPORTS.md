@@ -350,3 +350,49 @@
   - `TestDeleteAccountRequiresPasskeyConfirmation`
 - Проверки:
   - `go test ./internal/auth ./cmd/server` (dockerized Go) — `ok`
+
+### Admin Hard Delete User (Owner-only)
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Добавлены owner-only routes:
+  - `GET /admin/users/:id/delete`
+  - `POST /admin/users/:id/delete`
+- Delete flow защищён:
+  - admin session required
+  - owner role required
+  - CSRF required
+  - recent admin re-auth required
+  - explicit confirmation phrase required: `DELETE <user-id>`
+- В `adminui` добавлен централизованный delete service:
+  - snapshot user/profile/counts перед удалением
+  - `store.DeleteUser(userID)`
+  - после DB delete — full user session cleanup через `LogoutAllUserSessionsForAdmin`
+  - optional best-effort avatar cleanup hook (if configured)
+  - partial failure path (`user deleted but session cleanup failed`) surfaced to operator, not silent success
+- В `adminauth` усилен `LogoutAllUserSessionsForAdmin`:
+  - удаляет user session artifacts: `sess:*`, `recovery:*`, `sessmeta:*`
+  - очищает user indexes: `sesslist:<userID>`, `sessall:<userID>`
+  - очищает device mappings: `sessdev:<userID>:*`
+- UI:
+  - новая warning/confirmation страница `web/templates/admin/user_delete.html`
+  - owner-only delete link в users list/detail
+- Audit:
+  - `admin.user.delete.success|failure`
+  - details include safe snapshot and partial-failure flags
+
+Тесты:
+- `internal/adminui/handler_test.go`:
+  - `TestOwnerCanOpenUserDeletePage`
+  - `TestAdminCannotAccessUserDelete`
+  - `TestUserDeleteRequiresRecentReauth`
+  - `TestUserDeleteRequiresConfirmationPhrase`
+  - `TestUserDeleteSuccessRemovesUserAndWritesAudit`
+  - `TestUserDeleteAvatarCleanupFailureDoesNotRollbackDelete`
+  - `TestUserDeleteDBFailureDoesNotRunCleanup`
+  - `TestUserDeleteCleanupFailureIsSurfaced`
+  - CSRF coverage updated for `/admin/users/:id/delete`
+- Проверки:
+  - `go test ./internal/adminui ./internal/adminauth ./cmd/server` (dockerized Go) — `ok`
+  - `go test ./internal/auth` (dockerized Go) — `ok`

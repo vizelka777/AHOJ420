@@ -1,0 +1,58 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Delete User</h1>
+        {{if .Snapshot.User}}<p class="hint mono" style="margin:6px 0 0;">{{.Snapshot.User.ID}}</p>{{end}}
+      </div>
+      <div class="actions" style="margin-top:0;">
+        {{if .Snapshot.User}}<a class="btn secondary" href="/admin/users/{{.Snapshot.User.ID}}">Back to user</a>{{end}}
+        <a class="btn secondary" href="/admin/users">Back to users</a>
+      </div>
+    </div>
+  </div>
+
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  {{if .Warnings}}
+    {{range .Warnings}}
+      <div class="error">{{.}}</div>
+    {{end}}
+  {{end}}
+
+  {{if .Snapshot.User}}
+  <div class="panel">
+    <h2 style="margin-top:0;">Irreversible action</h2>
+    <p class="hint" style="margin:0 0 12px;">This permanently removes the user row and related records. The operation cannot be undone.</p>
+    <div class="grid2">
+      <dl class="kv"><dt>User ID</dt><dd class="mono">{{.Snapshot.User.ID}}</dd></dl>
+      <dl class="kv"><dt>Created</dt><dd class="mono">{{formatTime .Snapshot.User.CreatedAt}}</dd></dl>
+      <dl class="kv"><dt>Profile Email</dt><dd>{{if .Snapshot.User.ProfileEmail}}{{.Snapshot.User.ProfileEmail}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Phone</dt><dd>{{if .Snapshot.User.Phone}}{{.Snapshot.User.Phone}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Passkeys</dt><dd class="mono">{{.Snapshot.PasskeyCount}}</dd></dl>
+      <dl class="kv"><dt>Active sessions</dt><dd class="mono">{{.Snapshot.SessionCount}}</dd></dl>
+      <dl class="kv"><dt>Linked clients</dt><dd class="mono">{{.Snapshot.LinkedClientCount}}</dd></dl>
+      <dl class="kv"><dt>Avatar key</dt><dd class="mono">{{if .Snapshot.User.AvatarKey}}{{.Snapshot.User.AvatarKey}}{{else}}-{{end}}</dd></dl>
+    </div>
+  </div>
+
+  {{if not .Deleted}}
+  <div class="panel">
+    <form method="post" action="/admin/users/{{.Snapshot.User.ID}}/delete" data-require-reauth="1">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <div class="row">
+        <div style="flex:1 1 560px;">
+          <label for="confirm_phrase">Type confirmation phrase</label>
+          <input id="confirm_phrase" name="confirm_phrase" type="text" value="{{.ConfirmValue}}" autocomplete="off" spellcheck="false" placeholder="{{.ConfirmPhrase}}" required>
+          <p class="hint mono">Required: {{.ConfirmPhrase}}</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="submit" class="warn">Delete user permanently</button>
+      </div>
+    </form>
+  </div>
+  {{end}}
+  {{end}}
+</div>
+{{end}}

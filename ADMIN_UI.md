@@ -26,6 +26,8 @@ Protected (admin session required):
 - `GET /admin/security`
 - `GET /admin/users`
 - `GET /admin/users/:id`
+- `GET /admin/users/:id/delete`
+- `POST /admin/users/:id/delete`
 - `POST /admin/users/:id/block`
 - `POST /admin/users/:id/unblock`
 - `POST /admin/users/:id/sessions/logout-all`
@@ -98,6 +100,7 @@ Protected (admin session required):
   - unblock end-user account (`POST /admin/users/:id/unblock`)
   - revoke end-user passkey (`POST /admin/users/:id/passkeys/:credentialID/revoke`)
   - logout all end-user sessions (`POST /admin/users/:id/sessions/logout-all`)
+  - hard-delete end-user (`POST /admin/users/:id/delete`)
 - audit actions:
   - `admin.auth.reauth.success`
   - `admin.auth.reauth.failure`
@@ -192,6 +195,15 @@ Protected (admin session required):
   - active sessions list (session id, created_at, last_seen_at, expires_at, ip, user-agent)
   - linked OIDC clients list (client id, first_seen_at, last_seen_at)
 - allowed support actions (mutating, audited):
+  - `GET /admin/users/:id/delete` (owner-only confirmation page)
+  - `POST /admin/users/:id/delete`
+    - owner-only
+    - requires recent re-auth
+    - requires explicit confirmation phrase: `DELETE <user-id>`
+    - performs hard delete (no soft delete/restore)
+    - runs full session cleanup (`sess:*`, `recovery:*`, `sessmeta:*`, `sesslist:*`, `sessall:*`, `sessdev:*`)
+    - audit: `admin.user.delete.success|failure`
+    - partial failures (DB delete succeeded but session cleanup failed) are surfaced as operator-visible errors
   - `POST /admin/users/:id/block`
     - requires recent re-auth
     - requires reason
@@ -210,7 +222,8 @@ Protected (admin session required):
     - audit: `admin.user.passkey.revoke.success|failure`
 - security posture:
   - all mutating routes are CSRF-protected by existing admin UI CSRF middleware
-  - section is mostly read-only (no profile editing, no user deletion, no impersonation)
+  - section is mostly read-only (no profile editing, no impersonation)
+  - hard-delete is available only to `owner` and requires step-up re-auth + explicit confirmation phrase
   - timeline details are sanitized in storage + render path (secret/token/password/authorization/challenge/assertion fields are removed)
 
 ## Structured user security events
@@ -260,6 +273,7 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/security.html`
 - `web/templates/admin/users_list.html`
 - `web/templates/admin/user_detail.html`
+- `web/templates/admin/user_delete.html`
 - `web/templates/admin/admins_list.html`
 - `web/templates/admin/admin_new.html`
 - `web/templates/admin/admin_detail.html`

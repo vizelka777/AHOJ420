@@ -74,6 +74,7 @@ type OIDCClientStore interface {
 	ListUserOIDCClients(userID string) ([]store.UserOIDCClient, error)
 	CreateUserSecurityEvent(ctx context.Context, entry store.UserSecurityEvent) error
 	ListUserSecurityEvents(ctx context.Context, userID string, filter store.UserSecurityEventFilter) ([]store.UserSecurityEvent, error)
+	DeleteUser(userID string) error
 }
 
 type OIDCClientReloader interface {
@@ -111,6 +112,7 @@ type Handler struct {
 	reloader     OIDCClientReloader
 	auditStore   AdminAuditStore
 	auth         SessionAuth
+	avatarDelete func(ctx context.Context, avatarKey string) error
 	templatesDir string
 }
 
@@ -487,6 +489,32 @@ type userDetailPageData struct {
 	Error         string
 }
 
+type userDeleteSnapshot struct {
+	User              *store.AdminUserProfile
+	PasskeyCount      int
+	SessionCount      int
+	LinkedClientCount int
+}
+
+type userDeleteResult struct {
+	Snapshot               userDeleteSnapshot
+	UserDeleted            bool
+	SessionsRevoked        int
+	AvatarCleanupAttempted bool
+	AvatarCleanupFailed    bool
+	PartialFailure         bool
+}
+
+type userDeletePageData struct {
+	layoutData
+	Snapshot      userDeleteSnapshot
+	ConfirmPhrase string
+	ConfirmValue  string
+	Error         string
+	Deleted       bool
+	Warnings      []string
+}
+
 type inviteAcceptPageData struct {
 	layoutData
 	InviteToken string
@@ -532,6 +560,8 @@ func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/security", handler.SecurityPage)
 	group.GET("/users", handler.UsersList)
 	group.GET("/users/:id", handler.UserDetail)
+	group.GET("/users/:id/delete", handler.UserDeletePage)
+	group.POST("/users/:id/delete", handler.UserDelete)
 	group.POST("/users/:id/block", handler.UserBlock)
 	group.POST("/users/:id/unblock", handler.UserUnblock)
 	group.POST("/users/:id/sessions/logout-all", handler.UserSessionsLogoutAll)
@@ -903,6 +933,230 @@ func (h *Handler) UserDetail(c echo.Context) error {
 		EventsFilter:  eventsFilter,
 		EventFilters:  eventFilters,
 	})
+}
+
+func userDeleteConfirmPhrase(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	return "DELETE " + userID
+}
+
+func (h *Handler) loadUserDeleteSnapshot(ctx context.Context, userID string) (userDeleteSnapshot, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return userDeleteSnapshot{}, store.ErrUserNotFound
+	}
+
+	profile, err := h.store.GetUserProfileForAdmin(userID)
+	if err != nil {
+		return userDeleteSnapshot{}, err
+	}
+
+	passkeys, err := h.store.ListCredentialRecords(userID)
+	if err != nil {
+		return userDeleteSnapshot{}, err
+	}
+
+	sessions, err := h.auth.ListUserSessionsForAdmin(ctx, userID)
+	if err != nil {
+		return userDeleteSnapshot{}, err
+	}
+
+	linkedClients, err := h.store.ListUserOIDCClients(userID)
+	if err != nil {
+		return userDeleteSnapshot{}, err
+	}
+
+	return userDeleteSnapshot{
+		User:              profile,
+		PasskeyCount:      len(passkeys),
+		SessionCount:      len(sessions),
+		LinkedClientCount: len(linkedClients),
+	}, nil
+}
+
+func (h *Handler) deleteUserCompletely(ctx context.Context, userID string) (userDeleteResult, error) {
+	result := userDeleteResult{}
+
+	snapshot, err := h.loadUserDeleteSnapshot(ctx, userID)
+	if err != nil {
+		return result, err
+	}
+	result.Snapshot = snapshot
+
+	if err := h.store.DeleteUser(userID); err != nil {
+		return result, err
+	}
+	result.UserDeleted = true
+
+	removed, cleanupErr := h.auth.LogoutAllUserSessionsForAdmin(ctx, userID)
+	result.SessionsRevoked = removed
+	if cleanupErr != nil {
+		result.PartialFailure = true
+		return result, fmt.Errorf("user deleted but session cleanup failed: %w", cleanupErr)
+	}
+
+	avatarKey := ""
+	if snapshot.User != nil {
+		avatarKey = strings.TrimSpace(snapshot.User.AvatarKey)
+	}
+	if avatarKey != "" && h.avatarDelete != nil {
+		result.AvatarCleanupAttempted = true
+		if err := h.avatarDelete(ctx, avatarKey); err != nil {
+			result.AvatarCleanupFailed = true
+			log.Printf("admin user delete avatar cleanup failed user_id=%s avatar_key=%s error=%v", strings.TrimSpace(userID), avatarKey, err)
+		}
+	}
+
+	return result, nil
+}
+
+func userDeleteAuditDetails(result userDeleteResult) map[string]any {
+	details := map[string]any{
+		"recent_reauth": true,
+	}
+	if result.Snapshot.User != nil {
+		details["user_id"] = strings.TrimSpace(result.Snapshot.User.ID)
+		details["profile_email"] = strings.TrimSpace(result.Snapshot.User.ProfileEmail)
+		details["phone"] = strings.TrimSpace(result.Snapshot.User.Phone)
+		details["created_at"] = result.Snapshot.User.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	details["passkey_count"] = result.Snapshot.PasskeyCount
+	details["linked_client_count"] = result.Snapshot.LinkedClientCount
+	details["session_count_snapshot"] = result.Snapshot.SessionCount
+	details["sessions_revoked_count"] = result.SessionsRevoked
+	details["user_deleted"] = result.UserDeleted
+	details["partial_failure"] = result.PartialFailure
+	details["avatar_cleanup_attempted"] = result.AvatarCleanupAttempted
+	details["avatar_cleanup_failed"] = result.AvatarCleanupFailed
+	return details
+}
+
+func (h *Handler) UserDeletePage(c echo.Context) error {
+	adminUser, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+
+	snapshot, err := h.loadUserDeleteSnapshot(c.Request().Context(), userID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "Failed to load user for deletion"
+		if errors.Is(err, store.ErrUserNotFound) {
+			status = http.StatusNotFound
+			message = "User not found"
+		}
+		return h.render(c, status, "user_delete.html", userDeletePageData{
+			layoutData: h.newLayoutData(c, adminUser, "Delete user"),
+			Error:      message,
+		})
+	}
+
+	return h.render(c, http.StatusOK, "user_delete.html", userDeletePageData{
+		layoutData:    h.newLayoutData(c, adminUser, "Delete user: "+userID),
+		Snapshot:      snapshot,
+		ConfirmPhrase: userDeleteConfirmPhrase(userID),
+	})
+}
+
+func (h *Handler) UserDelete(c echo.Context) error {
+	adminUser, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+
+	snapshot, err := h.loadUserDeleteSnapshot(c.Request().Context(), userID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.delete.failure", false, "user", userID, err, map[string]any{
+			"recent_reauth": true,
+			"phase":         "snapshot",
+		})
+		status := http.StatusInternalServerError
+		message := "Failed to load user for deletion"
+		if errors.Is(err, store.ErrUserNotFound) {
+			status = http.StatusNotFound
+			message = "User not found"
+		}
+		return h.render(c, status, "user_delete.html", userDeletePageData{
+			layoutData: h.newLayoutData(c, adminUser, "Delete user"),
+			Error:      message,
+		})
+	}
+
+	confirmPhrase := userDeleteConfirmPhrase(userID)
+	confirmValue := strings.TrimSpace(c.FormValue("confirm_phrase"))
+	if confirmValue != confirmPhrase {
+		h.auditAdminAction(c, "admin.user.delete.failure", false, "user", userID, errors.New("delete_confirmation_mismatch"), map[string]any{
+			"recent_reauth": true,
+			"phase":         "confirm",
+		})
+		return h.render(c, http.StatusBadRequest, "user_delete.html", userDeletePageData{
+			layoutData:    h.newLayoutData(c, adminUser, "Delete user: "+userID),
+			Snapshot:      snapshot,
+			ConfirmPhrase: confirmPhrase,
+			ConfirmValue:  confirmValue,
+			Error:         "Confirmation phrase does not match",
+		})
+	}
+
+	result, err := h.deleteUserCompletely(c.Request().Context(), userID)
+	if err != nil {
+		result.Snapshot = snapshot
+		if result.UserDeleted {
+			result.PartialFailure = true
+		}
+
+		details := userDeleteAuditDetails(result)
+		details["phase"] = "delete"
+		h.auditAdminAction(c, "admin.user.delete.failure", false, "user", userID, err, details)
+
+		warnings := []string{}
+		if result.UserDeleted && result.PartialFailure {
+			warnings = append(warnings, "User row was deleted, but session cleanup failed. Manual operator attention is required.")
+		}
+		return h.render(c, http.StatusInternalServerError, "user_delete.html", userDeletePageData{
+			layoutData:    h.newLayoutData(c, adminUser, "Delete user: "+userID),
+			Snapshot:      result.Snapshot,
+			ConfirmPhrase: confirmPhrase,
+			ConfirmValue:  confirmValue,
+			Deleted:       result.UserDeleted,
+			Warnings:      warnings,
+			Error: func() string {
+				if result.UserDeleted && result.PartialFailure {
+					return "User deleted, but session cleanup failed"
+				}
+				return "Failed to delete user"
+			}(),
+		})
+	}
+
+	details := userDeleteAuditDetails(result)
+	details["phase"] = "delete"
+	h.auditAdminAction(c, "admin.user.delete.success", true, "user", userID, nil, details)
+
+	if result.AvatarCleanupFailed {
+		h.setFlash(c, "success", fmt.Sprintf("User deleted and %d session(s) cleaned up; avatar cleanup failed", result.SessionsRevoked))
+	} else {
+		h.setFlash(c, "success", fmt.Sprintf("User deleted and %d session(s) cleaned up", result.SessionsRevoked))
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/users")
 }
 
 func (h *Handler) UserBlock(c echo.Context) error {

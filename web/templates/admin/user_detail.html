@@ -53,6 +53,11 @@
           </div>
         </form>
       {{end}}
+      {{if .IsOwner}}
+      <div class="actions">
+        <a class="btn warn" href="/admin/users/{{.User.ID}}/delete">Delete user</a>
+      </div>
+      {{end}}
     </div>
   </div>
 

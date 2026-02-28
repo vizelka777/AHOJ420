@@ -1007,6 +1007,246 @@ func TestUserUnblockRequiresRecentReauthAndWritesAudit(t *testing.T) {
 	}
 }
 
+func TestOwnerCanOpenUserDeletePage(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-page", "delete.page@login.local", "delete.page@example.com", "+201")
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID+"/delete", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for owner delete page, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Delete User") {
+		t.Fatalf("expected delete page heading, body=%s", body)
+	}
+	if !strings.Contains(body, userDeleteConfirmPhrase(user.ID)) {
+		t.Fatalf("expected delete confirmation phrase on page, body=%s", body)
+	}
+}
+
+func TestAdminCannotAccessUserDelete(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-forbidden", "delete.forbidden@login.local", "delete.forbidden@example.com", "+202")
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-2", Login: "ops", DisplayName: "Ops", Role: store.AdminRoleAdmin},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	recGet := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID+"/delete", nil, auth.sessionCookies())
+	if recGet.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-owner delete page, got %d body=%s", recGet.Code, recGet.Body.String())
+	}
+
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+	recPost := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if recPost.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-owner delete post, got %d body=%s", recPost.Code, recPost.Body.String())
+	}
+}
+
+func TestUserDeleteRequiresRecentReauth(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-reauth", "delete.reauth@login.local", "delete.reauth@example.com", "+203")
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+
+	recBlocked := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth, got %d body=%s", recBlocked.Code, recBlocked.Body.String())
+	}
+	if _, err := fakeStore.GetUserProfileForAdmin(user.ID); err != nil {
+		t.Fatalf("expected user to still exist when reauth is missing, err=%v", err)
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+}
+
+func TestUserDeleteRequiresConfirmationPhrase(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-confirm", "delete.confirm@login.local", "delete.confirm@example.com", "+204")
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+
+	form := withCSRF(url.Values{"confirm_phrase": {"DELETE WRONG"}}, csrfToken)
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for wrong confirmation phrase, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "confirmation phrase does not match") {
+		t.Fatalf("expected confirmation mismatch message, body=%s", rec.Body.String())
+	}
+	if fakeStore.deleteUserCalls != 0 {
+		t.Fatalf("expected delete not to run on mismatch, delete calls=%d", fakeStore.deleteUserCalls)
+	}
+}
+
+func TestUserDeleteSuccessRemovesUserAndWritesAudit(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-success", "delete.success@login.local", "delete.success@example.com", "+205")
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{ID: []byte{0xaa, 0x01}, CreatedAt: time.Now().UTC().Add(-4 * time.Hour)},
+		{ID: []byte{0xaa, 0x02}, CreatedAt: time.Now().UTC().Add(-2 * time.Hour)},
+	}
+	fakeStore.userLinkedClients[user.ID] = []store.UserOIDCClient{
+		{ClientID: "client-a", ClientHost: "app.local", FirstSeenAt: time.Now().UTC().Add(-24 * time.Hour), LastSeenAt: time.Now().UTC().Add(-1 * time.Hour)},
+	}
+	ok := true
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:    user.ID,
+		EventType: store.UserSecurityEventLoginSuccess,
+		Category:  store.UserSecurityCategoryAuth,
+		Success:   &ok,
+		ActorType: "user",
+		ActorID:   user.ID,
+	})
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-del-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-10 * time.Minute)},
+				{SessionID: "sess-del-2", CreatedAt: time.Now().UTC().Add(-90 * time.Minute), LastSeenAt: time.Now().UTC().Add(-3 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 for successful delete, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/users" {
+		t.Fatalf("expected redirect to /admin/users, got %s", location)
+	}
+	if _, err := fakeStore.GetUserProfileForAdmin(user.ID); !errors.Is(err, store.ErrUserNotFound) {
+		t.Fatalf("expected user row to be deleted, got err=%v", err)
+	}
+	if len(fakeStore.userCredentials[user.ID]) != 0 {
+		t.Fatalf("expected user credentials to be deleted")
+	}
+	if len(fakeStore.userLinkedClients[user.ID]) != 0 {
+		t.Fatalf("expected linked clients to be deleted")
+	}
+	if hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventLoginSuccess, true) {
+		t.Fatalf("expected user security events to be deleted via cascade")
+	}
+	if auth.logoutAllCalls != 1 {
+		t.Fatalf("expected full session cleanup helper to be called once, got %d", auth.logoutAllCalls)
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.delete.success", true) {
+		t.Fatalf("expected admin.user.delete.success audit entry")
+	}
+}
+
+func TestUserDeleteAvatarCleanupFailureDoesNotRollbackDelete(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-avatar-fail", "delete.avatar@login.local", "delete.avatar@example.com", "+208")
+	user.AvatarKey = "avatars/" + user.ID + ".webp"
+	fakeStore.users[user.ID] = user
+
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-avatar-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-5 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e, h := setupTestAdminUIWithHandler(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	h.avatarDelete = func(ctx context.Context, avatarKey string) error {
+		return errors.New("avatar delete failed")
+	}
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 for delete with avatar cleanup warning, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := fakeStore.GetUserProfileForAdmin(user.ID); !errors.Is(err, store.ErrUserNotFound) {
+		t.Fatalf("expected user to be deleted despite avatar cleanup failure, err=%v", err)
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.delete.success", true) {
+		t.Fatalf("expected success audit entry")
+	}
+}
+
+func TestUserDeleteDBFailureDoesNotRunCleanup(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-db-fail", "delete.dbfail@login.local", "delete.dbfail@example.com", "+206")
+	fakeStore.deleteUserErr = errors.New("db delete failed")
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-db-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-5 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on DB delete failure, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if auth.logoutAllCalls != 0 {
+		t.Fatalf("expected cleanup not to run when DB delete fails, calls=%d", auth.logoutAllCalls)
+	}
+	if _, err := fakeStore.GetUserProfileForAdmin(user.ID); err != nil {
+		t.Fatalf("expected user to remain after DB failure, err=%v", err)
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.delete.failure", false) {
+		t.Fatalf("expected admin.user.delete.failure audit entry")
+	}
+}
+
+func TestUserDeleteCleanupFailureIsSurfaced(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-delete-cleanup-fail", "delete.cleanup@login.local", "delete.cleanup@example.com", "+207")
+	auth := &fakeUIAuth{
+		logoutAllErr: errors.New("redis cleanup failed"),
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-cleanup-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-5 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID+"/delete", auth.sessionCookies())
+	form := withCSRF(url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, csrfToken)
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", form, cookies)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when cleanup fails after delete, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := fakeStore.GetUserProfileForAdmin(user.ID); !errors.Is(err, store.ErrUserNotFound) {
+		t.Fatalf("expected user row to be deleted even when cleanup fails, err=%v", err)
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "session cleanup failed") {
+		t.Fatalf("expected explicit cleanup failure message, body=%s", rec.Body.String())
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.delete.failure", false) {
+		t.Fatalf("expected admin.user.delete.failure audit entry")
+	}
+}
+
 func TestUsersListAndDetailShowBlockedState(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	blocked := fakeStore.seedSupportUser("user-list-blocked", "list.blocked@login.local", "blocked@example.com", "+102")
@@ -1081,6 +1321,11 @@ func TestUsersMutatingRoutesRequireCSRF(t *testing.T) {
 	noCSRFUnblock := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/unblock", nil, auth.sessionCookies())
 	if noCSRFUnblock.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for unblock without csrf, got %d body=%s", noCSRFUnblock.Code, noCSRFUnblock.Body.String())
+	}
+
+	noCSRFDelete := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/delete", url.Values{"confirm_phrase": {userDeleteConfirmPhrase(user.ID)}}, auth.sessionCookies())
+	if noCSRFDelete.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for delete without csrf, got %d body=%s", noCSRFDelete.Code, noCSRFDelete.Body.String())
 	}
 }
 
@@ -2173,6 +2418,12 @@ func TestRevokeSecretAndLastActiveConflict(t *testing.T) {
 
 func setupTestAdminUI(t *testing.T, fakeStore *fakeUIStore, auth *fakeUIAuth, reloader *fakeReloader, auditStore *fakeAuditStore) *echo.Echo {
 	t.Helper()
+	e, _ := setupTestAdminUIWithHandler(t, fakeStore, auth, reloader, auditStore)
+	return e
+}
+
+func setupTestAdminUIWithHandler(t *testing.T, fakeStore *fakeUIStore, auth *fakeUIAuth, reloader *fakeReloader, auditStore *fakeAuditStore) (*echo.Echo, *Handler) {
+	t.Helper()
 	h, err := NewHandler(fakeStore, reloader, auditStore, auth)
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
@@ -2187,7 +2438,7 @@ func setupTestAdminUI(t *testing.T, fakeStore *fakeUIStore, auth *fakeUIAuth, re
 	protected.Use(auth.RequireSessionMiddleware("/admin/login"))
 	protected.Use(h.CSRFMiddleware())
 	RegisterProtectedRoutes(protected, h)
-	return e
+	return e, h
 }
 
 func doUIRequest(t *testing.T, e *echo.Echo, method string, path string, form url.Values, cookies []*http.Cookie) *httptest.ResponseRecorder {
@@ -2284,6 +2535,8 @@ type fakeUIAuth struct {
 	passkeys                []store.AdminCredentialInfo
 	sessions                []store.AdminSessionInfo
 	userSessions            map[string][]store.UserSessionInfo
+	logoutAllCalls          int
+	logoutAllErr            error
 	recentReauthAt          *time.Time
 	reauthMaxAge            time.Duration
 	disableAutoRecentReauth bool
@@ -2489,6 +2742,10 @@ func (a *fakeUIAuth) LogoutAllUserSessionsForAdmin(ctx context.Context, userID s
 	if userID == "" {
 		return 0, errors.New("invalid user id")
 	}
+	a.logoutAllCalls++
+	if a.logoutAllErr != nil {
+		return 0, a.logoutAllErr
+	}
 	removed := len(a.userSessions[userID])
 	if a.userSessions == nil {
 		a.userSessions = map[string][]store.UserSessionInfo{}
@@ -2630,6 +2887,8 @@ type fakeUIStore struct {
 	userLinkedClients    map[string][]store.UserOIDCClient
 	userSecurityEvents   []store.UserSecurityEvent
 	nextUserSecurityID   int64
+	deleteUserErr        error
+	deleteUserCalls      int
 }
 
 func newFakeUIStore() *fakeUIStore {
@@ -3257,6 +3516,30 @@ func (s *fakeUIStore) GetUserProfileForAdmin(userID string) (*store.AdminUserPro
 	}
 	copyItem := item
 	return &copyItem, nil
+}
+
+func (s *fakeUIStore) DeleteUser(userID string) error {
+	userID = strings.TrimSpace(userID)
+	s.deleteUserCalls++
+	if s.deleteUserErr != nil {
+		return s.deleteUserErr
+	}
+	if _, ok := s.users[userID]; !ok {
+		return store.ErrUserNotFound
+	}
+	delete(s.users, userID)
+	delete(s.userCredentials, userID)
+	delete(s.userLinkedClients, userID)
+
+	filtered := make([]store.UserSecurityEvent, 0, len(s.userSecurityEvents))
+	for _, event := range s.userSecurityEvents {
+		if strings.TrimSpace(event.UserID) == userID {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	s.userSecurityEvents = filtered
+	return nil
 }
 
 func (s *fakeUIStore) SetUserBlocked(ctx context.Context, userID string, blocked bool, reason string, blockedByAdminUserID string) error {

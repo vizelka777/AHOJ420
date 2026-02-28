@@ -41,6 +41,7 @@
             <th>Sessions</th>
             <th>Linked clients</th>
             <th>Open</th>
+            {{if .IsOwner}}<th>Delete</th>{{end}}
           </tr>
         </thead>
         <tbody>
@@ -67,10 +68,11 @@
                 <td class="mono">{{.SessionCount}}</td>
                 <td class="mono">{{.LinkedClientCount}}</td>
                 <td><a class="btn secondary" href="/admin/users/{{.ID}}">Open</a></td>
+                {{if $.IsOwner}}<td><a class="btn warn" href="/admin/users/{{.ID}}/delete">Delete</a></td>{{end}}
               </tr>
             {{end}}
           {{else}}
-            <tr><td colspan="10">No users found.</td></tr>
+            <tr><td colspan="{{if .IsOwner}}11{{else}}10{{end}}">No users found.</td></tr>
           {{end}}
         </tbody>
       </table>
