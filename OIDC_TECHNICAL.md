@@ -12,6 +12,7 @@
 - SSO logout: `/logout` (and `/end_session`)
 - Admin auth (internal): `/admin/auth/*`
 - Admin API (internal): `/admin/api/oidc/clients`
+- Admin UI (internal): `/admin/*`
 
 ## Runtime Modes
 Environment variable: `AHOJ_ENV=dev|prod` (default `dev`).
@@ -206,7 +207,7 @@ Admin auth data model:
 
 Configuration:
 - `ADMIN_API_HOST` is mandatory for serving `/admin/*` (if empty, admin routes return `503`)
-- bootstrap first admin login via `ADMIN_BOOTSTRAP_LOGIN`
+- bootstrap first admin login via `ADMIN_BOOTSTRAP_LOGIN` (one-time only; should be removed/empty after initial bootstrap)
 - optional explicit admin WebAuthn origins via `ADMIN_RP_ORIGINS` (comma-separated)
 - admin session TTL:
   - `ADMIN_SESSION_IDLE_MINUTES` (default `30`)
@@ -219,7 +220,7 @@ Authentication and perimeter:
 - primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
 - admin login is passkey-only via `/admin/auth/login/*`
 - host guard enforces `ADMIN_API_HOST` (`404` on wrong host)
-- dedicated rate limit for `/admin/auth/*` and `/admin/api/*`
+- dedicated rate limit for `/admin/auth/*`, `/admin/api/*`, and `/admin/*` HTML UI routes
 - token fallback is optional; when enabled it is accepted only if no valid admin session actor is present
 
 Bootstrap and login routes:
@@ -238,18 +239,37 @@ OIDC client admin routes:
 - `POST /admin/api/oidc/clients/:id/secrets`
 - `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
 
+Admin UI routes:
+- `GET /admin/login`
+- `POST /admin/logout`
+- `GET /admin/`
+- `GET /admin/clients`
+- `GET /admin/clients/new`
+- `POST /admin/clients/new`
+- `GET /admin/clients/:id`
+- `GET /admin/clients/:id/edit`
+- `POST /admin/clients/:id/edit`
+- `GET /admin/clients/:id/redirect-uris`
+- `POST /admin/clients/:id/redirect-uris`
+- `GET /admin/clients/:id/secrets/new`
+- `POST /admin/clients/:id/secrets`
+- `POST /admin/clients/:id/secrets/:secretID/revoke`
+
 Behavior notes:
 - API returns only safe secret metadata (`id`, `label`, `created_at`, `revoked_at`, `status`)
 - plaintext/hash of existing secrets are never returned
 - add-secret endpoint supports generated secret mode (`generate=true`) and returns one-time `plain_secret` only in that creation response
+- HTML UI add-secret flow supports generated secret mode and shows one-time reveal page only in immediate response
 - for MVP, changing `confidential` flag via update endpoint is blocked (`409`) to avoid unsafe transitions
 - successful mutating operations reload OIDC runtime clients immediately from DB (no restart required)
 - reload is all-or-nothing: if reload fails, previous runtime snapshot remains active
 - when DB mutation succeeds but reload fails, endpoint returns `500` with explicit runtime reload failure message
 - admin requests get `X-Request-ID`; this id is included in audit records
+- HTML UI uses admin session auth only; token fallback is never used for browser UI routes
 
 Audit logging:
 - mutating OIDC routes persist audit records in PostgreSQL table `admin_audit_log`
+- mutating HTML UI routes persist the same audit actions in `admin_audit_log`
 - auth events are also audited:
   - `admin.auth.register.success|failure`
   - `admin.auth.login.success|failure`

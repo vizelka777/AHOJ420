@@ -79,7 +79,6 @@ services:
       - OIDC_CLIENTS_FILE=${OIDC_CLIENTS_FILE:-/run/secrets/oidc_clients.json}
       # - OIDC_CLIENTS_JSON=[{"id":"client2","redirect_uris":["https://houbamzdar.cz/callback2.html"],"confidential":false,"require_pkce":true,"auth_method":"none","grant_types":["authorization_code"],"response_types":["code"]}]
     volumes:
-      - .:/app
       - ./secrets:/run/secrets:ro
     depends_on:
       - postgres

@@ -1,0 +1,101 @@
+{{define "content"}}
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+    <h1 style="margin:0;">Client Detail</h1>
+    <a class="btn secondary" href="/admin/clients">Back to clients</a>
+  </div>
+
+  {{if .Error}}
+    <div class="error" style="margin-top:12px;">{{.Error}}</div>
+  {{end}}
+
+  {{if .Client}}
+    <div class="actions" style="margin-top:14px;">
+      <a class="btn secondary" href="/admin/clients/{{.Client.ID}}/edit">Edit client</a>
+      <a class="btn secondary" href="/admin/clients/{{.Client.ID}}/redirect-uris">Edit redirect URIs</a>
+      {{if .Client.Confidential}}
+        <a class="btn" href="/admin/clients/{{.Client.ID}}/secrets/new">Add secret</a>
+      {{end}}
+    </div>
+  {{end}}
+</div>
+
+{{if .Client}}
+<div class="panel">
+  <h2 style="margin-top:0;">Metadata</h2>
+  <div class="grid2">
+    <dl class="kv"><dt>ID</dt><dd class="mono">{{.Client.ID}}</dd></dl>
+    <dl class="kv"><dt>Name</dt><dd>{{if .Client.Name}}{{.Client.Name}}{{else}}-{{end}}</dd></dl>
+    <dl class="kv"><dt>Enabled</dt><dd>{{if .Client.Enabled}}yes{{else}}no{{end}}</dd></dl>
+    <dl class="kv"><dt>Type</dt><dd>{{if .Client.Confidential}}confidential{{else}}public{{end}}</dd></dl>
+    <dl class="kv"><dt>Require PKCE</dt><dd>{{if .Client.RequirePKCE}}yes{{else}}no{{end}}</dd></dl>
+    <dl class="kv"><dt>Auth method</dt><dd class="mono">{{.Client.AuthMethod}}</dd></dl>
+    <dl class="kv"><dt>Grant types</dt><dd class="mono">{{joinComma .Client.GrantTypes}}</dd></dl>
+    <dl class="kv"><dt>Response types</dt><dd class="mono">{{joinComma .Client.ResponseTypes}}</dd></dl>
+    <dl class="kv"><dt>Scopes</dt><dd class="mono">{{joinComma .Client.Scopes}}</dd></dl>
+    <dl class="kv"><dt>Created at</dt><dd class="mono">{{formatTime .Client.CreatedAt}}</dd></dl>
+    <dl class="kv"><dt>Updated at</dt><dd class="mono">{{formatTime .Client.UpdatedAt}}</dd></dl>
+    <dl class="kv"><dt>Secret counts</dt><dd>active {{.Client.ActiveSecretCount}} / revoked {{.Client.RevokedSecretCount}}</dd></dl>
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0;">Redirect URIs</h2>
+  <div class="stack">
+    {{range .Client.RedirectURIs}}
+      <div class="mono">{{.}}</div>
+    {{else}}
+      <div class="hint">No redirect URIs.</div>
+    {{end}}
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0;">Secrets</h2>
+  {{if .Client.Confidential}}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Label</th>
+            <th>Created</th>
+            <th>Revoked</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Client.Secrets}}
+            <tr>
+              <td class="mono">{{.ID}}</td>
+              <td>{{if .Label}}{{.Label}}{{else}}-{{end}}</td>
+              <td class="mono">{{formatTime .CreatedAt}}</td>
+              <td class="mono">{{formatTimePtr .RevokedAt}}</td>
+              <td>
+                {{if eq .Status "active"}}
+                  <span class="chip ok">active</span>
+                {{else}}
+                  <span class="chip warn">revoked</span>
+                {{end}}
+              </td>
+              <td>
+                {{if eq .Status "active"}}
+                  <form method="post" action="/admin/clients/{{$.Client.ID}}/secrets/{{.ID}}/revoke" style="margin:0;">
+                    <button type="submit" class="warn" onclick="return confirm('Are you sure you want to revoke this secret?');">Revoke</button>
+                  </form>
+                {{end}}
+              </td>
+            </tr>
+          {{else}}
+            <tr><td colspan="6">No secrets.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  {{else}}
+    <p class="hint">This client is public. Secret management is not applicable.</p>
+  {{end}}
+</div>
+{{end}}
+{{end}}

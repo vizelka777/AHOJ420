@@ -159,12 +159,35 @@ func RegisterRoutes(group *echo.Group, svc *Service) {
 func (s *Service) AttachSessionActorMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			adminUser, _, err := s.sessionUser(c)
-			if err == nil && adminUser != nil {
-				admin.SetAdminActor(c, "admin_user", adminUser.ID)
-				c.Set("admin_user", adminUser)
-			}
+			_, _ = s.SessionUser(c)
 			return next(c)
+		}
+	}
+}
+
+func (s *Service) SessionUser(c echo.Context) (*store.AdminUser, bool) {
+	adminUser, _, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		return nil, false
+	}
+	admin.SetAdminActor(c, "admin_user", adminUser.ID)
+	c.Set("admin_user", adminUser)
+	return adminUser, true
+}
+
+func (s *Service) RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc {
+	target := strings.TrimSpace(loginPath)
+	if target == "" {
+		target = "/admin/login"
+	}
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if _, ok := s.SessionUser(c); ok {
+				return next(c)
+			}
+
+			return c.Redirect(http.StatusFound, target)
 		}
 	}
 }
@@ -389,11 +412,18 @@ func (s *Service) FinishLogin(c echo.Context) error {
 }
 
 func (s *Service) Logout(c echo.Context) error {
+	if err := s.LogoutSession(c); err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "not authenticated"})
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Service) LogoutSession(c echo.Context) error {
 	adminUser, sessionID, err := s.sessionUser(c)
 	if err != nil {
 		clearCookie(c, adminSessionCookieName, "/admin")
 		s.auditAuth(c, "admin.auth.logout", false, "unknown", "", map[string]any{"error": "missing_session"})
-		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "not authenticated"})
+		return errAdminSessionInvalid
 	}
 
 	_ = s.stateStore.Del(c.Request().Context(), adminSessionRedisKey(sessionID))
@@ -403,7 +433,7 @@ func (s *Service) Logout(c echo.Context) error {
 	s.auditAuth(c, "admin.auth.logout", true, "admin_user", adminUser.ID, map[string]any{
 		"login": adminUser.Login,
 	})
-	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	return nil
 }
 
 func (s *Service) sessionUser(c echo.Context) (*store.AdminUser, string, error) {

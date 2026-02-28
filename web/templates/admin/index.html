@@ -1,0 +1,21 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <h1 style="margin-top:0;">Admin Dashboard</h1>
+    <p class="hint">Internal controls for OIDC clients.</p>
+    <div class="actions">
+      <a class="btn" href="/admin/clients">Open OIDC clients</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Client Summary</h2>
+    <div class="grid2">
+      <dl class="kv"><dt>Total clients</dt><dd>{{.Summary.Total}}</dd></dl>
+      <dl class="kv"><dt>Enabled</dt><dd>{{.Summary.Enabled}}</dd></dl>
+      <dl class="kv"><dt>Confidential</dt><dd>{{.Summary.Confidential}}</dd></dl>
+      <dl class="kv"><dt>Public</dt><dd>{{.Summary.Public}}</dd></dl>
+    </div>
+  </div>
+</div>
+{{end}}

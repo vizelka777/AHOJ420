@@ -1,0 +1,71 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Edit OIDC Client</h1>
+  <p class="hint">Client ID and confidentiality mode are immutable in this MVP.</p>
+
+  {{if .Error}}
+    <div class="error">{{.Error}}</div>
+  {{end}}
+
+  <div class="grid2" style="margin-bottom:12px;">
+    <dl class="kv"><dt>Client ID</dt><dd class="mono">{{.ClientID}}</dd></dl>
+    <dl class="kv"><dt>Type</dt><dd>{{if .Confidential}}confidential{{else}}public{{end}}</dd></dl>
+    <dl class="kv"><dt>Created at</dt><dd class="mono">{{formatTime .CreatedAt}}</dd></dl>
+    <dl class="kv"><dt>Updated at</dt><dd class="mono">{{formatTime .UpdatedAt}}</dd></dl>
+  </div>
+
+  <form method="post" action="/admin/clients/{{.ClientID}}/edit">
+    <div class="row">
+      <div>
+        <label for="name">Name</label>
+        <input id="name" type="text" name="name" value="{{.Form.Name}}" required>
+      </div>
+      <div>
+        <label for="auth_method">Auth method</label>
+        <select id="auth_method" name="auth_method">
+          <option value="none" {{if eq .Form.AuthMethod "none"}}selected{{end}}>none</option>
+          <option value="basic" {{if eq .Form.AuthMethod "basic"}}selected{{end}}>basic</option>
+          <option value="post" {{if eq .Form.AuthMethod "post"}}selected{{end}}>post</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label><input type="checkbox" name="enabled" value="true" {{if .Form.Enabled}}checked{{end}}> Enabled</label>
+      </div>
+      <div>
+        <label><input type="checkbox" name="require_pkce" value="true" {{if .Form.RequirePKCE}}checked{{end}}> Require PKCE</label>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="grant_types">Grant types (comma or newline separated)</label>
+        <textarea id="grant_types" name="grant_types">{{.Form.GrantTypesRaw}}</textarea>
+      </div>
+      <div>
+        <label for="response_types">Response types (comma or newline separated)</label>
+        <textarea id="response_types" name="response_types">{{.Form.ResponseTypesRaw}}</textarea>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="scopes">Scopes (comma or newline separated)</label>
+        <textarea id="scopes" name="scopes">{{.Form.ScopesRaw}}</textarea>
+      </div>
+      <div>
+        <label>Redirect URIs</label>
+        <textarea readonly>{{.Form.RedirectURIsRaw}}</textarea>
+        <div class="hint">Use dedicated Redirect URIs editor ({{.RedirectCount}} configured).</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit">Update client</button>
+      <a class="btn secondary" href="/admin/clients/{{.ClientID}}">Back</a>
+    </div>
+  </form>
+</div>
+{{end}}

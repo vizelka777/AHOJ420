@@ -76,7 +76,7 @@ Optional for key rotation:
 
 Admin API + Admin Auth:
 - `ADMIN_API_HOST=admin.ahoj420.eu` (required; if unset, `/admin/*` returns `503`)
-- `ADMIN_BOOTSTRAP_LOGIN=<login>` (required for first admin passkey bootstrap, e.g. `owner`)
+- `ADMIN_BOOTSTRAP_LOGIN=<login>` (one-time only for first admin passkey bootstrap; remove/empty after bootstrap is finished)
 - `ADMIN_RP_ORIGINS=https://admin.ahoj420.eu,https://ahoj420.eu` (optional; explicit WebAuthn origins for admin auth)
 - `ADMIN_SESSION_IDLE_MINUTES=30` (optional, default `30`)
 - `ADMIN_SESSION_ABSOLUTE_HOURS=12` (optional, default `12`)
@@ -148,12 +148,14 @@ For backward compatibility we keep the physical DB column name `email` for now. 
 ├── cmd/server/main.go       # entry point
 ├── internal/
 │   ├── auth/                # WebAuthn flows
+│   ├── adminauth/           # Admin passkey auth + session middleware
+│   ├── adminui/             # Server-rendered admin HTML UI
 │   ├── oidc/                # OIDC provider
 │   ├── store/               # Postgres access
 │   └── cache/               # Redis access
 ├── web/
 │   ├── static/js/glue.js    # navigator.credentials glue
-│   └── templates/           # HTMX templates
+│   └── templates/           # main templates + admin templates
 ├── Caddyfile
 ├── docker-compose.yml
 └── README.md
@@ -251,12 +253,30 @@ Admin OIDC client endpoints (`/admin/api/oidc/clients`):
 - `POST /admin/api/oidc/clients/:id/secrets`
 - `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
 
+Admin HTML UI routes (`/admin/*`):
+- `GET /admin/login`
+- `POST /admin/logout`
+- `GET /admin/`
+- `GET /admin/clients`
+- `GET /admin/clients/new`
+- `POST /admin/clients/new`
+- `GET /admin/clients/:id`
+- `GET /admin/clients/:id/edit`
+- `POST /admin/clients/:id/edit`
+- `GET /admin/clients/:id/redirect-uris`
+- `POST /admin/clients/:id/redirect-uris`
+- `GET /admin/clients/:id/secrets/new`
+- `POST /admin/clients/:id/secrets`
+- `POST /admin/clients/:id/secrets/:secretID/revoke`
+
 Authentication and protection:
 - primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
 - session auth is passkey-only (`/admin/auth/login/*`), separate from regular user sessions
+- admin HTML UI (`/admin/*`) is session-only and always redirects unauthenticated users to `/admin/login`
 - host guard: admin routes are served only on `ADMIN_API_HOST` (wrong host returns `404`)
 - dedicated rate limit on admin routes (`429` on exceed)
 - legacy bearer token fallback is optional and controlled by `ADMIN_API_TOKEN_ENABLED`
+- token fallback is not used for HTML UI routes
 
 Bootstrap first admin:
 1. Set `ADMIN_BOOTSTRAP_LOGIN`.
@@ -267,6 +287,7 @@ Bootstrap first admin:
 Security behavior:
 - secret hashes and plaintext secrets are never returned from list/detail endpoints
 - `plain_secret` is returned one-time only in `POST .../secrets` when `generate=true`
+- generated secret in HTML UI is shown one-time on the immediate success page and never persisted for later reads
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
 - admin requests include `X-Request-ID`

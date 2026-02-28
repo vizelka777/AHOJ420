@@ -1,0 +1,72 @@
+{{define "content"}}
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+    <h1 style="margin:0;">OIDC Clients</h1>
+    <a class="btn" href="/admin/clients/new">New client</a>
+  </div>
+
+  <form method="get" action="/admin/clients" style="margin-top:14px;">
+    <div class="row">
+      <div>
+        <label for="q">Search by ID or name</label>
+        <input id="q" type="text" name="q" value="{{.Query}}" placeholder="mushroom-bff">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit">Search</button>
+      <a class="btn secondary" href="/admin/clients">Reset</a>
+    </div>
+  </form>
+</div>
+
+<div class="panel table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Status</th>
+        <th>Type</th>
+        <th>Auth</th>
+        <th>Redirect URIs</th>
+        <th>Active Secrets</th>
+        <th>Updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{if .Clients}}
+        {{range .Clients}}
+          <tr>
+            <td class="mono">{{.ID}}</td>
+            <td>{{if .Name}}{{.Name}}{{else}}-{{end}}</td>
+            <td>
+              {{if .Enabled}}
+                <span class="chip ok">enabled</span>
+              {{else}}
+                <span class="chip warn">disabled</span>
+              {{end}}
+            </td>
+            <td>
+              {{if .Confidential}}
+                <span class="chip">confidential</span>
+              {{else}}
+                <span class="chip">public</span>
+              {{end}}
+            </td>
+            <td class="mono">{{.AuthMethod}}</td>
+            <td>{{.RedirectURICount}}</td>
+            <td>{{.ActiveSecretCount}}</td>
+            <td class="mono">{{formatTime .UpdatedAt}}</td>
+            <td><a class="btn secondary" href="/admin/clients/{{.ID}}">Open</a></td>
+          </tr>
+        {{end}}
+      {{else}}
+        <tr>
+          <td colspan="9">No clients found.</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

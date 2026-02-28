@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="panel" style="max-width: 920px;">
+  <h1 style="margin-top:0;">Replace Redirect URIs</h1>
+  <p class="hint">One URI per line. Existing list will be fully replaced.</p>
+
+  {{if .Error}}
+    <div class="error">{{.Error}}</div>
+  {{end}}
+
+  <div class="hint" style="margin-bottom:10px;">
+    Client: <span class="mono">{{.ClientID}}</span>{{if .ClientName}} ({{.ClientName}}){{end}}
+  </div>
+
+  <form method="post" action="/admin/clients/{{.ClientID}}/redirect-uris">
+    <label for="redirect_uris">Redirect URIs</label>
+    <textarea id="redirect_uris" name="redirect_uris" style="min-height:220px;">{{.RedirectURIsRaw}}</textarea>
+
+    <div class="actions">
+      <button type="submit">Replace redirect URIs</button>
+      <a class="btn secondary" href="/admin/clients/{{.ClientID}}">Back</a>
+    </div>
+  </form>
+</div>
+{{end}}

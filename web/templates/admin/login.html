@@ -1,0 +1,118 @@
+{{define "content"}}
+<div class="panel" style="max-width: 520px; margin: 50px auto;">
+  <h1 style="margin-top:0;">Admin Login</h1>
+  <p class="hint">Use your registered passkey to open the internal admin panel.</p>
+
+  <div id="login-error" class="error" style="display:none;"></div>
+
+  <div class="actions" style="margin-top: 18px;">
+    <button type="button" id="login-btn">Sign in with passkey</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  const loginButton = document.getElementById("login-btn");
+  const errorBox = document.getElementById("login-error");
+
+  function setError(message) {
+    errorBox.style.display = "block";
+    errorBox.textContent = message || "Login failed";
+  }
+
+  function clearError() {
+    errorBox.style.display = "none";
+    errorBox.textContent = "";
+  }
+
+  function b64uToBytes(value) {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(base64);
+    return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+  }
+
+  function bytesToB64u(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  async function beginLogin() {
+    const res = await fetch("/admin/auth/login/begin", {
+      method: "POST",
+      credentials: "include"
+    });
+    if (!res.ok) {
+      throw new Error("Unable to start passkey login (" + res.status + ")");
+    }
+    const data = await res.json();
+    return data.publicKey || data;
+  }
+
+  async function finishLogin(assertion) {
+    const body = {
+      id: assertion.id,
+      type: assertion.type,
+      rawId: bytesToB64u(assertion.rawId),
+      response: {
+        authenticatorData: bytesToB64u(assertion.response.authenticatorData),
+        clientDataJSON: bytesToB64u(assertion.response.clientDataJSON),
+        signature: bytesToB64u(assertion.response.signature),
+        userHandle: assertion.response.userHandle ? bytesToB64u(assertion.response.userHandle) : ""
+      }
+    };
+
+    const res = await fetch("/admin/auth/login/finish", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      let message = "Passkey login failed";
+      try {
+        const payload = await res.json();
+        if (payload && payload.message) {
+          message = payload.message;
+        }
+      } catch (_) {}
+      throw new Error(message);
+    }
+  }
+
+  loginButton.addEventListener("click", async function () {
+    clearError();
+    loginButton.disabled = true;
+    loginButton.textContent = "Signing in...";
+
+    try {
+      const publicKey = await beginLogin();
+      publicKey.challenge = b64uToBytes(publicKey.challenge);
+      if (publicKey.allowCredentials) {
+        publicKey.allowCredentials = publicKey.allowCredentials.map((item) => ({
+          ...item,
+          id: b64uToBytes(item.id)
+        }));
+      }
+
+      const assertion = await navigator.credentials.get({ publicKey });
+      if (!assertion) {
+        throw new Error("No passkey assertion returned");
+      }
+
+      await finishLogin(assertion);
+      window.location.href = "/admin/";
+    } catch (err) {
+      setError(err && err.message ? err.message : "Login failed");
+      loginButton.disabled = false;
+      loginButton.textContent = "Sign in with passkey";
+    }
+  });
+})();
+</script>
+{{end}}

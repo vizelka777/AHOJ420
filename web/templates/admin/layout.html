@@ -1,0 +1,187 @@
+{{define "layout"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --surface: #ffffff;
+      --text: #102131;
+      --muted: #5f7287;
+      --border: #d6dee8;
+      --accent: #1259b3;
+      --ok: #0a7f3f;
+      --warn: #9b1c1c;
+      --chip-bg: #edf3fb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      line-height: 1.4;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .container { max-width: 1120px; margin: 0 auto; padding: 20px; }
+    .top {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .top-inner {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .menu { display: flex; align-items: center; gap: 14px; }
+    .user { color: var(--muted); font-size: 14px; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; }
+    .row > * { flex: 1 1 220px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input[type=text],
+    input[type=password],
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+      background: #fff;
+      color: var(--text);
+    }
+    textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, Menlo, Monaco, Consolas, monospace; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    button,
+    .btn {
+      background: var(--accent);
+      border: 1px solid var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      padding: 9px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .btn.secondary,
+    button.secondary {
+      background: #fff;
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn.warn,
+    button.warn {
+      background: #fff3f3;
+      color: var(--warn);
+      border-color: #eab8b8;
+    }
+    .flash {
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      border: 1px solid var(--border);
+      background: #edf3fb;
+    }
+    .flash.success {
+      background: #ebf8f0;
+      color: var(--ok);
+      border-color: #bfe3cc;
+    }
+    .flash.error {
+      background: #fff0f0;
+      color: var(--warn);
+      border-color: #f0c2c2;
+    }
+    .error {
+      border: 1px solid #f0c2c2;
+      background: #fff0f0;
+      color: var(--warn);
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 12px;
+    }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      background: #fff;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .mono { font-family: ui-monospace, Menlo, Monaco, Consolas, monospace; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      display: inline-block;
+      border: 1px solid var(--border);
+      background: var(--chip-bg);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .chip.ok { background: #ebf8f0; border-color: #bfe3cc; color: var(--ok); }
+    .chip.warn { background: #fff0f0; border-color: #f0c2c2; color: var(--warn); }
+    .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+    .kv { margin: 0; }
+    .kv dt { color: var(--muted); font-size: 12px; text-transform: uppercase; margin-bottom: 4px; }
+    .kv dd { margin: 0 0 12px 0; font-weight: 600; }
+    .stack { display: flex; flex-direction: column; gap: 12px; }
+    @media (max-width: 700px) {
+      .top-inner { flex-direction: column; align-items: flex-start; }
+      .container { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="menu">
+        <a href="/admin/"><strong>AHOJ420 Admin</strong></a>
+        {{if .Admin}}
+          <a href="/admin/clients">Clients</a>
+        {{end}}
+      </div>
+      {{if .Admin}}
+      <div class="menu">
+        <span class="user">{{if .Admin.DisplayName}}{{.Admin.DisplayName}}{{else}}{{.Admin.Login}}{{end}}</span>
+        <form method="post" action="/admin/logout" style="margin:0;">
+          <button type="submit" class="secondary">Logout</button>
+        </form>
+      </div>
+      {{end}}
+    </div>
+  </header>
+
+  <main class="container">
+    {{if .Flash}}
+      <div class="flash {{.Flash.Kind}}">{{.Flash.Message}}</div>
+    {{end}}
+    {{template "content" .}}
+  </main>
+</body>
+</html>
+{{end}}

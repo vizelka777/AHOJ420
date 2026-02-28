@@ -16,6 +16,7 @@ import (
 
 	"github.com/houbamydar/AHOJ420/internal/admin"
 	"github.com/houbamydar/AHOJ420/internal/adminauth"
+	"github.com/houbamydar/AHOJ420/internal/adminui"
 	"github.com/houbamydar/AHOJ420/internal/auth"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
@@ -166,6 +167,21 @@ func main() {
 	adminGroup.Use(adminAuthService.AttachSessionActorMiddleware())
 	adminGroup.Use(admin.AdminRequireActorMiddleware(adminToken, adminTokenEnabled))
 	admin.RegisterOIDCClientRoutes(adminGroup, adminHandler)
+
+	adminUIHandler, err := adminui.NewHandler(userStore, oidcReloader, userStore, adminAuthService)
+	if err != nil {
+		log.Fatalf("Failed to init admin UI: %v", err)
+	}
+	adminUIGroup := e.Group("/admin")
+	adminUIGroup.Use(admin.AdminRequestIDMiddleware())
+	adminUIGroup.Use(admin.AdminHostGuardMiddleware(adminHost))
+	adminUIGroup.Use(admin.AdminRateLimitMiddleware(admin.DefaultAdminRateLimitConfig))
+	adminui.RegisterPublicRoutes(adminUIGroup, adminUIHandler)
+
+	adminUIProtected := adminUIGroup.Group("")
+	adminUIProtected.Use(adminAuthService.AttachSessionActorMiddleware())
+	adminUIProtected.Use(adminAuthService.RequireSessionMiddleware("/admin/login"))
+	adminui.RegisterProtectedRoutes(adminUIProtected, adminUIHandler)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))
 	e.Any("/keys", oidcHandler)
