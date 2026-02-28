@@ -275,6 +275,7 @@ Admin HTML UI routes (`/admin/*`):
 - `POST /admin/admins/:id/invites/:inviteID/revoke`
 - `POST /admin/admins/:id/enable`
 - `POST /admin/admins/:id/disable`
+- `POST /admin/admins/:id/role`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
 - `POST /admin/clients/new`
@@ -320,11 +321,17 @@ Security behavior:
   - admin can sign out one session or all other sessions
 - multi-admin model:
   - admins are separate users in `admin_users`
-  - logged-in admin can create another admin user and generate one-time invite
+  - roles: `owner`, `admin` (stored in `admin_users.role`)
+  - owner-only admin-management actions: create admin, admin detail, invite create/revoke, enable/disable, role change
+  - logged-in owner can create another admin user and generate one-time invite
   - invite token plaintext is shown only once on immediate success page (never stored in plaintext)
   - invite accept flow (`/admin/invite/*` + `/admin/auth/invite/register/*`) registers first passkey for invited admin
   - invite is one-time (`used_at`), revoked/expired/used invites are blocked
   - invite flow is blocked when target admin already has credentials
+  - new admins are created as `admin` by default; promotion/demotion is done on admin detail page
+  - system always keeps at least one enabled owner:
+    - last enabled owner cannot be demoted to `admin`
+    - last enabled owner cannot be disabled
   - disabling admin blocks future login and invalidates active admin sessions for that user
 - sensitive admin actions require recent passkey re-authentication (`/admin/auth/reauth/*`)
   - recent re-auth timestamp is kept in admin session (`recent_auth_at_utc`)

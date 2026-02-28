@@ -22,3 +22,24 @@
 - Проверка после выката:
   - `https://admin.ahoj420.eu/admin/login` -> `200`
   - `https://ahoj420.eu/admin/login` -> `404`
+
+### RBAC MVP (owner/admin)
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`, `deployed`
+
+Сделано:
+- Добавлена минимальная RBAC-модель для `admin_users` с ролями `owner` и `admin`.
+- Добавлено поле `role` в схему БД (`admin_users`) с ограничением допустимых значений.
+- Обеспечено наличие минимум одного enabled owner (блокировки демоушена/disable последнего owner).
+- Добавлены owner-only backend guards для раздела `/admin/admins*` и invite/admin-management действий.
+- Добавлена смена роли на странице admin detail (`POST /admin/admins/:id/role`).
+- В UI скрыт пункт `Admins` для обычного `admin`.
+- Обновлены тесты `internal/adminui` и `internal/adminauth` под RBAC-поведение.
+- Обновлена документация (`README.md`, `ADMIN_UI.md`).
+
+Проверки:
+- `go test ./internal/adminui ./internal/adminauth` (через dockerized Go) — `ok`.
+- `go test ./...` (через dockerized Go) — `ok`.
+- Прод после выката:
+  - `https://admin.ahoj420.eu/admin/login` -> `200`
+  - `https://ahoj420.eu/admin/login` -> `404`

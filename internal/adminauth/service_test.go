@@ -1054,6 +1054,7 @@ func (f *fakeAdminStore) CreateAdminUser(login string, displayName string) (*sto
 		Login:       normalized,
 		DisplayName: strings.TrimSpace(displayName),
 		Enabled:     true,
+		Role:        store.AdminRoleAdmin,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		Credentials: []webauthn.Credential{},
@@ -1064,6 +1065,27 @@ func (f *fakeAdminStore) CreateAdminUser(login string, displayName string) (*sto
 	f.users[id] = user
 	f.usersByLogin[normalized] = id
 	return cloneAdminUser(user), nil
+}
+
+func (f *fakeAdminStore) SetAdminUserRole(id string, role string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id = strings.TrimSpace(id)
+	role = strings.TrimSpace(strings.ToLower(role))
+	if id == "" {
+		return store.ErrAdminUserNotFound
+	}
+	if !store.IsValidAdminRole(role) {
+		return store.ErrAdminRoleInvalid
+	}
+	user, ok := f.users[id]
+	if !ok {
+		return store.ErrAdminUserNotFound
+	}
+	user.Role = role
+	user.UpdatedAt = time.Now().UTC()
+	return nil
 }
 
 func (f *fakeAdminStore) GetAdminUser(id string) (*store.AdminUser, error) {

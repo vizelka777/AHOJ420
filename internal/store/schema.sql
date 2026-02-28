@@ -90,8 +90,42 @@ CREATE TABLE IF NOT EXISTS admin_users (
     login TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL DEFAULT '',
     enabled BOOLEAN NOT NULL DEFAULT true,
+    role TEXT NOT NULL DEFAULT 'admin',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT admin_users_role_check CHECK (role IN ('owner', 'admin'))
+);
+
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS role TEXT;
+UPDATE admin_users
+SET role = 'admin'
+WHERE trim(COALESCE(role, '')) = ''
+   OR trim(COALESCE(role, '')) NOT IN ('owner', 'admin');
+ALTER TABLE admin_users ALTER COLUMN role SET DEFAULT 'admin';
+ALTER TABLE admin_users ALTER COLUMN role SET NOT NULL;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'admin_users_role_check'
+    ) THEN
+        ALTER TABLE admin_users
+            ADD CONSTRAINT admin_users_role_check CHECK (role IN ('owner', 'admin'));
+    END IF;
+END $$;
+UPDATE admin_users
+SET role = 'owner'
+WHERE id = (
+    SELECT u.id
+    FROM admin_users u
+    ORDER BY u.created_at ASC, lower(trim(u.login)) ASC
+    LIMIT 1
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM admin_users
+    WHERE role = 'owner'
 );
 
 CREATE TABLE IF NOT EXISTS admin_credentials (

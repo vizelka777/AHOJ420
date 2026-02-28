@@ -45,6 +45,7 @@ type adminStore interface {
 	CountAdminUsers() (int, error)
 	CountAdminCredentials() (int, error)
 	CreateAdminUser(login string, displayName string) (*store.AdminUser, error)
+	SetAdminUserRole(id string, role string) error
 	GetAdminUser(id string) (*store.AdminUser, error)
 	GetAdminUserByLogin(login string) (*store.AdminUser, error)
 	GetAdminUserByCredentialID(credentialID []byte) (*store.AdminUser, error)
@@ -231,7 +232,9 @@ func (s *Service) SessionUser(c echo.Context) (*store.AdminUser, bool) {
 		return nil, false
 	}
 	admin.SetAdminActor(c, "admin_user", adminUser.ID)
+	admin.SetAdminActorRole(c, adminUser.Role)
 	c.Set("admin_user", adminUser)
+	c.Set("admin_user_role", strings.TrimSpace(strings.ToLower(adminUser.Role)))
 	return adminUser, true
 }
 
@@ -1309,7 +1312,15 @@ func (s *Service) ensureBootstrapUser() (*store.AdminUser, error) {
 
 	switch {
 	case usersCount == 0:
-		return s.store.CreateAdminUser(bootstrapLogin, bootstrapLogin)
+		adminUser, err := s.store.CreateAdminUser(bootstrapLogin, bootstrapLogin)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.store.SetAdminUserRole(adminUser.ID, store.AdminRoleOwner); err != nil {
+			return nil, err
+		}
+		adminUser.Role = store.AdminRoleOwner
+		return adminUser, nil
 	case usersCount == 1 && credentialsCount == 0:
 		adminUser, err := s.store.GetAdminUserByLogin(bootstrapLogin)
 		if err != nil {

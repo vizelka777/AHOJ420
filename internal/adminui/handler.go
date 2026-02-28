@@ -48,6 +48,8 @@ type OIDCClientStore interface {
 	ListAdminUsers() ([]store.AdminUser, error)
 	SetAdminUserEnabled(id string, enabled bool) error
 	CountEnabledAdminUsers() (int, error)
+	CountEnabledAdminUsersByRole(role string) (int, error)
+	SetAdminUserRole(id string, role string) error
 	CountAdminCredentialsForUser(adminUserID string) (int, error)
 	CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*store.AdminInvite, error)
 	GetAdminInviteByID(ctx context.Context, inviteID int64) (*store.AdminInvite, error)
@@ -97,6 +99,7 @@ type flashMessage struct {
 type layoutData struct {
 	Title            string
 	Admin            *store.AdminUser
+	IsOwner          bool
 	Flash            *flashMessage
 	CSRFToken        string
 	ReauthTTLSeconds int
@@ -284,6 +287,7 @@ type adminUserListItem struct {
 	Login             string
 	DisplayName       string
 	Enabled           bool
+	Role              string
 	CreatedAt         time.Time
 	CredentialCount   int
 	ActiveInviteCount int
@@ -330,6 +334,7 @@ type adminDetailPageData struct {
 	CredentialCount       int
 	ActiveInviteCount     int
 	Invites               []adminInviteView
+	RoleOptions           []string
 	DefaultInviteNote     string
 	DefaultInviteTTLHours int
 	Error                 string
@@ -386,6 +391,7 @@ func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.POST("/admins/:id/invites/:inviteID/revoke", handler.AdminInviteRevoke)
 	group.POST("/admins/:id/disable", handler.AdminDisable)
 	group.POST("/admins/:id/enable", handler.AdminEnable)
+	group.POST("/admins/:id/role", handler.AdminRoleUpdate)
 	group.POST("/logout", handler.Logout)
 	group.POST("/security/passkeys/:id/delete", handler.SecurityPasskeyDelete)
 	group.POST("/security/sessions/:id/logout", handler.SecuritySessionLogout)
@@ -633,7 +639,10 @@ func (h *Handler) InviteAcceptPage(c echo.Context) error {
 }
 
 func (h *Handler) AdminsList(c echo.Context) error {
-	adminUser := h.currentAdmin(c)
+	adminUser, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	admins, err := h.store.ListAdminUsers()
 	if err != nil {
 		return h.render(c, http.StatusInternalServerError, "admins_list.html", adminsListPageData{
@@ -649,6 +658,7 @@ func (h *Handler) AdminsList(c echo.Context) error {
 			Login:             strings.TrimSpace(item.Login),
 			DisplayName:       strings.TrimSpace(item.DisplayName),
 			Enabled:           item.Enabled,
+			Role:              store.NormalizeAdminRole(item.Role),
 			CreatedAt:         item.CreatedAt,
 			CredentialCount:   item.CredentialCount,
 			ActiveInviteCount: item.ActiveInviteCount,
@@ -662,7 +672,10 @@ func (h *Handler) AdminsList(c echo.Context) error {
 }
 
 func (h *Handler) AdminNew(c echo.Context) error {
-	adminUser := h.currentAdmin(c)
+	adminUser, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	return h.render(c, http.StatusOK, "admin_new.html", adminNewPageData{
 		layoutData:     h.newLayoutData(c, adminUser, "New Admin"),
 		InviteTTLHours: defaultInviteTTLHours,
@@ -670,7 +683,10 @@ func (h *Handler) AdminNew(c echo.Context) error {
 }
 
 func (h *Handler) AdminCreate(c echo.Context) error {
-	currentAdmin := h.currentAdmin(c)
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	createdByID := ""
 	if currentAdmin != nil {
 		createdByID = strings.TrimSpace(currentAdmin.ID)
@@ -750,7 +766,10 @@ func (h *Handler) AdminCreate(c echo.Context) error {
 }
 
 func (h *Handler) AdminDetail(c echo.Context) error {
-	currentAdmin := h.currentAdmin(c)
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	targetAdminID := strings.TrimSpace(c.Param("id"))
 	if targetAdminID == "" {
 		return h.render(c, http.StatusBadRequest, "admin_detail.html", adminDetailPageData{
@@ -823,12 +842,16 @@ func (h *Handler) AdminDetail(c echo.Context) error {
 		CredentialCount:       credentialCount,
 		ActiveInviteCount:     activeInviteCount,
 		Invites:               invites,
+		RoleOptions:           []string{store.AdminRoleAdmin, store.AdminRoleOwner},
 		DefaultInviteTTLHours: defaultInviteTTLHours,
 	})
 }
 
 func (h *Handler) AdminInviteCreate(c echo.Context) error {
-	currentAdmin := h.currentAdmin(c)
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	createdByID := ""
 	if currentAdmin != nil {
 		createdByID = strings.TrimSpace(currentAdmin.ID)
@@ -895,6 +918,10 @@ func (h *Handler) AdminInviteCreate(c echo.Context) error {
 }
 
 func (h *Handler) AdminInviteRevoke(c echo.Context) error {
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	targetAdminID := strings.TrimSpace(c.Param("id"))
 	inviteID, err := strconv.ParseInt(strings.TrimSpace(c.Param("inviteID")), 10, 64)
 	if err != nil || inviteID <= 0 {
@@ -921,13 +948,17 @@ func (h *Handler) AdminInviteRevoke(c echo.Context) error {
 
 	h.auditAdminAction(c, "admin.invite.revoke.success", true, "admin_invite", strconv.FormatInt(inviteID, 10), nil, map[string]any{
 		"admin_user_id": targetAdminID,
+		"actor_role":    store.NormalizeAdminRole(currentAdmin.Role),
 	})
 	h.setFlash(c, "success", "Invite revoked")
 	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
 }
 
 func (h *Handler) AdminDisable(c echo.Context) error {
-	currentAdmin := h.currentAdmin(c)
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	targetAdminID := strings.TrimSpace(c.Param("id"))
 	if targetAdminID == "" {
 		h.setFlash(c, "error", "Invalid admin user ID")
@@ -950,14 +981,16 @@ func (h *Handler) AdminDisable(c echo.Context) error {
 		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
 	}
 
-	enabledCount, err := h.store.CountEnabledAdminUsers()
-	if err != nil {
-		h.setFlash(c, "error", "Failed to validate enabled admins")
-		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
-	}
-	if enabledCount <= 1 {
-		h.setFlash(c, "error", "Cannot disable last enabled admin")
-		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	if store.NormalizeAdminRole(targetAdmin.Role) == store.AdminRoleOwner {
+		ownerCount, countErr := h.store.CountEnabledAdminUsersByRole(store.AdminRoleOwner)
+		if countErr != nil {
+			h.setFlash(c, "error", "Failed to validate enabled owners")
+			return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+		}
+		if ownerCount <= 1 {
+			h.setFlash(c, "error", "Cannot disable the last enabled owner")
+			return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+		}
 	}
 
 	if err := h.store.SetAdminUserEnabled(targetAdminID, false); err != nil {
@@ -981,6 +1014,10 @@ func (h *Handler) AdminDisable(c echo.Context) error {
 }
 
 func (h *Handler) AdminEnable(c echo.Context) error {
+	_, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
 	targetAdminID := strings.TrimSpace(c.Param("id"))
 	if targetAdminID == "" {
 		h.setFlash(c, "error", "Invalid admin user ID")
@@ -1006,6 +1043,68 @@ func (h *Handler) AdminEnable(c echo.Context) error {
 
 	h.auditAdminAction(c, "admin.user.enable.success", true, "admin_user", targetAdminID, nil, nil)
 	h.setFlash(c, "success", "Admin user enabled")
+	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+}
+
+func (h *Handler) AdminRoleUpdate(c echo.Context) error {
+	currentAdmin, err := h.requireOwner(c)
+	if err != nil {
+		return err
+	}
+	targetAdminID := strings.TrimSpace(c.Param("id"))
+	if targetAdminID == "" {
+		h.setFlash(c, "error", "Invalid admin user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+
+	targetAdmin, err := h.store.GetAdminUser(targetAdminID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.role_change.failure", false, "admin_user", targetAdminID, err, nil)
+		h.setFlash(c, "error", "Admin user not found")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins")
+	}
+
+	currentRole := store.NormalizeAdminRole(targetAdmin.Role)
+	nextRoleRaw := strings.TrimSpace(c.FormValue("role"))
+	if !store.IsValidAdminRole(nextRoleRaw) {
+		h.setFlash(c, "error", "Invalid admin role")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+	nextRole := store.NormalizeAdminRole(nextRoleRaw)
+
+	if currentRole == nextRole {
+		h.setFlash(c, "success", "Role is already set")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	if currentRole == store.AdminRoleOwner && targetAdmin.Enabled && nextRole != store.AdminRoleOwner {
+		ownerCount, countErr := h.store.CountEnabledAdminUsersByRole(store.AdminRoleOwner)
+		if countErr != nil {
+			h.setFlash(c, "error", "Failed to validate enabled owners")
+			return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+		}
+		if ownerCount <= 1 {
+			h.setFlash(c, "error", "Cannot demote the last enabled owner")
+			return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+		}
+	}
+
+	if err := h.store.SetAdminUserRole(targetAdminID, nextRole); err != nil {
+		h.auditAdminAction(c, "admin.user.role_change.failure", false, "admin_user", targetAdminID, err, map[string]any{
+			"old_role":   currentRole,
+			"new_role":   nextRole,
+			"actor_role": store.NormalizeAdminRole(currentAdmin.Role),
+		})
+		h.setFlash(c, "error", "Failed to update admin role")
+		return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
+	}
+
+	h.auditAdminAction(c, "admin.user.role_change.success", true, "admin_user", targetAdminID, nil, map[string]any{
+		"old_role":   currentRole,
+		"new_role":   nextRole,
+		"actor_role": store.NormalizeAdminRole(currentAdmin.Role),
+	})
+	h.setFlash(c, "success", "Admin role updated")
 	return c.Redirect(http.StatusSeeOther, "/admin/admins/"+targetAdminID)
 }
 
@@ -1721,10 +1820,38 @@ func (h *Handler) ClientSecretRevoke(c echo.Context) error {
 
 func (h *Handler) currentAdmin(c echo.Context) *store.AdminUser {
 	if fromCtx, ok := c.Get("admin_user").(*store.AdminUser); ok && fromCtx != nil {
+		fromCtx.Role = store.NormalizeAdminRole(fromCtx.Role)
 		return fromCtx
 	}
 	adminUser, _ := h.auth.SessionUser(c)
+	if adminUser != nil {
+		adminUser.Role = store.NormalizeAdminRole(adminUser.Role)
+	}
 	return adminUser
+}
+
+func isAdminOwner(adminUser *store.AdminUser) bool {
+	if adminUser == nil {
+		return false
+	}
+	return store.NormalizeAdminRole(adminUser.Role) == store.AdminRoleOwner
+}
+
+func (h *Handler) requireOwner(c echo.Context) (*store.AdminUser, error) {
+	adminUser := h.currentAdmin(c)
+	if adminUser == nil {
+		return nil, c.String(http.StatusUnauthorized, "admin session is required")
+	}
+	if isAdminOwner(adminUser) {
+		return adminUser, nil
+	}
+	h.auditAdminAction(c, "admin.guard.permission_denied", false, "", "", nil, map[string]any{
+		"required_role": "owner",
+		"actor_role":    store.NormalizeAdminRole(adminUser.Role),
+		"path":          strings.TrimSpace(c.Path()),
+		"method":        strings.TrimSpace(c.Request().Method),
+	})
+	return nil, c.String(http.StatusForbidden, "owner role required")
 }
 
 func (h *Handler) recentReauthMaxAge() time.Duration {
@@ -1773,6 +1900,7 @@ func (h *Handler) newLayoutData(c echo.Context, adminUser *store.AdminUser, titl
 	return layoutData{
 		Title:            strings.TrimSpace(title),
 		Admin:            adminUser,
+		IsOwner:          isAdminOwner(adminUser),
 		Flash:            h.popFlash(c),
 		CSRFToken:        csrfToken,
 		ReauthTTLSeconds: int(h.recentReauthMaxAge().Seconds()),

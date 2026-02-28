@@ -30,6 +30,8 @@
           <dd>{{if .TargetAdmin.DisplayName}}{{.TargetAdmin.DisplayName}}{{else}}-{{end}}</dd>
           <dt>Status</dt>
           <dd>{{if .TargetAdmin.Enabled}}Enabled{{else}}Disabled{{end}}</dd>
+          <dt>Role</dt>
+          <dd><span class="chip">{{.TargetAdmin.Role}}</span></dd>
         </dl>
       </div>
 
@@ -49,6 +51,19 @@
           {{end}}
           <a class="btn secondary" href="/admin/admins">Back to admins</a>
         </div>
+        <p class="hint">At least one enabled owner must always remain.</p>
+        <form method="post" action="/admin/admins/{{.TargetAdmin.ID}}/role" style="margin-top:10px;">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+          <label for="role">Role</label>
+          <div class="actions" style="margin-top:6px;">
+            <select id="role" name="role" style="max-width:200px;">
+              {{range .RoleOptions}}
+                <option value="{{.}}" {{if eq $.TargetAdmin.Role .}}selected{{end}}>{{.}}</option>
+              {{end}}
+            </select>
+            <button type="submit">Update role</button>
+          </div>
+        </form>
       </div>
     </div>
   {{end}}

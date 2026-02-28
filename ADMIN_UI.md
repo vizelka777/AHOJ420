@@ -30,6 +30,7 @@ Protected (admin session required):
 - `POST /admin/admins/:id/invites/:inviteID/revoke`
 - `POST /admin/admins/:id/enable`
 - `POST /admin/admins/:id/disable`
+- `POST /admin/admins/:id/role`
 - `POST /admin/logout`
 - `POST /admin/security/passkeys/:id/delete`
 - `POST /admin/security/sessions/:id/logout`
@@ -75,8 +76,26 @@ Protected (admin session required):
 
 ## Multi-admin + Invite flow
 - multiple separate `admin_users` are supported (not just multiple passkeys for one user)
+- minimal RBAC roles:
+  - `owner`
+  - `admin`
+- owner-only actions:
+  - `GET /admin/admins`
+  - `GET /admin/admins/new`
+  - `POST /admin/admins/new`
+  - `GET /admin/admins/:id`
+  - `POST /admin/admins/:id/invites`
+  - `POST /admin/admins/:id/invites/:inviteID/revoke`
+  - `POST /admin/admins/:id/enable`
+  - `POST /admin/admins/:id/disable`
+  - `POST /admin/admins/:id/role`
+- `admin` role can still use allowed features:
+  - OIDC clients UI
+  - audit viewer
+  - own security page/logout/passkeys/sessions
 - create admin flow:
   - `POST /admin/admins/new` creates a new admin user and an invite
+  - new admin users are created with role `admin` by default
   - plaintext invite token/link is shown only on immediate success page
   - plaintext token is not stored in DB, only `token_hash` in `admin_invites`
 - invite accept flow:
@@ -87,11 +106,16 @@ Protected (admin session required):
 - admin detail actions:
   - create/revoke invite
   - enable/disable admin user
+  - change role (`admin` <-> `owner`)
   - disable invalidates all active sessions of that admin user
+  - protections:
+    - last enabled owner cannot be disabled
+    - last enabled owner cannot be demoted
 - audit actions:
   - `admin.user.create.success|failure`
   - `admin.user.enable.success|failure`
   - `admin.user.disable.success|failure`
+  - `admin.user.role_change.success|failure`
   - `admin.invite.create.success|failure`
   - `admin.invite.revoke.success|failure`
   - `admin.invite.accept.success|failure`

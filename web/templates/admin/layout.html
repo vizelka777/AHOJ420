@@ -166,12 +166,12 @@
           <a href="/admin/clients">Clients</a>
           <a href="/admin/audit">Audit log</a>
           <a href="/admin/security">Security</a>
-          <a href="/admin/admins">Admins</a>
+          {{if .IsOwner}}<a href="/admin/admins">Admins</a>{{end}}
         {{end}}
       </div>
       {{if .Admin}}
       <div class="menu">
-        <span class="user">{{if .Admin.DisplayName}}{{.Admin.DisplayName}}{{else}}{{.Admin.Login}}{{end}}</span>
+        <span class="user">{{if .Admin.DisplayName}}{{.Admin.DisplayName}}{{else}}{{.Admin.Login}}{{end}} ({{.Admin.Role}})</span>
         <form method="post" action="/admin/logout" style="margin:0;">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
           <button type="submit" class="secondary">Logout</button>

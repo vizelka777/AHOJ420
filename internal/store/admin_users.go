@@ -19,6 +19,12 @@ var (
 	ErrAdminCredentialNotFound = errors.New("admin credential not found")
 	ErrAdminUserDisabled       = errors.New("admin user is disabled")
 	ErrAdminCredentialLast     = errors.New("cannot delete last admin credential")
+	ErrAdminRoleInvalid        = errors.New("admin role is invalid")
+)
+
+const (
+	AdminRoleOwner = "owner"
+	AdminRoleAdmin = "admin"
 )
 
 type AdminUser struct {
@@ -26,6 +32,7 @@ type AdminUser struct {
 	Login             string
 	DisplayName       string
 	Enabled           bool
+	Role              string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	CredentialCount   int
@@ -64,6 +71,10 @@ func (u *AdminUser) WebAuthnCredentials() []webauthn.Credential {
 	return u.Credentials
 }
 
+func (u *AdminUser) IsOwner() bool {
+	return NormalizeAdminRole(u.Role) == AdminRoleOwner
+}
+
 func (s *Store) CountAdminUsers() (int, error) {
 	var count int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admin_users`).Scan(&count); err != nil {
@@ -80,6 +91,18 @@ func (s *Store) CountEnabledAdminUsers() (int, error) {
 	return count, nil
 }
 
+func (s *Store) CountEnabledAdminUsersByRole(role string) (int, error) {
+	role = strings.TrimSpace(strings.ToLower(role))
+	if !IsValidAdminRole(role) {
+		return 0, ErrAdminRoleInvalid
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admin_users WHERE enabled = true AND role = $1`, role).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *Store) ListAdminUsers() ([]AdminUser, error) {
 	rows, err := s.db.Query(`
 		SELECT
@@ -87,6 +110,7 @@ func (s *Store) ListAdminUsers() ([]AdminUser, error) {
 			u.login,
 			u.display_name,
 			u.enabled,
+			u.role,
 			u.created_at,
 			u.updated_at,
 			COALESCE(c.credential_count, 0),
@@ -120,6 +144,7 @@ func (s *Store) ListAdminUsers() ([]AdminUser, error) {
 			&item.Login,
 			&item.DisplayName,
 			&item.Enabled,
+			&item.Role,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 			&item.CredentialCount,
@@ -129,6 +154,7 @@ func (s *Store) ListAdminUsers() ([]AdminUser, error) {
 		}
 		item.Login = normalizeAdminLogin(item.Login)
 		item.DisplayName = strings.TrimSpace(item.DisplayName)
+		item.Role = NormalizeAdminRole(item.Role)
 		item.Credentials = []webauthn.Credential{}
 		out = append(out, item)
 	}
@@ -158,20 +184,22 @@ func (s *Store) CreateAdminUser(login string, displayName string) (*AdminUser, e
 
 	var out AdminUser
 	err := s.db.QueryRow(`
-		INSERT INTO admin_users (login, display_name)
-		VALUES ($1, $2)
-		RETURNING id::text, login, display_name, enabled, created_at, updated_at
-	`, login, displayName).Scan(
+		INSERT INTO admin_users (login, display_name, role)
+		VALUES ($1, $2, $3)
+		RETURNING id::text, login, display_name, enabled, role, created_at, updated_at
+	`, login, displayName, AdminRoleAdmin).Scan(
 		&out.ID,
 		&out.Login,
 		&out.DisplayName,
 		&out.Enabled,
+		&out.Role,
 		&out.CreatedAt,
 		&out.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+	out.Role = NormalizeAdminRole(out.Role)
 	out.Credentials = []webauthn.Credential{}
 	return &out, nil
 }
@@ -184,7 +212,7 @@ func (s *Store) GetAdminUser(id string) (*AdminUser, error) {
 
 	var out AdminUser
 	err := s.db.QueryRow(`
-		SELECT id::text, login, display_name, enabled, created_at, updated_at
+		SELECT id::text, login, display_name, enabled, role, created_at, updated_at
 		FROM admin_users
 		WHERE id = $1
 	`, id).Scan(
@@ -192,6 +220,7 @@ func (s *Store) GetAdminUser(id string) (*AdminUser, error) {
 		&out.Login,
 		&out.DisplayName,
 		&out.Enabled,
+		&out.Role,
 		&out.CreatedAt,
 		&out.UpdatedAt,
 	)
@@ -206,6 +235,7 @@ func (s *Store) GetAdminUser(id string) (*AdminUser, error) {
 	if err != nil {
 		return nil, err
 	}
+	out.Role = NormalizeAdminRole(out.Role)
 	out.Credentials = credentials
 	out.CredentialCount = len(credentials)
 	activeInvites, err := s.CountActiveAdminInvitesForUser(context.Background(), out.ID)
@@ -245,6 +275,33 @@ func (s *Store) SetAdminUserEnabled(id string, enabled bool) error {
 		SET enabled = $2, updated_at = NOW()
 		WHERE id = $1
 	`, id, enabled)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrAdminUserNotFound
+	}
+	return nil
+}
+
+func (s *Store) SetAdminUserRole(id string, role string) error {
+	id = strings.TrimSpace(id)
+	role = strings.TrimSpace(strings.ToLower(role))
+	if id == "" {
+		return ErrAdminUserNotFound
+	}
+	if !IsValidAdminRole(role) {
+		return ErrAdminRoleInvalid
+	}
+	res, err := s.db.Exec(`
+		UPDATE admin_users
+		SET role = $2, updated_at = NOW()
+		WHERE id = $1
+	`, id, role)
 	if err != nil {
 		return err
 	}
@@ -513,6 +570,25 @@ func (s *Store) listAdminCredentials(adminUserID string) ([]webauthn.Credential,
 
 func normalizeAdminLogin(login string) string {
 	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func NormalizeAdminRole(role string) string {
+	role = strings.TrimSpace(strings.ToLower(role))
+	switch role {
+	case AdminRoleOwner:
+		return AdminRoleOwner
+	default:
+		return AdminRoleAdmin
+	}
+}
+
+func IsValidAdminRole(role string) bool {
+	switch strings.TrimSpace(strings.ToLower(role)) {
+	case AdminRoleOwner, AdminRoleAdmin:
+		return true
+	default:
+		return false
+	}
 }
 
 func encodeCredentialDisplayID(raw []byte) string {

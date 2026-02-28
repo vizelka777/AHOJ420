@@ -234,6 +234,34 @@ func TestAdminsPageRequiresSession(t *testing.T) {
 	}
 }
 
+func TestOwnerCanAccessAdminsSection(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/admins", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for owner, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Admin Users") {
+		t.Fatalf("expected admins page content, got %s", rec.Body.String())
+	}
+}
+
+func TestAdminCannotAccessAdminsSection(t *testing.T) {
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/admins", nil, auth.sessionCookies())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-owner, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "owner role required") {
+		t.Fatalf("expected owner role error message, got %s", rec.Body.String())
+	}
+}
+
 func TestCreateSecondAdminUserAndInvite(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -255,6 +283,9 @@ func TestCreateSecondAdminUserAndInvite(t *testing.T) {
 	created, err := fakeStore.GetAdminUserByLogin("second-admin")
 	if err != nil {
 		t.Fatalf("expected created admin user, err=%v", err)
+	}
+	if created.Role != store.AdminRoleAdmin {
+		t.Fatalf("expected created admin role=%s, got %s", store.AdminRoleAdmin, created.Role)
 	}
 	invites, err := fakeStore.ListAdminInvites(context.Background(), created.ID)
 	if err != nil {
@@ -289,6 +320,152 @@ func TestCreateSecondAdminUserAndInvite(t *testing.T) {
 	}
 	if strings.Contains(recDetail.Body.String(), token) {
 		t.Fatalf("plaintext invite token should not be visible on admin detail page")
+	}
+}
+
+func TestAdminCannotCreateAdminUser(t *testing.T) {
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients", auth.sessionCookies())
+
+	form := url.Values{}
+	form.Set("login", "blocked-admin")
+	form.Set("display_name", "Blocked Admin")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/new", withCSRF(form, csrfToken), cookies)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-owner admin create, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOwnerCanChangeRole(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	target, err := fakeStore.CreateAdminUser("second", "Second")
+	if err != nil {
+		t.Fatalf("create second admin failed: %v", err)
+	}
+
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/"+target.ID, auth.sessionCookies())
+	formPromote := url.Values{}
+	formPromote.Set("role", store.AdminRoleOwner)
+	recPromote := doUIRequest(t, e, http.MethodPost, "/admin/admins/"+target.ID+"/role", withCSRF(formPromote, csrfToken), cookies)
+	if recPromote.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on promote, got %d body=%s", recPromote.Code, recPromote.Body.String())
+	}
+	afterPromote, err := fakeStore.GetAdminUser(target.ID)
+	if err != nil {
+		t.Fatalf("get promoted user failed: %v", err)
+	}
+	if afterPromote.Role != store.AdminRoleOwner {
+		t.Fatalf("expected promoted role owner, got %s", afterPromote.Role)
+	}
+
+	formDemote := url.Values{}
+	formDemote.Set("role", store.AdminRoleAdmin)
+	recDemote := doUIRequest(t, e, http.MethodPost, "/admin/admins/admin-1/role", withCSRF(formDemote, csrfToken), cookies)
+	if recDemote.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on demote, got %d body=%s", recDemote.Code, recDemote.Body.String())
+	}
+	rootAfter, err := fakeStore.GetAdminUser("admin-1")
+	if err != nil {
+		t.Fatalf("get root admin failed: %v", err)
+	}
+	if rootAfter.Role != store.AdminRoleAdmin {
+		t.Fatalf("expected root role admin after demote, got %s", rootAfter.Role)
+	}
+}
+
+func TestCannotDemoteLastEnabledOwner(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/admin-1", auth.sessionCookies())
+	form := url.Values{}
+	form.Set("role", store.AdminRoleAdmin)
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/admin-1/role", withCSRF(form, csrfToken), cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on blocked demote, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	root, err := fakeStore.GetAdminUser("admin-1")
+	if err != nil {
+		t.Fatalf("get root admin failed: %v", err)
+	}
+	if root.Role != store.AdminRoleOwner {
+		t.Fatalf("expected last owner role to stay owner, got %s", root.Role)
+	}
+}
+
+func TestCannotDisableLastEnabledOwner(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	extra, err := fakeStore.CreateAdminUser("owner2", "Owner Two")
+	if err != nil {
+		t.Fatalf("create extra admin failed: %v", err)
+	}
+	if err := fakeStore.SetAdminUserRole(extra.ID, store.AdminRoleOwner); err != nil {
+		t.Fatalf("set extra role failed: %v", err)
+	}
+	if err := fakeStore.SetAdminUserEnabled(extra.ID, false); err != nil {
+		t.Fatalf("disable extra owner failed: %v", err)
+	}
+
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: extra.ID, Login: "owner2", DisplayName: "Owner Two", Role: store.AdminRoleOwner},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/admins/admin-1", auth.sessionCookies())
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/admins/admin-1/disable", withCSRF(nil, csrfToken), cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on blocked disable, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	root, err := fakeStore.GetAdminUser("admin-1")
+	if err != nil {
+		t.Fatalf("get root admin failed: %v", err)
+	}
+	if !root.Enabled {
+		t.Fatalf("expected last enabled owner to remain enabled")
+	}
+}
+
+func TestAdminRoleStillAllowsClientsAuditAndSecurity(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-allowed",
+		Name:          "Allowed",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.org/cb"},
+	}, nil)
+
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	recClients := doUIRequest(t, e, http.MethodGet, "/admin/clients", nil, auth.sessionCookies())
+	if recClients.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /admin/clients for admin role, got %d body=%s", recClients.Code, recClients.Body.String())
+	}
+	recAudit := doUIRequest(t, e, http.MethodGet, "/admin/audit", nil, auth.sessionCookies())
+	if recAudit.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /admin/audit for admin role, got %d body=%s", recAudit.Code, recAudit.Body.String())
+	}
+	recSecurity := doUIRequest(t, e, http.MethodGet, "/admin/security", nil, auth.sessionCookies())
+	if recSecurity.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /admin/security for admin role, got %d body=%s", recSecurity.Code, recSecurity.Body.String())
 	}
 }
 
@@ -1256,10 +1433,13 @@ func (a *fakeUIAuth) SessionUser(c echo.Context) (*store.AdminUser, bool) {
 	}
 	user := a.user
 	if strings.TrimSpace(user.ID) == "" {
-		user = store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin"}
+		user = store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleOwner}
 	}
+	user.Role = store.NormalizeAdminRole(user.Role)
 	admin.SetAdminActor(c, "admin_user", user.ID)
+	admin.SetAdminActorRole(c, user.Role)
 	c.Set("admin_user", &user)
+	c.Set("admin_user_role", user.Role)
 	if !a.disableAutoRecentReauth && a.recentReauthAt == nil {
 		now := time.Now().UTC()
 		a.recentReauthAt = &now
@@ -1515,6 +1695,7 @@ func newFakeUIStore() *fakeUIStore {
 		Login:       "admin",
 		DisplayName: "Admin",
 		Enabled:     true,
+		Role:        store.AdminRoleOwner,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -1743,6 +1924,7 @@ func (s *fakeUIStore) CreateAdminUser(login string, displayName string) (*store.
 		Login:       login,
 		DisplayName: displayName,
 		Enabled:     true,
+		Role:        store.AdminRoleAdmin,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -1764,6 +1946,7 @@ func (s *fakeUIStore) GetAdminUser(id string) (*store.AdminUser, error) {
 	}
 	copyUser := *user
 	copyUser.CredentialCount = s.adminCredentialCount[id]
+	copyUser.Role = store.NormalizeAdminRole(copyUser.Role)
 	return &copyUser, nil
 }
 
@@ -1781,6 +1964,7 @@ func (s *fakeUIStore) ListAdminUsers() ([]store.AdminUser, error) {
 	for id, user := range s.adminUsers {
 		item := *user
 		item.CredentialCount = s.adminCredentialCount[id]
+		item.Role = store.NormalizeAdminRole(item.Role)
 		active := 0
 		now := time.Now().UTC()
 		for _, invite := range s.adminInvites {
@@ -1819,6 +2003,41 @@ func (s *fakeUIStore) CountEnabledAdminUsers() (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func (s *fakeUIStore) CountEnabledAdminUsersByRole(role string) (int, error) {
+	role = strings.TrimSpace(strings.ToLower(role))
+	if !store.IsValidAdminRole(role) {
+		return 0, store.ErrAdminRoleInvalid
+	}
+	count := 0
+	for _, user := range s.adminUsers {
+		if !user.Enabled {
+			continue
+		}
+		if store.NormalizeAdminRole(user.Role) == role {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *fakeUIStore) SetAdminUserRole(id string, role string) error {
+	id = strings.TrimSpace(id)
+	role = strings.TrimSpace(strings.ToLower(role))
+	if id == "" {
+		return store.ErrAdminUserNotFound
+	}
+	if !store.IsValidAdminRole(role) {
+		return store.ErrAdminRoleInvalid
+	}
+	user, ok := s.adminUsers[id]
+	if !ok {
+		return store.ErrAdminUserNotFound
+	}
+	user.Role = role
+	user.UpdatedAt = time.Now().UTC()
+	return nil
 }
 
 func (s *fakeUIStore) CountAdminCredentialsForUser(adminUserID string) (int, error) {
