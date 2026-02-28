@@ -66,6 +66,225 @@ func TestClientsRequireSession(t *testing.T) {
 	}
 }
 
+func TestOverviewRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestOverviewRendersSummaryAndRecentBlocks(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{
+		entries: []store.AdminAuditEntry{
+			{
+				ID:           1,
+				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+				Action:       "admin.oidc_client.create",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "oidc_client",
+				ResourceID:   "client-a",
+				RequestID:    "req-ok",
+				RemoteIP:     "127.0.0.1",
+				DetailsJSON:  json.RawMessage(`{"x":1}`),
+			},
+			{
+				ID:           2,
+				CreatedAt:    time.Now().UTC().Add(-1 * time.Minute),
+				Action:       "admin.oidc_client.secret.revoke",
+				Success:      false,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "oidc_client_secret",
+				ResourceID:   "12",
+				RequestID:    "req-fail",
+				RemoteIP:     "127.0.0.1",
+				DetailsJSON:  json.RawMessage(`{"error":"x"}`),
+			},
+		},
+	}
+
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-a",
+		Name:          "A",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://a.example/cb"},
+	}, []store.OIDCClientSecretInput{{PlainSecret: "secret-a"}})
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-b",
+		Name:          "B",
+		Enabled:       false,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://b.example/cb"},
+	}, nil)
+
+	target, err := fakeStore.CreateAdminUser("pending", "Pending Admin")
+	if err != nil {
+		t.Fatalf("create pending admin failed: %v", err)
+	}
+	_, err = fakeStore.CreateAdminInvite(context.Background(), target.ID, "admin-1", "hash-active", time.Now().UTC().Add(12*time.Hour), "oncall")
+	if err != nil {
+		t.Fatalf("create active invite failed: %v", err)
+	}
+	_, err = fakeStore.CreateAdminInvite(context.Background(), target.ID, "admin-1", "hash-expired", time.Now().UTC().Add(-2*time.Hour), "expired")
+	if err != nil {
+		t.Fatalf("create expired invite failed: %v", err)
+	}
+
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Overview Dashboard",
+		"Recent Audit Activity",
+		"Recent Failures",
+		"Recent Client Changes",
+		"Pending Invites",
+		"Admin Users",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on overview page", expected)
+		}
+	}
+}
+
+func TestOverviewOwnerSeesPendingInvites(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	target, _ := fakeStore.CreateAdminUser("invitee", "Invitee")
+	_, _ = fakeStore.CreateAdminInvite(context.Background(), target.ID, "admin-1", "h-owner", time.Now().UTC().Add(8*time.Hour), "")
+
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Pending Invites") || !strings.Contains(body, "invitee") {
+		t.Fatalf("owner should see pending invites block, body=%s", body)
+	}
+}
+
+func TestOverviewNonOwnerHidesOwnerOnlyBlocks(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+	}
+	target, _ := fakeStore.CreateAdminUser("invitee", "Invitee")
+	_, _ = fakeStore.CreateAdminInvite(context.Background(), target.ID, "admin-1", "h-nonowner", time.Now().UTC().Add(8*time.Hour), "")
+
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "Pending Invites") || strings.Contains(body, "Admin Users") {
+		t.Fatalf("non-owner should not see owner-only dashboard blocks, body=%s", body)
+	}
+}
+
+func TestOverviewRecentFailuresBlockShowsFailures(t *testing.T) {
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{
+		entries: []store.AdminAuditEntry{
+			{
+				ID:           1,
+				CreatedAt:    time.Now().UTC(),
+				Action:       "admin.oidc_client.secret.revoke",
+				Success:      false,
+				ActorType:    "admin_user",
+				ActorID:      "admin-1",
+				ResourceType: "oidc_client_secret",
+				ResourceID:   "99",
+				RequestID:    "req-f",
+				RemoteIP:     "127.0.0.1",
+				DetailsJSON:  json.RawMessage(`{"error":"failed"}`),
+			},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, auditStore)
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Recent Failures") || !strings.Contains(body, "admin.oidc_client.secret.revoke") {
+		t.Fatalf("expected failure action in recent failures block, body=%s", body)
+	}
+}
+
+func TestOverviewClientSummaryCounts(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+	}
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-1",
+		Name:          "C1",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://c1.example/cb"},
+	}, []store.OIDCClientSecretInput{{PlainSecret: "secret-1"}})
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-2",
+		Name:          "C2",
+		Enabled:       false,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://c2.example/cb"},
+	}, nil)
+
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"<dt>Total</dt><dd>2</dd>",
+		"<dt>Enabled</dt><dd>1</dd>",
+		"<dt>Disabled</dt><dd>1</dd>",
+		"<dt>Confidential</dt><dd>1</dd>",
+		"<dt>Public</dt><dd>1</dd>",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected summary snippet %q, body=%s", expected, body)
+		}
+	}
+}
+
 func TestAuditLogPageRequiresSession(t *testing.T) {
 	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
 
@@ -1676,6 +1895,23 @@ func (a *fakeAuditStore) ListAdminAuditEntries(ctx context.Context, opts store.A
 	return append([]store.AdminAuditEntry(nil), filtered[offset:end]...), nil
 }
 
+func (a *fakeAuditStore) CountAdminAuditFailuresSince(ctx context.Context, since time.Time) (int, error) {
+	if since.IsZero() {
+		since = time.Now().UTC().Add(-24 * time.Hour)
+	}
+	count := 0
+	for _, entry := range a.entries {
+		if entry.Success {
+			continue
+		}
+		if entry.CreatedAt.UTC().Before(since.UTC()) {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
 type fakeUIStore struct {
 	clients              map[string]store.OIDCClient
 	secrets              map[string][]store.OIDCClientSecret
@@ -2049,6 +2285,72 @@ func (s *fakeUIStore) CountAdminCredentialsForUser(adminUserID string) (int, err
 		return 0, store.ErrAdminUserNotFound
 	}
 	return s.adminCredentialCount[adminUserID], nil
+}
+
+func (s *fakeUIStore) CountActiveAdminInvites(ctx context.Context) (int, error) {
+	now := time.Now().UTC()
+	count := 0
+	for _, invite := range s.adminInvites {
+		if invite.UsedAt == nil && invite.RevokedAt == nil && invite.ExpiresAt.After(now) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *fakeUIStore) CountExpiredUnusedAdminInvites(ctx context.Context) (int, error) {
+	now := time.Now().UTC()
+	count := 0
+	for _, invite := range s.adminInvites {
+		if invite.UsedAt == nil && invite.RevokedAt == nil && !invite.ExpiresAt.After(now) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *fakeUIStore) ListActiveAdminInvites(ctx context.Context, limit int) ([]store.ActiveAdminInviteOverview, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	now := time.Now().UTC()
+	out := make([]store.ActiveAdminInviteOverview, 0, len(s.adminInvites))
+	for _, invite := range s.adminInvites {
+		if invite.UsedAt != nil || invite.RevokedAt != nil || !invite.ExpiresAt.After(now) {
+			continue
+		}
+		targetUser, ok := s.adminUsers[strings.TrimSpace(invite.AdminUserID)]
+		if !ok {
+			continue
+		}
+		creatorUser, ok := s.adminUsers[strings.TrimSpace(invite.CreatedByAdminUserID)]
+		if !ok {
+			continue
+		}
+		out = append(out, store.ActiveAdminInviteOverview{
+			ID:                   invite.ID,
+			AdminUserID:          strings.TrimSpace(invite.AdminUserID),
+			AdminLogin:           strings.TrimSpace(targetUser.Login),
+			CreatedByAdminUserID: strings.TrimSpace(invite.CreatedByAdminUserID),
+			CreatedByLogin:       strings.TrimSpace(creatorUser.Login),
+			CreatedAt:            invite.CreatedAt,
+			ExpiresAt:            invite.ExpiresAt,
+			Note:                 strings.TrimSpace(invite.Note),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ExpiresAt.Equal(out[j].ExpiresAt) {
+			if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+				return out[i].ID > out[j].ID
+			}
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ExpiresAt.Before(out[j].ExpiresAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *fakeUIStore) CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*store.AdminInvite, error) {

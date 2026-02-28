@@ -6,6 +6,7 @@ Internal server-rendered admin panel for OIDC client management.
 - host-guarded (`ADMIN_API_HOST`)
 - session-only auth (`admin_session` cookie)
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
+- overview dashboard (`GET /admin/`) with role-aware operational summary
 - passkey login via `/admin/auth/login/*`
 - admin self-security page (`/admin/security`) for passkeys + sessions
 - step-up re-auth for sensitive actions (recent passkey assertion required)
@@ -55,6 +56,21 @@ Protected (admin session required):
   - cryptographically random token is generated server-side (`admin_csrf`, Secure, HttpOnly, SameSite=Strict, Path=/admin)
   - token is injected into templates via shared `layoutData.CSRFToken`
   - all mutating forms include `<input type="hidden" name="csrf_token" ...>`
+
+## Overview Dashboard (`GET /admin/`)
+- read-only operational landing page with compact blocks:
+  - summary cards (OIDC client state totals)
+  - recent audit activity preview
+  - recent failures preview (separate from full audit stream)
+  - recent client-related audit changes (`admin.oidc_client*`)
+- owner-only on dashboard:
+  - admin users summary cards (total/enabled/owner/admin/invites)
+  - pending active invites list (with links to admin detail)
+- non-owner admin still sees:
+  - OIDC summary
+  - recent audit
+  - recent failures
+  - recent client changes
 
 ## Step-up re-authentication
 - endpoints:

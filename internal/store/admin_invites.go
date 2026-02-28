@@ -26,6 +26,17 @@ type AdminInvite struct {
 	Note                 string
 }
 
+type ActiveAdminInviteOverview struct {
+	ID                   int64
+	AdminUserID          string
+	AdminLogin           string
+	CreatedByAdminUserID string
+	CreatedByLogin       string
+	CreatedAt            time.Time
+	ExpiresAt            time.Time
+	Note                 string
+}
+
 func (s *Store) CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*AdminInvite, error) {
 	adminUserID = strings.TrimSpace(adminUserID)
 	createdBy = strings.TrimSpace(createdBy)
@@ -250,6 +261,93 @@ func (s *Store) CountActiveAdminInvitesForUser(ctx context.Context, adminUserID 
 		return 0, err
 	}
 	return count, nil
+}
+
+func (s *Store) CountActiveAdminInvites(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM admin_invites
+		WHERE used_at IS NULL
+		  AND revoked_at IS NULL
+		  AND expires_at > NOW()
+	`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) CountExpiredUnusedAdminInvites(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM admin_invites
+		WHERE used_at IS NULL
+		  AND revoked_at IS NULL
+		  AND expires_at <= NOW()
+	`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) ListActiveAdminInvites(ctx context.Context, limit int) ([]ActiveAdminInviteOverview, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			i.id,
+			i.admin_user_id::text,
+			target.login,
+			i.created_by_admin_user_id::text,
+			creator.login,
+			i.created_at,
+			i.expires_at,
+			i.note
+		FROM admin_invites i
+		JOIN admin_users target ON target.id = i.admin_user_id
+		JOIN admin_users creator ON creator.id = i.created_by_admin_user_id
+		WHERE i.used_at IS NULL
+		  AND i.revoked_at IS NULL
+		  AND i.expires_at > NOW()
+		ORDER BY i.expires_at ASC, i.created_at DESC, i.id DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ActiveAdminInviteOverview, 0, limit)
+	for rows.Next() {
+		var item ActiveAdminInviteOverview
+		if err := rows.Scan(
+			&item.ID,
+			&item.AdminUserID,
+			&item.AdminLogin,
+			&item.CreatedByAdminUserID,
+			&item.CreatedByLogin,
+			&item.CreatedAt,
+			&item.ExpiresAt,
+			&item.Note,
+		); err != nil {
+			return nil, err
+		}
+		item.AdminUserID = strings.TrimSpace(item.AdminUserID)
+		item.AdminLogin = strings.TrimSpace(item.AdminLogin)
+		item.CreatedByAdminUserID = strings.TrimSpace(item.CreatedByAdminUserID)
+		item.CreatedByLogin = strings.TrimSpace(item.CreatedByLogin)
+		item.Note = strings.TrimSpace(item.Note)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) getAdminInviteBy(ctx context.Context, query string, arg any) (*AdminInvite, error) {

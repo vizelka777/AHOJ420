@@ -304,6 +304,17 @@ Authentication and protection:
 - legacy bearer token fallback is optional and controlled by `ADMIN_API_TOKEN_ENABLED`
 - token fallback is not used for HTML UI routes
 
+Overview dashboard (`GET /admin/`):
+- read-only operational landing page after login
+- shows compact summaries and recent activity:
+  - OIDC client totals/state
+  - recent audit activity preview
+  - recent failures preview (separate block)
+  - recent OIDC client change events
+- owner-only blocks:
+  - admin users summary (owners/admins/invites)
+  - pending active invites list
+
 Bootstrap first admin:
 1. Set `ADMIN_BOOTSTRAP_LOGIN`.
 2. When there are no admin users/credentials, call `POST /admin/auth/register/begin`.
@@ -333,6 +344,9 @@ Security behavior:
     - last enabled owner cannot be demoted to `admin`
     - last enabled owner cannot be disabled
   - disabling admin blocks future login and invalidates active admin sessions for that user
+  - overview dashboard is role-aware:
+    - `owner` sees pending invites and full admin summary
+    - `admin` sees OIDC/audit/failures/client-change blocks only
 - sensitive admin actions require recent passkey re-authentication (`/admin/auth/reauth/*`)
   - recent re-auth timestamp is kept in admin session (`recent_auth_at_utc`)
   - TTL is controlled by `ADMIN_REAUTH_TTL_MINUTES` (default `5`)

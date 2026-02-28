@@ -31,6 +31,10 @@ const (
 	flashCookieName       = "admin_ui_flash"
 	auditLogPageSize      = 25
 	defaultInviteTTLHours = 24
+	dashboardRecentAudit  = 20
+	dashboardRecentFailed = 10
+	dashboardRecentClient = 15
+	dashboardPendingLimit = 15
 )
 
 type OIDCClientStore interface {
@@ -51,6 +55,9 @@ type OIDCClientStore interface {
 	CountEnabledAdminUsersByRole(role string) (int, error)
 	SetAdminUserRole(id string, role string) error
 	CountAdminCredentialsForUser(adminUserID string) (int, error)
+	CountActiveAdminInvites(ctx context.Context) (int, error)
+	CountExpiredUnusedAdminInvites(ctx context.Context) (int, error)
+	ListActiveAdminInvites(ctx context.Context, limit int) ([]store.ActiveAdminInviteOverview, error)
 	CreateAdminInvite(ctx context.Context, adminUserID string, createdBy string, tokenHash string, expiresAt time.Time, note string) (*store.AdminInvite, error)
 	GetAdminInviteByID(ctx context.Context, inviteID int64) (*store.AdminInvite, error)
 	GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error)
@@ -65,6 +72,7 @@ type OIDCClientReloader interface {
 type AdminAuditStore interface {
 	CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error
 	ListAdminAuditEntries(ctx context.Context, opts store.AdminAuditListOptions) ([]store.AdminAuditEntry, error)
+	CountAdminAuditFailuresSince(ctx context.Context, since time.Time) (int, error)
 }
 
 type SessionAuth interface {
@@ -106,10 +114,41 @@ type layoutData struct {
 }
 
 type dashboardSummary struct {
-	Total        int
-	Enabled      int
-	Confidential int
-	Public       int
+	AdminsTotal            int
+	AdminsEnabled          int
+	OwnersCount            int
+	AdminsRoleCount        int
+	ActiveInvites          int
+	ExpiredUnusedInvites   int
+	ClientsTotal           int
+	ClientsEnabled         int
+	ClientsDisabled        int
+	ClientsConfidential    int
+	ClientsPublic          int
+	RecentFailures24hCount int
+}
+
+type dashboardAuditPreviewItem struct {
+	CreatedAt    time.Time
+	Action       string
+	Success      bool
+	Actor        string
+	ResourceType string
+	ResourceID   string
+	RequestID    string
+	AuditURL     string
+}
+
+type dashboardPendingInviteItem struct {
+	ID             int64
+	AdminUserID    string
+	AdminLogin     string
+	CreatedBy      string
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+	ExpiringSoon   bool
+	Note           string
+	AdminDetailURL string
 }
 
 type clientsListItem struct {
@@ -157,7 +196,11 @@ type clientsListPageData struct {
 
 type dashboardPageData struct {
 	layoutData
-	Summary dashboardSummary
+	Summary             dashboardSummary
+	RecentAudit         []dashboardAuditPreviewItem
+	RecentFailures      []dashboardAuditPreviewItem
+	RecentClientChanges []dashboardAuditPreviewItem
+	PendingInvites      []dashboardPendingInviteItem
 }
 
 type clientDetailPageData struct {
@@ -1133,21 +1176,114 @@ func (h *Handler) Dashboard(c echo.Context) error {
 		return h.renderInternalError(c, adminUser, "failed to load OIDC clients")
 	}
 
-	summary := dashboardSummary{Total: len(clients)}
+	summary := dashboardSummary{
+		ClientsTotal: len(clients),
+	}
 	for _, client := range clients {
 		if client.Enabled {
-			summary.Enabled++
+			summary.ClientsEnabled++
+		} else {
+			summary.ClientsDisabled++
 		}
 		if client.Confidential {
-			summary.Confidential++
+			summary.ClientsConfidential++
 		} else {
-			summary.Public++
+			summary.ClientsPublic++
+		}
+	}
+
+	admins, err := h.store.ListAdminUsers()
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load admin users")
+	}
+	summary.AdminsTotal = len(admins)
+	for _, item := range admins {
+		if item.Enabled {
+			summary.AdminsEnabled++
+		}
+		if store.NormalizeAdminRole(item.Role) == store.AdminRoleOwner {
+			summary.OwnersCount++
+		} else {
+			summary.AdminsRoleCount++
+		}
+	}
+
+	summary.ActiveInvites, err = h.store.CountActiveAdminInvites(c.Request().Context())
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to count active invites")
+	}
+	summary.ExpiredUnusedInvites, err = h.store.CountExpiredUnusedAdminInvites(c.Request().Context())
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to count expired invites")
+	}
+
+	zeroOffset := 0
+	recentEntries, err := h.auditStore.ListAdminAuditEntries(c.Request().Context(), store.AdminAuditListOptions{
+		Limit:  dashboardRecentAudit,
+		Offset: zeroOffset,
+	})
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load recent audit entries")
+	}
+	recentAudit := buildDashboardAuditPreview(recentEntries, "")
+
+	failOnly := false
+	recentFailuresEntries, err := h.auditStore.ListAdminAuditEntries(c.Request().Context(), store.AdminAuditListOptions{
+		Limit:   dashboardRecentFailed,
+		Offset:  zeroOffset,
+		Success: &failOnly,
+	})
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load recent failures")
+	}
+	recentFailures := buildDashboardAuditPreview(recentFailuresEntries, "failure")
+
+	clientChangeEntries, err := h.auditStore.ListAdminAuditEntries(c.Request().Context(), store.AdminAuditListOptions{
+		Limit:  dashboardRecentClient,
+		Offset: zeroOffset,
+		Action: "admin.oidc_client",
+	})
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load recent client changes")
+	}
+	recentClientChanges := buildDashboardAuditPreview(clientChangeEntries, "")
+
+	summary.RecentFailures24hCount, err = h.auditStore.CountAdminAuditFailuresSince(c.Request().Context(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load failure summary")
+	}
+
+	pendingInvites := []dashboardPendingInviteItem{}
+	now := time.Now().UTC()
+	if isAdminOwner(adminUser) {
+		pendingRaw, pendingErr := h.store.ListActiveAdminInvites(c.Request().Context(), dashboardPendingLimit)
+		if pendingErr != nil {
+			return h.renderInternalError(c, adminUser, "failed to load pending invites")
+		}
+		pendingInvites = make([]dashboardPendingInviteItem, 0, len(pendingRaw))
+		for _, item := range pendingRaw {
+			expiresAt := item.ExpiresAt.UTC()
+			pendingInvites = append(pendingInvites, dashboardPendingInviteItem{
+				ID:             item.ID,
+				AdminUserID:    strings.TrimSpace(item.AdminUserID),
+				AdminLogin:     strings.TrimSpace(item.AdminLogin),
+				CreatedBy:      strings.TrimSpace(item.CreatedByLogin),
+				CreatedAt:      item.CreatedAt,
+				ExpiresAt:      expiresAt,
+				ExpiringSoon:   now.Add(24 * time.Hour).After(expiresAt),
+				Note:           strings.TrimSpace(item.Note),
+				AdminDetailURL: "/admin/admins/" + strings.TrimSpace(item.AdminUserID),
+			})
 		}
 	}
 
 	return h.render(c, http.StatusOK, "index.html", dashboardPageData{
-		layoutData: h.newLayoutData(c, adminUser, "Admin Dashboard"),
-		Summary:    summary,
+		layoutData:          h.newLayoutData(c, adminUser, "Admin Dashboard"),
+		Summary:             summary,
+		RecentAudit:         recentAudit,
+		RecentFailures:      recentFailures,
+		RecentClientChanges: recentClientChanges,
+		PendingInvites:      pendingInvites,
 	})
 }
 
@@ -2166,6 +2302,27 @@ func auditLogURL(page int, action string, success string, actor string, resource
 		return "/admin/audit"
 	}
 	return "/admin/audit?" + encoded
+}
+
+func buildDashboardAuditPreview(entries []store.AdminAuditEntry, successFilter string) []dashboardAuditPreviewItem {
+	out := make([]dashboardAuditPreviewItem, 0, len(entries))
+	for _, entry := range entries {
+		action := strings.TrimSpace(entry.Action)
+		actorID := strings.TrimSpace(entry.ActorID)
+		resourceID := strings.TrimSpace(entry.ResourceID)
+		resourceType := strings.TrimSpace(entry.ResourceType)
+		out = append(out, dashboardAuditPreviewItem{
+			CreatedAt:    entry.CreatedAt,
+			Action:       action,
+			Success:      entry.Success,
+			Actor:        formatAuditActor(entry.ActorType, actorID),
+			ResourceType: defaultDisplay(resourceType),
+			ResourceID:   defaultDisplay(resourceID),
+			RequestID:    defaultDisplay(strings.TrimSpace(entry.RequestID)),
+			AuditURL:     auditLogURL(1, action, successFilter, actorID, resourceID),
+		})
+	}
+	return out
 }
 
 func formatAuditActor(actorType string, actorID string) string {

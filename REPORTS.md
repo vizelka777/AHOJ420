@@ -43,3 +43,31 @@
 - Прод после выката:
   - `https://admin.ahoj420.eu/admin/login` -> `200`
   - `https://ahoj420.eu/admin/login` -> `404`
+
+### Overview Dashboard MVP
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Доработана landing page `GET /admin/` до операционного overview dashboard.
+- Добавлены summary-блоки:
+  - OIDC clients: total/enabled/disabled/confidential/public
+  - Admin summary (owner-only): total/enabled/owners/admins/active invites/expired unused invites
+- Добавлены preview-блоки:
+  - recent audit activity
+  - recent failures (отдельно)
+  - recent OIDC client changes
+  - pending invites (owner-only)
+- Добавлены новые read-side методы store для invites summary/list:
+  - `CountActiveAdminInvites`
+  - `CountExpiredUnusedAdminInvites`
+  - `ListActiveAdminInvites`
+- Dashboard сделан role-aware:
+  - owner видит owner-only блоки
+  - non-owner эти блоки не видит
+- Обновлены тесты dashboard в `internal/adminui/handler_test.go`.
+- Обновлена документация (`README.md`, `ADMIN_UI.md`).
+
+Проверки:
+- `go test ./internal/adminui` (dockerized Go) — `ok`.
+- `go test ./...` (dockerized Go) — `ok`.

@@ -1,21 +1,195 @@
 {{define "content"}}
 <div class="stack">
   <div class="panel">
-    <h1 style="margin-top:0;">Admin Dashboard</h1>
-    <p class="hint">Internal controls for OIDC clients.</p>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Overview Dashboard</h1>
+        <p class="hint" style="margin:6px 0 0;">Operational summary for admin users, OIDC clients, and recent audit activity.</p>
+      </div>
+      <div class="actions" style="margin-top:0;">
+        <a class="btn secondary" href="/admin/clients">Clients</a>
+        <a class="btn secondary" href="/admin/audit">Audit log</a>
+        <a class="btn secondary" href="/admin/security">Security</a>
+        {{if .IsOwner}}<a class="btn secondary" href="/admin/admins">Admins</a>{{end}}
+      </div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">OIDC Clients</h2>
+      <div class="grid2">
+        <dl class="kv"><dt>Total</dt><dd>{{.Summary.ClientsTotal}}</dd></dl>
+        <dl class="kv"><dt>Enabled</dt><dd>{{.Summary.ClientsEnabled}}</dd></dl>
+        <dl class="kv"><dt>Disabled</dt><dd>{{.Summary.ClientsDisabled}}</dd></dl>
+        <dl class="kv"><dt>Confidential</dt><dd>{{.Summary.ClientsConfidential}}</dd></dl>
+        <dl class="kv"><dt>Public</dt><dd>{{.Summary.ClientsPublic}}</dd></dl>
+      </div>
+    </div>
+
+    {{if .IsOwner}}
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Admin Users</h2>
+      <div class="grid2">
+        <dl class="kv"><dt>Total admins</dt><dd>{{.Summary.AdminsTotal}}</dd></dl>
+        <dl class="kv"><dt>Enabled admins</dt><dd>{{.Summary.AdminsEnabled}}</dd></dl>
+        <dl class="kv"><dt>Owners</dt><dd>{{.Summary.OwnersCount}}</dd></dl>
+        <dl class="kv"><dt>Admins</dt><dd>{{.Summary.AdminsRoleCount}}</dd></dl>
+        <dl class="kv"><dt>Active invites</dt><dd>{{.Summary.ActiveInvites}}</dd></dl>
+        <dl class="kv"><dt>Expired invites</dt><dd>{{.Summary.ExpiredUnusedInvites}}</dd></dl>
+      </div>
+    </div>
+    {{end}}
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Recent Failures</h2>
+    <p class="hint" style="margin-top:4px;">Last 24h failures: <strong>{{.Summary.RecentFailures24hCount}}</strong></p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Actor</th>
+            <th>Resource</th>
+            <th>Request</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .RecentFailures}}
+            {{range .RecentFailures}}
+              <tr>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td><span class="chip warn">failure</span> <span class="mono">{{.Action}}</span></td>
+                <td class="mono">{{.Actor}}</td>
+                <td class="mono">{{.ResourceType}}:{{.ResourceID}}</td>
+                <td class="mono">{{.RequestID}}</td>
+                <td><a class="btn secondary" href="{{.AuditURL}}">View</a></td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="6">No recent failures.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
     <div class="actions">
-      <a class="btn" href="/admin/clients">Open OIDC clients</a>
+      <a class="btn secondary" href="/admin/audit?success=failure">View all failures</a>
     </div>
   </div>
 
   <div class="panel">
-    <h2 style="margin-top:0;">Client Summary</h2>
-    <div class="grid2">
-      <dl class="kv"><dt>Total clients</dt><dd>{{.Summary.Total}}</dd></dl>
-      <dl class="kv"><dt>Enabled</dt><dd>{{.Summary.Enabled}}</dd></dl>
-      <dl class="kv"><dt>Confidential</dt><dd>{{.Summary.Confidential}}</dd></dl>
-      <dl class="kv"><dt>Public</dt><dd>{{.Summary.Public}}</dd></dl>
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2 style="margin:0;">Recent Audit Activity</h2>
+      <a class="btn secondary" href="/admin/audit">View all audit entries</a>
+    </div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Status</th>
+            <th>Actor</th>
+            <th>Resource</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .RecentAudit}}
+            {{range .RecentAudit}}
+              <tr>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td class="mono">{{.Action}}</td>
+                <td>{{if .Success}}<span class="chip ok">success</span>{{else}}<span class="chip warn">failure</span>{{end}}</td>
+                <td class="mono">{{.Actor}}</td>
+                <td class="mono">{{.ResourceType}}:{{.ResourceID}}</td>
+                <td><a class="btn secondary" href="{{.AuditURL}}">View</a></td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="6">No audit entries found.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
     </div>
   </div>
+
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2 style="margin:0;">Recent Client Changes</h2>
+      <a class="btn secondary" href="/admin/audit?action=admin.oidc_client">View client audit</a>
+    </div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Status</th>
+            <th>Actor</th>
+            <th>Resource</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .RecentClientChanges}}
+            {{range .RecentClientChanges}}
+              <tr>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td class="mono">{{.Action}}</td>
+                <td>{{if .Success}}<span class="chip ok">success</span>{{else}}<span class="chip warn">failure</span>{{end}}</td>
+                <td class="mono">{{.Actor}}</td>
+                <td class="mono">{{.ResourceType}}:{{.ResourceID}}</td>
+                <td><a class="btn secondary" href="{{.AuditURL}}">View</a></td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="6">No recent OIDC client changes.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {{if .IsOwner}}
+  <div class="panel">
+    <h2 style="margin-top:0;">Pending Invites</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Admin login</th>
+            <th>Created by</th>
+            <th>Created at</th>
+            <th>Expires at</th>
+            <th>Status</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .PendingInvites}}
+            {{range .PendingInvites}}
+              <tr>
+                <td class="mono">{{.AdminLogin}}</td>
+                <td class="mono">{{if .CreatedBy}}{{.CreatedBy}}{{else}}-{{end}}</td>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td class="mono">{{formatTime .ExpiresAt}}</td>
+                <td>
+                  {{if .ExpiringSoon}}<span class="chip warn">expiring soon</span>{{else}}<span class="chip ok">active</span>{{end}}
+                </td>
+                <td><a class="btn secondary" href="{{.AdminDetailURL}}">Admin</a></td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="6">No active invites.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{end}}
 </div>
 {{end}}

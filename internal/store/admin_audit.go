@@ -142,6 +142,23 @@ func (s *Store) ListAdminAuditEntries(ctx context.Context, opts AdminAuditListOp
 	return out, nil
 }
 
+func (s *Store) CountAdminAuditFailuresSince(ctx context.Context, since time.Time) (int, error) {
+	if since.IsZero() {
+		since = time.Now().UTC().Add(-24 * time.Hour)
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM admin_audit_log
+		WHERE success = false
+		  AND created_at >= $1
+	`, since.UTC()).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func normalizeAdminAuditEntry(entry AdminAuditEntry) (AdminAuditEntry, error) {
 	entry.Action = strings.TrimSpace(entry.Action)
 	if entry.Action == "" {
