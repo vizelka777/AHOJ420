@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -18,6 +20,7 @@ import (
 	"github.com/houbamydar/AHOJ420/internal/adminauth"
 	"github.com/houbamydar/AHOJ420/internal/adminui"
 	"github.com/houbamydar/AHOJ420/internal/auth"
+	"github.com/houbamydar/AHOJ420/internal/maintenance"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/labstack/echo/v4"
@@ -29,6 +32,13 @@ import (
 )
 
 func main() {
+	if isCleanupRetentionMode(os.Args, os.Getenv("MODE")) {
+		if err := runRetentionCleanupCommand(os.Args[1:]); err != nil {
+			log.Fatalf("Retention cleanup failed: %v", err)
+		}
+		return
+	}
+
 	pgURL := os.Getenv("POSTGRES_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
 
@@ -244,6 +254,114 @@ func main() {
 
 	log.Println("Server starting on :8080")
 	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func isCleanupRetentionMode(args []string, mode string) bool {
+	if strings.EqualFold(strings.TrimSpace(mode), "cleanup-retention") {
+		return true
+	}
+	if len(args) < 2 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(args[1]), "cleanup-retention")
+}
+
+func runRetentionCleanupCommand(args []string) error {
+	fs := flag.NewFlagSet("cleanup-retention", flag.ContinueOnError)
+	dryRun := fs.Bool("dry-run", false, "report eligible rows without deleting")
+	batchSizeFlag := fs.Int("batch-size", 0, "delete batch size override")
+
+	parsedArgs := args
+	if len(parsedArgs) > 0 && strings.EqualFold(strings.TrimSpace(parsedArgs[0]), "cleanup-retention") {
+		parsedArgs = parsedArgs[1:]
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
+		return err
+	}
+
+	pgURL := strings.TrimSpace(os.Getenv("POSTGRES_URL"))
+	if pgURL == "" {
+		return fmt.Errorf("POSTGRES_URL is required for cleanup-retention")
+	}
+
+	db, err := sql.Open("postgres", pgURL)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("ping db: %w", err)
+	}
+
+	schema, err := os.ReadFile("internal/store/schema.sql")
+	if err == nil {
+		if _, execErr := db.Exec(string(schema)); execErr != nil {
+			log.Printf("Schema init error (might be already existing): %v", execErr)
+		}
+	}
+
+	cfg := maintenance.RetentionConfig{
+		AdminAuditRetentionDays:         retentionDaysFromEnv("ADMIN_AUDIT_RETENTION_DAYS", maintenance.DefaultRetentionDays),
+		UserSecurityEventsRetentionDays: retentionDaysFromEnv("USER_SECURITY_EVENTS_RETENTION_DAYS", maintenance.DefaultRetentionDays),
+		DeleteBatchSize:                 retentionBatchSizeFromEnv("RETENTION_DELETE_BATCH_SIZE", maintenance.DefaultDeleteBatchSize),
+	}
+	if *batchSizeFlag != 0 {
+		cfg.DeleteBatchSize = *batchSizeFlag
+	}
+
+	result, err := maintenance.RunRetentionCleanup(context.Background(), store.New(db), cfg, *dryRun)
+	if err != nil {
+		return err
+	}
+
+	for _, tableResult := range result.Results {
+		if !tableResult.Enabled {
+			log.Printf("retention.cleanup.summary table=%s enabled=false", tableResult.Table)
+			continue
+		}
+		log.Printf(
+			"retention.cleanup.summary table=%s cutoff=%s dry_run=%t eligible=%d deleted=%d batches=%d",
+			tableResult.Table,
+			tableResult.Cutoff.UTC().Format(time.RFC3339),
+			result.DryRun,
+			tableResult.EligibleCount,
+			tableResult.DeletedCount,
+			tableResult.Batches,
+		)
+	}
+	return nil
+}
+
+func retentionDaysFromEnv(key string, defaultDays int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultDays
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("Invalid %s value %q; using default %d", key, raw, defaultDays)
+		return defaultDays
+	}
+	if parsed <= 0 {
+		return 0
+	}
+	return parsed
+}
+
+func retentionBatchSizeFromEnv(key string, defaultBatchSize int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultBatchSize
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("Invalid %s value %q; using default %d", key, raw, defaultBatchSize)
+		return defaultBatchSize
+	}
+	if parsed <= 0 {
+		return defaultBatchSize
+	}
+	return parsed
 }
 
 func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {

@@ -159,6 +159,62 @@ func (s *Store) CountAdminAuditFailuresSince(ctx context.Context, since time.Tim
 	return count, nil
 }
 
+func (s *Store) CountAdminAuditEntriesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, fmt.Errorf("cutoff time is required")
+	}
+
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM admin_audit_log
+		WHERE created_at < $1
+	`, cutoff.UTC()).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) DeleteAdminAuditEntriesOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, fmt.Errorf("cutoff time is required")
+	}
+	batchLimit := normalizeRetentionDeleteBatch(limit)
+
+	res, err := s.db.ExecContext(ctx, `
+		WITH to_delete AS (
+			SELECT id
+			FROM admin_audit_log
+			WHERE created_at < $1
+			ORDER BY id ASC
+			LIMIT $2
+		)
+		DELETE FROM admin_audit_log target
+		USING to_delete d
+		WHERE target.id = d.id
+	`, cutoff.UTC(), batchLimit)
+	if err != nil {
+		return 0, err
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+func normalizeRetentionDeleteBatch(limit int) int {
+	if limit <= 0 {
+		return 1000
+	}
+	if limit > 10000 {
+		return 10000
+	}
+	return limit
+}
+
 func normalizeAdminAuditEntry(entry AdminAuditEntry) (AdminAuditEntry, error) {
 	entry.Action = strings.TrimSpace(entry.Action)
 	if entry.Action == "" {

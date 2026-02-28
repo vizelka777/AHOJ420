@@ -206,6 +206,9 @@ CREATE TABLE IF NOT EXISTS user_security_events (
 CREATE INDEX IF NOT EXISTS user_security_events_user_created_idx
     ON user_security_events (user_id, created_at DESC);
 
+CREATE INDEX IF NOT EXISTS user_security_events_created_at_idx
+    ON user_security_events (created_at DESC);
+
 CREATE INDEX IF NOT EXISTS user_security_events_user_category_created_idx
     ON user_security_events (user_id, category, created_at DESC);
 

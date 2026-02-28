@@ -4,6 +4,53 @@
 
 ## 2026-02-28
 
+### Retention / Cleanup Policy for Event Tables
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Добавлен retention cleanup для растущих event-таблиц:
+  - `admin_audit_log`
+  - `user_security_events`
+- Добавлен store cleanup/read API:
+  - `CountAdminAuditEntriesOlderThan(...)`
+  - `DeleteAdminAuditEntriesOlderThan(...)`
+  - `CountUserSecurityEventsOlderThan(...)`
+  - `DeleteUserSecurityEventsOlderThan(...)`
+- Добавлен maintenance сервис `internal/maintenance/retention.go`:
+  - dry-run режим (только подсчёт eligible rows)
+  - batched deletion (`DELETE` батчами, configurable batch size)
+  - UTC cutoff (`created_at < cutoff`)
+  - консистентные lifecycle logs:
+    - `retention.cleanup.start`
+    - `retention.cleanup.batch`
+    - `retention.cleanup.done`
+    - `retention.cleanup.error`
+- Добавлен CLI entrypoint в `cmd/server/main.go`:
+  - `./server cleanup-retention --dry-run`
+  - `./server cleanup-retention`
+  - optional: `--batch-size N`
+  - также поддержан env-mode: `MODE=cleanup-retention`
+- Добавлены env-настройки retention:
+  - `ADMIN_AUDIT_RETENTION_DAYS`
+  - `USER_SECURITY_EVENTS_RETENTION_DAYS`
+  - `RETENTION_DELETE_BATCH_SIZE`
+  - empty значение по retention days => default `180`
+  - `<=0` => retention для конкретной таблицы отключён
+- Добавлен индекс для глобального cleanup по времени в `user_security_events`:
+  - `user_security_events_created_at_idx (created_at DESC)`
+- Обновлена документация в `README.md` (env + запуск cleanup команд).
+
+Тесты:
+- `go test ./internal/maintenance ./internal/store ./cmd/server` — `ok`
+- Добавлены unit tests:
+  - count older-than cutoff
+  - dry-run ничего не удаляет
+  - batched delete удаляет порциями
+  - disabled retention table skip
+  - empty tables
+  - cutoff boundary (`created_at == cutoff` не удаляется)
+
 ### Multi-admin MVP
 - Ветка: `админ`
 - Коммит: `d95c62f`

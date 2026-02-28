@@ -205,6 +205,52 @@ func (s *Store) ListUserSecurityEvents(ctx context.Context, userID string, filte
 	return out, nil
 }
 
+func (s *Store) CountUserSecurityEventsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, fmt.Errorf("cutoff time is required")
+	}
+
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM user_security_events
+		WHERE created_at < $1
+	`, cutoff.UTC()).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) DeleteUserSecurityEventsOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, fmt.Errorf("cutoff time is required")
+	}
+	batchLimit := normalizeRetentionDeleteBatch(limit)
+
+	res, err := s.db.ExecContext(ctx, `
+		WITH to_delete AS (
+			SELECT id
+			FROM user_security_events
+			WHERE created_at < $1
+			ORDER BY id ASC
+			LIMIT $2
+		)
+		DELETE FROM user_security_events target
+		USING to_delete d
+		WHERE target.id = d.id
+	`, cutoff.UTC(), batchLimit)
+	if err != nil {
+		return 0, err
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
 func normalizeUserSecurityEventEntry(entry UserSecurityEvent) (UserSecurityEvent, error) {
 	entry.UserID = strings.TrimSpace(entry.UserID)
 	if entry.UserID == "" {

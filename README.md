@@ -80,6 +80,10 @@ Admin API + Admin Auth:
 - `ADMIN_RP_ORIGINS=https://admin.ahoj420.eu,https://ahoj420.eu` (optional; explicit WebAuthn origins for admin auth)
 - `ADMIN_SESSION_IDLE_MINUTES=30` (optional, default `30`)
 - `ADMIN_SESSION_ABSOLUTE_HOURS=12` (optional, default `12`)
+- retention cleanup:
+  - `ADMIN_AUDIT_RETENTION_DAYS=180` (optional; empty uses default `180`, `<=0` disables cleanup for `admin_audit_log`)
+  - `USER_SECURITY_EVENTS_RETENTION_DAYS=180` (optional; empty uses default `180`, `<=0` disables cleanup for `user_security_events`)
+  - `RETENTION_DELETE_BATCH_SIZE=1000` (optional batch delete size for cleanup command)
 - token fallback (optional emergency mode, disabled by default):
   - `ADMIN_API_TOKEN_ENABLED=true|false` (default `false`)
   - `ADMIN_API_TOKEN=<long-random-shared-secret>` (required only when token fallback is enabled)
@@ -394,6 +398,19 @@ Structured user security event store:
   - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
   - session: `session_created`, `session_revoked`, `session_logout_all`
   - passkey: `passkey_added`, `passkey_revoked`
+
+Retention cleanup for event tables:
+- target tables:
+  - `admin_audit_log`
+  - `user_security_events`
+- cleanup condition: rows with `created_at < cutoff_utc` are eligible for deletion
+- cleanup is batched (`DELETE ... LIMIT N`) to avoid giant table locks/transactions
+- per-table retention can be disabled independently by setting retention days to `<=0`
+- dry-run mode computes eligible rows and logs summary without deleting
+- command:
+  - dry-run: `./server cleanup-retention --dry-run`
+  - real cleanup: `./server cleanup-retention`
+  - optional override: `./server cleanup-retention --batch-size 500`
 
 Audit:
 - mutating admin actions are persisted in PostgreSQL `admin_audit_log` and app logs
