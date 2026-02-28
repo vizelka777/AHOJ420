@@ -26,6 +26,8 @@ Protected (admin session required):
 - `GET /admin/security`
 - `GET /admin/users`
 - `GET /admin/users/:id`
+- `POST /admin/users/:id/block`
+- `POST /admin/users/:id/unblock`
 - `POST /admin/users/:id/sessions/logout-all`
 - `POST /admin/users/:id/sessions/:sessionID/logout`
 - `POST /admin/users/:id/passkeys/:credentialID/revoke`
@@ -92,6 +94,8 @@ Protected (admin session required):
   - revoke OIDC client secret
   - delete admin passkey
   - logout other admin sessions
+  - block end-user account (`POST /admin/users/:id/block`)
+  - unblock end-user account (`POST /admin/users/:id/unblock`)
   - revoke end-user passkey (`POST /admin/users/:id/passkeys/:credentialID/revoke`)
   - logout all end-user sessions (`POST /admin/users/:id/sessions/logout-all`)
 - audit actions:
@@ -176,8 +180,9 @@ Protected (admin session required):
     - passkey count
     - active session count
     - linked client count
+    - status badge (`active` / `blocked`)
 - detail page (`GET /admin/users/:id`):
-  - summary (id, created_at, profile contacts + verification, avatar presence)
+  - summary (id, created_at, profile contacts + verification, avatar presence, blocked status/metadata)
   - recent security events timeline (read-only, user-scoped):
     - latest security/auth/support events with time, label, status, actor, safe details
     - category filter via query param: `?events=all|auth|recovery|passkey|session|admin` (`passkeys/sessions` aliases are accepted)
@@ -187,6 +192,14 @@ Protected (admin session required):
   - active sessions list (session id, created_at, last_seen_at, expires_at, ip, user-agent)
   - linked OIDC clients list (client id, first_seen_at, last_seen_at)
 - allowed support actions (mutating, audited):
+  - `POST /admin/users/:id/block`
+    - requires recent re-auth
+    - requires reason
+    - invalidates all active user sessions
+    - audit: `admin.user.block.success|failure`
+  - `POST /admin/users/:id/unblock`
+    - requires recent re-auth
+    - audit: `admin.user.unblock.success|failure`
   - `POST /admin/users/:id/sessions/:sessionID/logout`
     - audit: `admin.user.session.logout.success|failure`
   - `POST /admin/users/:id/sessions/logout-all`
@@ -212,7 +225,10 @@ Protected (admin session required):
   - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
   - session: `session_created`, `session_revoked`, `session_logout_all`
   - passkey: `passkey_added`, `passkey_revoked`
+  - account/admin actions: `account_blocked`, `account_unblocked`
 - admin support actions are mirrored into user timeline events (in addition to `admin_audit_log`):
+  - block user
+  - unblock user
   - logout one session
   - logout all sessions
   - revoke user passkey

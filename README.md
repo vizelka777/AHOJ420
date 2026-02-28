@@ -273,6 +273,8 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/security`
 - `GET /admin/users`
 - `GET /admin/users/:id`
+- `POST /admin/users/:id/block`
+- `POST /admin/users/:id/unblock`
 - `POST /admin/users/:id/sessions/logout-all`
 - `POST /admin/users/:id/sessions/:sessionID/logout`
 - `POST /admin/users/:id/passkeys/:credentialID/revoke`
@@ -349,10 +351,18 @@ Security behavior:
     - fallback source (when structured stream is empty): linked client activity (`first_seen_at`, `last_seen_at`)
     - sensitive fields are stripped in storage and render path (`token/secret/password/authorization/challenge/assertion`)
   - safe support mutations:
+    - block user (`POST /admin/users/:id/block`)
+    - unblock user (`POST /admin/users/:id/unblock`)
     - logout one user session (`POST /admin/users/:id/sessions/:sessionID/logout`)
     - logout all user sessions (`POST /admin/users/:id/sessions/logout-all`)
     - revoke one user passkey (`POST /admin/users/:id/passkeys/:credentialID/revoke`)
+    - block/unblock requires recent re-auth and CSRF
+    - blocking user invalidates all active user sessions
+    - blocked user cannot start new login/recovery and cannot continue session-backed auth flows
+    - blocked status is visible in users list/detail (`active`/`blocked`, blocked_at/reason/blocked_by)
   - support mutations are audited:
+    - `admin.user.block.success|failure`
+    - `admin.user.unblock.success|failure`
     - `admin.user.session.logout.success|failure`
     - `admin.user.session.logout_all.success|failure`
     - `admin.user.passkey.revoke.success|failure`
@@ -383,6 +393,8 @@ Security behavior:
     - add/revoke OIDC secret
     - delete admin passkey
     - logout other admin sessions
+    - block user
+    - unblock user
     - logout all user sessions
     - revoke user passkey
   - missing/expired recent re-auth returns `403` with message `recent admin re-auth required` (JSON code `admin_reauth_required`)
@@ -398,6 +410,7 @@ Structured user security event store:
   - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
   - session: `session_created`, `session_revoked`, `session_logout_all`
   - passkey: `passkey_added`, `passkey_revoked`
+  - account/admin: `account_blocked`, `account_unblocked`
 
 Retention cleanup for event tables:
 - target tables:

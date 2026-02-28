@@ -78,6 +78,21 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 			log.Printf("Recovery requested for non-existent or unverified email: %s", email)
 			return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 		}
+		if err := s.ensureUserNotBlocked(ctx, user.ID); err != nil {
+			if errors.Is(err, errUserBlocked) {
+				s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+					UserID:      user.ID,
+					EventType:   store.UserSecurityEventRecoveryFailure,
+					Category:    store.UserSecurityCategoryRecovery,
+					Success:     boolPointer(false),
+					ActorType:   "user",
+					ActorID:     user.ID,
+					DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email", "reason": "user_blocked"}),
+				})
+				return c.String(http.StatusForbidden, "User account is blocked")
+			}
+			return c.String(http.StatusInternalServerError, "Internal error")
+		}
 
 		magicLink, tokenKey, err := s.createRecoveryToken(ctx, user.ID)
 		if err != nil {
@@ -137,6 +152,21 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 	if err != nil || user == nil {
 		log.Printf("Recovery requested for non-existent or unverified phone: %s", phone)
 		return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
+	}
+	if err := s.ensureUserNotBlocked(ctx, user.ID); err != nil {
+		if errors.Is(err, errUserBlocked) {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      user.ID,
+				EventType:   store.UserSecurityEventRecoveryFailure,
+				Category:    store.UserSecurityCategoryRecovery,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     user.ID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "user_blocked"}),
+			})
+			return c.String(http.StatusForbidden, "User account is blocked")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
 	code, err := generatePhoneVerifyCode()
@@ -299,6 +329,21 @@ func (s *Service) VerifyRecovery(c echo.Context) error {
 	if userID == "" {
 		return c.String(http.StatusForbidden, "Invalid or expired link")
 	}
+	if err := s.ensureUserNotBlocked(ctx, userID); err != nil {
+		if errors.Is(err, errUserBlocked) {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      userID,
+				EventType:   store.UserSecurityEventRecoveryFailure,
+				Category:    store.UserSecurityCategoryRecovery,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     userID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email", "reason": "user_blocked"}),
+			})
+			return c.String(http.StatusForbidden, "User account is blocked")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
 
 	if err := s.startRecoveryMode(c, userID); err != nil {
 		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
@@ -368,6 +413,22 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 		_ = s.redis.Del(ctx, codeKey).Err()
 		return c.String(http.StatusBadRequest, recoveryCodeInvalidMessage)
 	}
+	if err := s.ensureUserNotBlocked(ctx, token.UserID); err != nil {
+		_ = s.redis.Del(ctx, codeKey).Err()
+		if errors.Is(err, errUserBlocked) {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      strings.TrimSpace(token.UserID),
+				EventType:   store.UserSecurityEventRecoveryFailure,
+				Category:    store.UserSecurityCategoryRecovery,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     strings.TrimSpace(token.UserID),
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "user_blocked"}),
+			})
+			return c.String(http.StatusForbidden, "User account is blocked")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
+	}
 
 	inputHash := hashPhoneVerifyCode(code)
 	match := subtle.ConstantTimeCompare([]byte(inputHash), []byte(token.CodeHash)) == 1
@@ -425,6 +486,9 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 
 func (s *Service) startRecoveryMode(c echo.Context, userID string) error {
 	ctx := c.Request().Context()
+	if err := s.ensureUserNotBlocked(ctx, userID); err != nil {
+		return err
+	}
 	sessionID, err := s.setUserSessionWithID(c, userID)
 	if err != nil {
 		return err

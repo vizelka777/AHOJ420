@@ -29,6 +29,8 @@ const (
 	UserSecurityEventSessionLogoutAll = "session_logout_all"
 	UserSecurityEventPasskeyAdded     = "passkey_added"
 	UserSecurityEventPasskeyRevoked   = "passkey_revoked"
+	UserSecurityEventAccountBlocked   = "account_blocked"
+	UserSecurityEventAccountUnblocked = "account_unblocked"
 )
 
 const (

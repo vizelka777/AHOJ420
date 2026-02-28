@@ -914,6 +914,133 @@ func TestUserPasskeyRevokeRequiresRecentReauthAndWritesAudit(t *testing.T) {
 	}
 }
 
+func TestUserBlockRequiresRecentReauthInvalidatesSessionsAndWritesAudit(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-block", "block@login.local", "block@example.com", "+100")
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-a", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-5 * time.Minute)},
+				{SessionID: "sess-b", CreatedAt: time.Now().UTC().Add(-90 * time.Minute), LastSeenAt: time.Now().UTC().Add(-2 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+
+	blockForm := withCSRF(url.Values{"reason": {"security incident"}}, csrfToken)
+	recBlocked := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/block", blockForm, cookies)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth for block, got %d body=%s", recBlocked.Code, recBlocked.Body.String())
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/block", blockForm, cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth for block, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+	updatedUser, err := fakeStore.GetUserProfileForAdmin(user.ID)
+	if err != nil {
+		t.Fatalf("get blocked user profile failed: %v", err)
+	}
+	if !updatedUser.IsBlocked {
+		t.Fatalf("expected user to be blocked")
+	}
+	if updatedUser.BlockedReason != "security incident" {
+		t.Fatalf("expected blocked reason to be stored, got %q", updatedUser.BlockedReason)
+	}
+	if updatedUser.BlockedAt == nil || updatedUser.BlockedAt.IsZero() {
+		t.Fatalf("expected blocked_at to be set")
+	}
+	if len(auth.userSessions[user.ID]) != 0 {
+		t.Fatalf("expected all user sessions invalidated on block, got %+v", auth.userSessions[user.ID])
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.block.success", true) {
+		t.Fatalf("expected admin.user.block.success audit entry")
+	}
+	if !hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventAccountBlocked, true) {
+		t.Fatalf("expected account_blocked user timeline event")
+	}
+}
+
+func TestUserUnblockRequiresRecentReauthAndWritesAudit(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-unblock", "unblock@login.local", "unblock@example.com", "+101")
+	if err := fakeStore.SetUserBlocked(context.Background(), user.ID, true, "manual block", "admin-1"); err != nil {
+		t.Fatalf("seed blocked state failed: %v", err)
+	}
+
+	auth := &fakeUIAuth{disableAutoRecentReauth: true}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+
+	recBlocked := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/unblock", withCSRF(nil, csrfToken), cookies)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth for unblock, got %d body=%s", recBlocked.Code, recBlocked.Body.String())
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/unblock", withCSRF(nil, csrfToken), cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth for unblock, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+	updatedUser, err := fakeStore.GetUserProfileForAdmin(user.ID)
+	if err != nil {
+		t.Fatalf("get unblocked user profile failed: %v", err)
+	}
+	if updatedUser.IsBlocked {
+		t.Fatalf("expected user to be unblocked")
+	}
+	if updatedUser.BlockedAt != nil || updatedUser.BlockedReason != "" || updatedUser.BlockedByAdminUserID != "" {
+		t.Fatalf("expected block metadata to be cleared on unblock, got %+v", updatedUser)
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.unblock.success", true) {
+		t.Fatalf("expected admin.user.unblock.success audit entry")
+	}
+	if !hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventAccountUnblocked, true) {
+		t.Fatalf("expected account_unblocked user timeline event")
+	}
+}
+
+func TestUsersListAndDetailShowBlockedState(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	blocked := fakeStore.seedSupportUser("user-list-blocked", "list.blocked@login.local", "blocked@example.com", "+102")
+	if err := fakeStore.SetUserBlocked(context.Background(), blocked.ID, true, "abuse", "admin-1"); err != nil {
+		t.Fatalf("seed blocked user failed: %v", err)
+	}
+	active := fakeStore.seedSupportUser("user-list-active", "list.active@login.local", "active@example.com", "+103")
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	listRec := doUIRequest(t, e, http.MethodGet, "/admin/users?q=user-list", nil, auth.sessionCookies())
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for users list, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	listBody := listRec.Body.String()
+	if !strings.Contains(listBody, blocked.ID) || !strings.Contains(listBody, active.ID) {
+		t.Fatalf("expected both users in list output, body=%s", listBody)
+	}
+	if !strings.Contains(listBody, "blocked") {
+		t.Fatalf("expected blocked badge in users list, body=%s", listBody)
+	}
+
+	detailRec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+blocked.ID, nil, auth.sessionCookies())
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for blocked detail, got %d body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	detailBody := detailRec.Body.String()
+	for _, expected := range []string{"Status", "blocked", "Blocked Reason", "abuse", "/admin/users/" + blocked.ID + "/unblock"} {
+		if !strings.Contains(detailBody, expected) {
+			t.Fatalf("expected %q on blocked detail page, body=%s", expected, detailBody)
+		}
+	}
+}
+
 func TestUsersMutatingRoutesRequireCSRF(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	user := fakeStore.seedSupportUser("user-csrf", "csrf@login.local", "csrf@example.com", "+999")
@@ -944,6 +1071,16 @@ func TestUsersMutatingRoutesRequireCSRF(t *testing.T) {
 	noCSRFRevoke := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/passkeys/"+credentialID+"/revoke", nil, auth.sessionCookies())
 	if noCSRFRevoke.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for passkey revoke without csrf, got %d body=%s", noCSRFRevoke.Code, noCSRFRevoke.Body.String())
+	}
+
+	noCSRFBlock := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/block", url.Values{"reason": {"incident"}}, auth.sessionCookies())
+	if noCSRFBlock.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for block without csrf, got %d body=%s", noCSRFBlock.Code, noCSRFBlock.Body.String())
+	}
+
+	noCSRFUnblock := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/unblock", nil, auth.sessionCookies())
+	if noCSRFUnblock.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unblock without csrf, got %d body=%s", noCSRFUnblock.Code, noCSRFUnblock.Body.String())
 	}
 }
 
@@ -3087,6 +3224,7 @@ func (s *fakeUIStore) ListUsersForAdmin(filter store.AdminUserSupportListFilter)
 			CreatedAt:            user.CreatedAt,
 			ProfileEmailVerified: user.ProfileEmailVerified,
 			PhoneVerified:        user.PhoneVerified,
+			IsBlocked:            user.IsBlocked,
 			PasskeyCount:         len(s.userCredentials[id]),
 			LinkedClientCount:    len(s.userLinkedClients[id]),
 		})
@@ -3119,6 +3257,34 @@ func (s *fakeUIStore) GetUserProfileForAdmin(userID string) (*store.AdminUserPro
 	}
 	copyItem := item
 	return &copyItem, nil
+}
+
+func (s *fakeUIStore) SetUserBlocked(ctx context.Context, userID string, blocked bool, reason string, blockedByAdminUserID string) error {
+	userID = strings.TrimSpace(userID)
+	item, ok := s.users[userID]
+	if !ok {
+		return store.ErrUserNotFound
+	}
+	if blocked {
+		item.IsBlocked = true
+		now := time.Now().UTC()
+		item.BlockedAt = &now
+		item.BlockedReason = strings.TrimSpace(reason)
+		item.BlockedByAdminUserID = strings.TrimSpace(blockedByAdminUserID)
+		if adminUser, ok := s.adminUsers[item.BlockedByAdminUserID]; ok {
+			item.BlockedByAdminLogin = strings.TrimSpace(adminUser.Login)
+		} else {
+			item.BlockedByAdminLogin = ""
+		}
+	} else {
+		item.IsBlocked = false
+		item.BlockedAt = nil
+		item.BlockedReason = ""
+		item.BlockedByAdminUserID = ""
+		item.BlockedByAdminLogin = ""
+	}
+	s.users[userID] = item
+	return nil
 }
 
 func (s *fakeUIStore) ListCredentialRecords(userID string) ([]store.CredentialRecord, error) {

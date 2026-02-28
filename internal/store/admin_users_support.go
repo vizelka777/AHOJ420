@@ -23,6 +23,7 @@ type AdminUserSupportListItem struct {
 	CreatedAt            time.Time
 	ProfileEmailVerified bool
 	PhoneVerified        bool
+	IsBlocked            bool
 	PasskeyCount         int
 	LinkedClientCount    int
 }
@@ -36,6 +37,11 @@ type AdminUserProfile struct {
 	ShareProfile         bool
 	ProfileEmailVerified bool
 	PhoneVerified        bool
+	IsBlocked            bool
+	BlockedAt            *time.Time
+	BlockedReason        string
+	BlockedByAdminUserID string
+	BlockedByAdminLogin  string
 	AvatarKey            string
 	AvatarUpdatedAt      *time.Time
 	AvatarMIME           string
@@ -65,6 +71,7 @@ func (s *Store) ListUsersForAdmin(filter AdminUserSupportListFilter) ([]AdminUse
 			u.created_at,
 			COALESCE(u.email_verified, false),
 			COALESCE(u.phone_verified, false),
+			COALESCE(u.is_blocked, false),
 			COALESCE(c.passkey_count, 0),
 			COALESCE(cl.linked_client_count, 0)
 		FROM users u
@@ -104,6 +111,7 @@ func (s *Store) ListUsersForAdmin(filter AdminUserSupportListFilter) ([]AdminUse
 			&item.CreatedAt,
 			&item.ProfileEmailVerified,
 			&item.PhoneVerified,
+			&item.IsBlocked,
 			&item.PasskeyCount,
 			&item.LinkedClientCount,
 		); err != nil {
@@ -130,6 +138,7 @@ func (s *Store) GetUserProfileForAdmin(userID string) (*AdminUserProfile, error)
 	var item AdminUserProfile
 	var avatarUpdatedAt sql.NullTime
 	var profileCompletedAt sql.NullTime
+	var blockedAt sql.NullTime
 	err := s.db.QueryRow(`
 		SELECT
 			u.id::text,
@@ -140,6 +149,11 @@ func (s *Store) GetUserProfileForAdmin(userID string) (*AdminUserProfile, error)
 			COALESCE(u.share_profile, false),
 			COALESCE(u.email_verified, false),
 			COALESCE(u.phone_verified, false),
+			COALESCE(u.is_blocked, false),
+			u.blocked_at,
+			COALESCE(u.blocked_reason, ''),
+			COALESCE(u.blocked_by_admin_user_id::text, ''),
+			COALESCE(blocked_by.login, ''),
 			COALESCE(u.avatar_key, ''),
 			u.avatar_updated_at,
 			COALESCE(u.avatar_mime, ''),
@@ -147,6 +161,7 @@ func (s *Store) GetUserProfileForAdmin(userID string) (*AdminUserProfile, error)
 			u.created_at,
 			u.profile_completed_at
 		FROM users u
+		LEFT JOIN admin_users blocked_by ON blocked_by.id = u.blocked_by_admin_user_id
 		WHERE u.id = $1
 	`, userID).Scan(
 		&item.ID,
@@ -157,6 +172,11 @@ func (s *Store) GetUserProfileForAdmin(userID string) (*AdminUserProfile, error)
 		&item.ShareProfile,
 		&item.ProfileEmailVerified,
 		&item.PhoneVerified,
+		&item.IsBlocked,
+		&blockedAt,
+		&item.BlockedReason,
+		&item.BlockedByAdminUserID,
+		&item.BlockedByAdminLogin,
 		&item.AvatarKey,
 		&avatarUpdatedAt,
 		&item.AvatarMIME,
@@ -176,8 +196,15 @@ func (s *Store) GetUserProfileForAdmin(userID string) (*AdminUserProfile, error)
 	item.DisplayName = strings.TrimSpace(item.DisplayName)
 	item.ProfileEmail = strings.TrimSpace(item.ProfileEmail)
 	item.Phone = strings.TrimSpace(item.Phone)
+	item.BlockedReason = strings.TrimSpace(item.BlockedReason)
+	item.BlockedByAdminUserID = strings.TrimSpace(item.BlockedByAdminUserID)
+	item.BlockedByAdminLogin = strings.TrimSpace(item.BlockedByAdminLogin)
 	item.AvatarKey = strings.TrimSpace(item.AvatarKey)
 	item.AvatarMIME = strings.TrimSpace(item.AvatarMIME)
+	if blockedAt.Valid {
+		ts := blockedAt.Time.UTC()
+		item.BlockedAt = &ts
+	}
 	if avatarUpdatedAt.Valid {
 		ts := avatarUpdatedAt.Time.UTC()
 		item.AvatarUpdatedAt = &ts

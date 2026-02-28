@@ -68,6 +68,7 @@ type OIDCClientStore interface {
 	ListAdminInvites(ctx context.Context, adminUserID string) ([]store.AdminInvite, error)
 	ListUsersForAdmin(filter store.AdminUserSupportListFilter) ([]store.AdminUserSupportListItem, error)
 	GetUserProfileForAdmin(userID string) (*store.AdminUserProfile, error)
+	SetUserBlocked(ctx context.Context, userID string, blocked bool, reason string, blockedByAdminUserID string) error
 	ListCredentialRecords(userID string) ([]store.CredentialRecord, error)
 	DeleteCredentialByUserAndID(userID string, credID []byte) error
 	ListUserOIDCClients(userID string) ([]store.UserOIDCClient, error)
@@ -405,6 +406,7 @@ type userListItem struct {
 	CreatedAt            time.Time
 	ProfileEmailVerified bool
 	PhoneVerified        bool
+	IsBlocked            bool
 	PasskeyCount         int
 	SessionCount         int
 	LinkedClientCount    int
@@ -530,6 +532,8 @@ func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/security", handler.SecurityPage)
 	group.GET("/users", handler.UsersList)
 	group.GET("/users/:id", handler.UserDetail)
+	group.POST("/users/:id/block", handler.UserBlock)
+	group.POST("/users/:id/unblock", handler.UserUnblock)
 	group.POST("/users/:id/sessions/logout-all", handler.UserSessionsLogoutAll)
 	group.POST("/users/:id/sessions/:sessionID/logout", handler.UserSessionLogout)
 	group.POST("/users/:id/passkeys/:credentialID/revoke", handler.UserPasskeyRevoke)
@@ -783,6 +787,7 @@ func (h *Handler) UsersList(c echo.Context) error {
 			CreatedAt:            item.CreatedAt,
 			ProfileEmailVerified: item.ProfileEmailVerified,
 			PhoneVerified:        item.PhoneVerified,
+			IsBlocked:            item.IsBlocked,
 			PasskeyCount:         item.PasskeyCount,
 			SessionCount:         sessionCounts[id],
 			LinkedClientCount:    item.LinkedClientCount,
@@ -898,6 +903,124 @@ func (h *Handler) UserDetail(c echo.Context) error {
 		EventsFilter:  eventsFilter,
 		EventFilters:  eventFilters,
 	})
+}
+
+func (h *Handler) UserBlock(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+
+	reason := strings.TrimSpace(c.FormValue("reason"))
+	if reason == "" {
+		h.setFlash(c, "error", "Block reason is required")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	actorID := ""
+	if current := h.currentAdmin(c); current != nil {
+		actorID = strings.TrimSpace(current.ID)
+	}
+
+	if err := h.store.SetUserBlocked(c.Request().Context(), userID, true, reason, actorID); err != nil {
+		h.auditAdminAction(c, "admin.user.block.failure", false, "user", userID, err, map[string]any{
+			"recent_reauth": true,
+			"reason":        reason,
+			"blocked":       true,
+		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventAccountBlocked,
+			Category:    store.UserSecurityCategoryAdmin,
+			Success:     boolPtr(false),
+			DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.block", "reason": "block_failed"}),
+		})
+		h.setFlash(c, "error", "Failed to block user")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	removedSessions, invalidateErr := h.auth.LogoutAllUserSessionsForAdmin(c.Request().Context(), userID)
+	if invalidateErr != nil {
+		h.auditAdminAction(c, "admin.user.block.failure", false, "user", userID, invalidateErr, map[string]any{
+			"recent_reauth": true,
+			"reason":        reason,
+			"blocked":       true,
+			"phase":         "session_invalidation",
+		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventAccountBlocked,
+			Category:    store.UserSecurityCategoryAdmin,
+			Success:     boolPtr(false),
+			DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.block", "reason": "session_invalidation_failed"}),
+		})
+		h.setFlash(c, "error", "User blocked, but failed to invalidate sessions")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	h.auditAdminAction(c, "admin.user.block.success", true, "user", userID, nil, map[string]any{
+		"recent_reauth":         true,
+		"reason":                reason,
+		"blocked":               true,
+		"invalidated_sessions":  removedSessions,
+		"blocked_by_admin_user": actorID,
+	})
+	h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventAccountBlocked,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     boolPtr(true),
+		DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.block", "reason": reason, "invalidated_sessions": removedSessions}),
+	})
+	h.setFlash(c, "success", fmt.Sprintf("User blocked and %d session(s) invalidated", removedSessions))
+	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+}
+
+func (h *Handler) UserUnblock(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+
+	if err := h.store.SetUserBlocked(c.Request().Context(), userID, false, "", ""); err != nil {
+		h.auditAdminAction(c, "admin.user.unblock.failure", false, "user", userID, err, map[string]any{
+			"recent_reauth": true,
+			"blocked":       false,
+		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventAccountUnblocked,
+			Category:    store.UserSecurityCategoryAdmin,
+			Success:     boolPtr(false),
+			DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.unblock", "reason": "unblock_failed"}),
+		})
+		h.setFlash(c, "error", "Failed to unblock user")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	h.auditAdminAction(c, "admin.user.unblock.success", true, "user", userID, nil, map[string]any{
+		"recent_reauth": true,
+		"blocked":       false,
+	})
+	h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventAccountUnblocked,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     boolPtr(true),
+		DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.unblock"}),
+	})
+	h.setFlash(c, "success", "User unblocked")
+	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
 }
 
 func (h *Handler) UserSessionLogout(c echo.Context) error {
@@ -1195,6 +1318,16 @@ func userSecurityEventLabel(entry store.UserSecurityEvent) string {
 			return "Admin revoked user passkey"
 		}
 		return "Passkey revoked"
+	case store.UserSecurityEventAccountBlocked:
+		if actorType == "admin" || actorType == "admin_user" {
+			return "Admin blocked user account"
+		}
+		return "Account blocked"
+	case store.UserSecurityEventAccountUnblocked:
+		if actorType == "admin" || actorType == "admin_user" {
+			return "Admin unblocked user account"
+		}
+		return "Account unblocked"
 	default:
 		if humanized := humanizeSecurityEventType(eventType); humanized != "" {
 			return humanized

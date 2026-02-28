@@ -28,6 +28,7 @@ import (
 type Service struct {
 	wa                 *webauthn.WebAuthn
 	store              *store.Store
+	userBlockedChecker func(ctx context.Context, userID string) (bool, error)
 	userSecurityEvents userSecurityEventStore
 	redis              *redis.Client
 	provider           *mp.Provider
@@ -163,6 +164,10 @@ func (s *Service) setUserSessionWithID(c echo.Context, userID string) (string, e
 }
 
 func (s *Service) setUserSessionWithCredentialID(c echo.Context, userID, credentialID string) (string, error) {
+	if err := s.ensureUserNotBlocked(c.Request().Context(), userID); err != nil {
+		return "", err
+	}
+
 	userSessionID, err := newSessionID()
 	if err != nil {
 		return "", err
@@ -250,6 +255,11 @@ func (s *Service) BeginRegistration(c echo.Context) error {
 	recoveryMode, _ := s.isRecoveryMode(c)
 
 	sessionUserID, hasSession := s.SessionUserID(c)
+	if !hasSession {
+		if _, hasSessionCookie := s.sessionID(c); hasSessionCookie {
+			return c.String(http.StatusBadRequest, "Registration session invalid")
+		}
+	}
 	user, err = selectRegistrationUser(sessionUserID, hasSession, s.store.GetUser, s.store.CreateAnonymousUser)
 
 	if err != nil || user == nil {
@@ -429,6 +439,21 @@ func (s *Service) BeginLogin(c echo.Context) error {
 			// In a real app, do not return 404 to avoid enumeration, but for now it's fine
 			return c.String(http.StatusNotFound, "User not found")
 		}
+		if err := s.ensureUserNotBlocked(c.Request().Context(), user.ID); err != nil {
+			if errors.Is(err, errUserBlocked) {
+				s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+					UserID:      user.ID,
+					EventType:   store.UserSecurityEventLoginFailure,
+					Category:    store.UserSecurityCategoryAuth,
+					Success:     boolPointer(false),
+					ActorType:   "user",
+					ActorID:     user.ID,
+					DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "user_blocked"}),
+				})
+				return c.String(http.StatusForbidden, "User account is blocked")
+			}
+			return c.String(http.StatusInternalServerError, "Internal error")
+		}
 	}
 
 	// 2. Generate Credential Assertion Options
@@ -549,6 +574,21 @@ func (s *Service) FinishLogin(c echo.Context) error {
 			}
 			return c.String(http.StatusInternalServerError, "User not found")
 		}
+		if blockedErr := s.ensureUserNotBlocked(c.Request().Context(), user.ID); blockedErr != nil {
+			if errors.Is(blockedErr, errUserBlocked) {
+				s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+					UserID:      user.ID,
+					EventType:   store.UserSecurityEventLoginFailure,
+					Category:    store.UserSecurityCategoryAuth,
+					Success:     boolPointer(false),
+					ActorType:   "user",
+					ActorID:     user.ID,
+					DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "user_blocked"}),
+				})
+				return c.String(http.StatusForbidden, "User account is blocked")
+			}
+			return c.String(http.StatusInternalServerError, "Internal error")
+		}
 		credential, err = s.wa.FinishLogin(user, session, c.Request())
 	}
 
@@ -572,6 +612,21 @@ func (s *Service) FinishLogin(c echo.Context) error {
 	}
 	if user == nil {
 		return c.String(http.StatusInternalServerError, "User not found")
+	}
+	if err := s.ensureUserNotBlocked(c.Request().Context(), user.ID); err != nil {
+		if errors.Is(err, errUserBlocked) {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      user.ID,
+				EventType:   store.UserSecurityEventLoginFailure,
+				Category:    store.UserSecurityCategoryAuth,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     user.ID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "user_blocked"}),
+			})
+			return c.String(http.StatusForbidden, "User account is blocked")
+		}
+		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
 	// 5. Update Counters
@@ -680,15 +735,7 @@ func (s *Service) clearUserSession(c echo.Context) {
 			DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "logout"}),
 		})
 	}
-	c.SetCookie(&http.Cookie{
-		Name:     "user_session",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
+	clearUserSessionCookie(c)
 }
 
 func safePostLogoutRedirect(raw string) string {
@@ -756,15 +803,7 @@ func (s *Service) DeleteAccount(c echo.Context) error {
 	if sessionCookie != nil && sessionCookie.Value != "" {
 		_ = s.redis.Del(c.Request().Context(), "sess:"+sessionCookie.Value).Err()
 	}
-	c.SetCookie(&http.Cookie{
-		Name:     "user_session",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
+	clearUserSessionCookie(c)
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -774,8 +813,16 @@ func (s *Service) SessionUserID(c echo.Context) (string, bool) {
 	if err != nil || cookie.Value == "" {
 		return "", false
 	}
-	userID, err := s.redis.Get(c.Request().Context(), "sess:"+cookie.Value).Result()
+	sessionID := strings.TrimSpace(cookie.Value)
+	userID, err := s.redis.Get(c.Request().Context(), "sess:"+sessionID).Result()
 	if err != nil || userID == "" {
+		return "", false
+	}
+	if err := s.ensureUserNotBlocked(c.Request().Context(), userID); err != nil {
+		if errors.Is(err, errUserBlocked) {
+			_ = s.cleanupSessionArtifacts(c.Request().Context(), userID, sessionID, nil)
+			clearUserSessionCookie(c)
+		}
 		return "", false
 	}
 	_ = s.touchDeviceSession(c, cookie.Value, userID, "")

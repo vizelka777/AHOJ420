@@ -4,6 +4,57 @@
 
 ## 2026-02-28
 
+### User Block/Unblock MVP
+- Ветка: `админ`
+- Статус: `implemented` (`local go toolchain unavailable`, тесты добавлены, но локальный `go test` в этом окружении не выполнен)
+
+Сделано:
+- Добавлена блокировка пользователя на уровне модели `users`:
+  - `is_blocked BOOLEAN NOT NULL DEFAULT false`
+  - `blocked_at TIMESTAMPTZ`
+  - `blocked_reason TEXT NOT NULL DEFAULT ''`
+  - `blocked_by_admin_user_id UUID`
+- Добавлен store-layer для block state:
+  - `SetUserBlocked(...)`
+  - `GetUserBlockState(...)`
+  - `IsUserBlocked(...)`
+- Users support UI расширен:
+  - новые routes:
+    - `POST /admin/users/:id/block`
+    - `POST /admin/users/:id/unblock`
+  - блок/разблок в `user_detail` (с reason для block)
+  - status badge `active/blocked` в users list и user detail
+  - блокировка/разблокировка защищены `session + CSRF + recent re-auth`
+- При block добавлена полная инвалидизация user sessions:
+  - используется существующий `LogoutAllUserSessionsForAdmin`
+- Добавлены проверки blocked-state в auth/recovery/session path:
+  - blocked user не может получить/продолжить user session (`SessionUserID` invalidates stale session)
+  - blocked user не может пройти login flow (begin/finish paths)
+  - blocked user не может запустить recovery/request/verify flow
+  - recovery mode start также защищён blocked-check
+- Добавлены audit actions:
+  - `admin.user.block.success|failure`
+  - `admin.user.unblock.success|failure`
+- В user timeline добавлены события:
+  - `account_blocked`
+  - `account_unblocked`
+- Обновлены docs:
+  - `ADMIN_UI.md`
+  - `README.md`
+
+Тесты:
+- Добавлены/обновлены тесты в `internal/adminui/handler_test.go`:
+  - block success + session invalidation + audit + timeline
+  - unblock success + audit + timeline
+  - CSRF checks для block/unblock
+  - recent re-auth checks для block/unblock
+  - blocked state badges на users list/detail
+- Добавлены auth-тесты в `internal/auth/user_block_test.go`:
+  - blocked existing session rejected + invalidated
+  - blocked session creation prevented
+  - blocked recovery mode start prevented
+  - non-blocked session still works
+
 ### Retention Cleanup Hardening Follow-up
 - Ветка: `админ`
 - Статус: `implemented`, `tests_passed`

@@ -28,6 +28,31 @@
       <dl class="kv"><dt>Phone Verified</dt><dd>{{if .User.PhoneVerified}}<span class="chip ok">yes</span>{{else}}<span class="chip warn">no</span>{{end}}</dd></dl>
       <dl class="kv"><dt>Avatar</dt><dd>{{if .User.AvatarKey}}<span class="chip ok">present</span>{{else}}<span class="chip">missing</span>{{end}}</dd></dl>
       <dl class="kv"><dt>Profile Sharing</dt><dd>{{if .User.ShareProfile}}<span class="chip ok">enabled</span>{{else}}<span class="chip">disabled</span>{{end}}</dd></dl>
+      <dl class="kv"><dt>Status</dt><dd>{{if .User.IsBlocked}}<span class="chip warn">blocked</span>{{else}}<span class="chip ok">active</span>{{end}}</dd></dl>
+      <dl class="kv"><dt>Blocked At</dt><dd class="mono">{{formatTimePtr .User.BlockedAt}}</dd></dl>
+      <dl class="kv"><dt>Blocked Reason</dt><dd>{{if .User.BlockedReason}}{{.User.BlockedReason}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Blocked By</dt><dd class="mono">{{if .User.BlockedByAdminLogin}}{{.User.BlockedByAdminLogin}}{{else if .User.BlockedByAdminUserID}}{{.User.BlockedByAdminUserID}}{{else}}-{{end}}</dd></dl>
+    </div>
+    <div style="margin-top:10px;">
+      {{if .User.IsBlocked}}
+        <form method="post" action="/admin/users/{{.User.ID}}/unblock" style="margin:0;" data-require-reauth="1">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <button type="submit" class="secondary">Unblock user</button>
+        </form>
+      {{else}}
+        <form method="post" action="/admin/users/{{.User.ID}}/block" data-require-reauth="1">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <div class="row">
+            <div style="flex:1 1 420px;">
+              <label for="block_reason">Block reason</label>
+              <input id="block_reason" name="reason" type="text" placeholder="support abuse / security incident / policy violation" required>
+            </div>
+          </div>
+          <div class="actions">
+            <button type="submit" class="warn">Block user</button>
+          </div>
+        </form>
+      {{end}}
     </div>
   </div>
 
