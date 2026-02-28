@@ -30,6 +30,7 @@ import (
 const (
 	flashCookieName       = "admin_ui_flash"
 	auditLogPageSize      = 25
+	usersPageSize         = 25
 	defaultInviteTTLHours = 24
 	dashboardRecentAudit  = 20
 	dashboardRecentFailed = 10
@@ -63,6 +64,11 @@ type OIDCClientStore interface {
 	GetActiveAdminInviteByTokenHash(ctx context.Context, tokenHash string) (*store.AdminInvite, error)
 	RevokeAdminInvite(ctx context.Context, inviteID int64) error
 	ListAdminInvites(ctx context.Context, adminUserID string) ([]store.AdminInvite, error)
+	ListUsersForAdmin(filter store.AdminUserSupportListFilter) ([]store.AdminUserSupportListItem, error)
+	GetUserProfileForAdmin(userID string) (*store.AdminUserProfile, error)
+	ListCredentialRecords(userID string) ([]store.CredentialRecord, error)
+	DeleteCredentialByUserAndID(userID string, credID []byte) error
+	ListUserOIDCClients(userID string) ([]store.UserOIDCClient, error)
 }
 
 type OIDCClientReloader interface {
@@ -87,6 +93,10 @@ type SessionAuth interface {
 	LogoutSessionByID(c echo.Context, sessionID string) error
 	LogoutOtherSessions(c echo.Context) (int, error)
 	InvalidateSessionsForAdminUser(ctx context.Context, adminUserID string) (int, error)
+	CountActiveUserSessionsByUserIDs(ctx context.Context, userIDs []string) (map[string]int, error)
+	ListUserSessionsForAdmin(ctx context.Context, userID string) ([]store.UserSessionInfo, error)
+	LogoutUserSessionForAdmin(ctx context.Context, userID string, sessionID string) error
+	LogoutAllUserSessionsForAdmin(ctx context.Context, userID string) (int, error)
 	RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc
 	AttachSessionActorMiddleware() echo.MiddlewareFunc
 }
@@ -383,6 +393,62 @@ type adminDetailPageData struct {
 	Error                 string
 }
 
+type userListItem struct {
+	ID                   string
+	LoginID              string
+	ProfileEmail         string
+	Phone                string
+	CreatedAt            time.Time
+	ProfileEmailVerified bool
+	PhoneVerified        bool
+	PasskeyCount         int
+	SessionCount         int
+	LinkedClientCount    int
+}
+
+type usersListPageData struct {
+	layoutData
+	Query   string
+	Page    int
+	PrevURL string
+	NextURL string
+	Users   []userListItem
+	Error   string
+}
+
+type userPasskeyView struct {
+	CredentialID string
+	Label        string
+	CreatedAt    time.Time
+	LastUsedAt   *time.Time
+}
+
+type userSessionView struct {
+	SessionID  string
+	SessionTag string
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	RemoteIP   string
+	UserAgent  string
+}
+
+type userClientView struct {
+	ClientID    string
+	ClientHost  string
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+}
+
+type userDetailPageData struct {
+	layoutData
+	User          *store.AdminUserProfile
+	Passkeys      []userPasskeyView
+	Sessions      []userSessionView
+	LinkedClients []userClientView
+	Error         string
+}
+
 type inviteAcceptPageData struct {
 	layoutData
 	InviteToken string
@@ -426,6 +492,11 @@ func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
 	group.GET("/audit", handler.AuditLog)
 	group.GET("/security", handler.SecurityPage)
+	group.GET("/users", handler.UsersList)
+	group.GET("/users/:id", handler.UserDetail)
+	group.POST("/users/:id/sessions/logout-all", handler.UserSessionsLogoutAll)
+	group.POST("/users/:id/sessions/:sessionID/logout", handler.UserSessionLogout)
+	group.POST("/users/:id/passkeys/:credentialID/revoke", handler.UserPasskeyRevoke)
 	group.GET("/admins", handler.AdminsList)
 	group.GET("/admins/new", handler.AdminNew)
 	group.POST("/admins/new", handler.AdminCreate)
@@ -622,6 +693,250 @@ func (h *Handler) SecuritySessionsLogoutOthers(c echo.Context) error {
 		h.setFlash(c, "success", fmt.Sprintf("Signed out %d other session(s)", removed))
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/security")
+}
+
+func (h *Handler) UsersList(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	query := strings.TrimSpace(c.QueryParam("q"))
+	page := parseListPage(c.QueryParam("page"))
+
+	rows, err := h.store.ListUsersForAdmin(store.AdminUserSupportListFilter{
+		Query:  query,
+		Limit:  usersPageSize + 1,
+		Offset: (page - 1) * usersPageSize,
+	})
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "users_list.html", usersListPageData{
+			layoutData: h.newLayoutData(c, adminUser, "Users"),
+			Query:      query,
+			Page:       page,
+			Error:      "Failed to load users",
+		})
+	}
+
+	hasNext := len(rows) > usersPageSize
+	if hasNext {
+		rows = rows[:usersPageSize]
+	}
+
+	userIDs := make([]string, 0, len(rows))
+	for _, item := range rows {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		userIDs = append(userIDs, strings.TrimSpace(item.ID))
+	}
+	sessionCounts, err := h.auth.CountActiveUserSessionsByUserIDs(c.Request().Context(), userIDs)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "users_list.html", usersListPageData{
+			layoutData: h.newLayoutData(c, adminUser, "Users"),
+			Query:      query,
+			Page:       page,
+			Error:      "Failed to load user sessions",
+		})
+	}
+
+	items := make([]userListItem, 0, len(rows))
+	for _, item := range rows {
+		id := strings.TrimSpace(item.ID)
+		items = append(items, userListItem{
+			ID:                   id,
+			LoginID:              strings.TrimSpace(item.LoginID),
+			ProfileEmail:         strings.TrimSpace(item.ProfileEmail),
+			Phone:                strings.TrimSpace(item.Phone),
+			CreatedAt:            item.CreatedAt,
+			ProfileEmailVerified: item.ProfileEmailVerified,
+			PhoneVerified:        item.PhoneVerified,
+			PasskeyCount:         item.PasskeyCount,
+			SessionCount:         sessionCounts[id],
+			LinkedClientCount:    item.LinkedClientCount,
+		})
+	}
+
+	prevURL := ""
+	if page > 1 {
+		prevURL = usersListURL(page-1, query)
+	}
+	nextURL := ""
+	if hasNext {
+		nextURL = usersListURL(page+1, query)
+	}
+
+	return h.render(c, http.StatusOK, "users_list.html", usersListPageData{
+		layoutData: h.newLayoutData(c, adminUser, "Users"),
+		Query:      query,
+		Page:       page,
+		PrevURL:    prevURL,
+		NextURL:    nextURL,
+		Users:      items,
+	})
+}
+
+func (h *Handler) UserDetail(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		return h.render(c, http.StatusBadRequest, "user_detail.html", userDetailPageData{
+			layoutData: h.newLayoutData(c, adminUser, "User"),
+			Error:      "User ID is required",
+		})
+	}
+
+	profile, err := h.store.GetUserProfileForAdmin(userID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "Failed to load user profile"
+		if errors.Is(err, store.ErrUserNotFound) {
+			status = http.StatusNotFound
+			message = "User not found"
+		}
+		return h.render(c, status, "user_detail.html", userDetailPageData{
+			layoutData: h.newLayoutData(c, adminUser, "User"),
+			Error:      message,
+		})
+	}
+
+	passkeysRaw, err := h.store.ListCredentialRecords(userID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
+			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:       profile,
+			Error:      "Failed to load user passkeys",
+		})
+	}
+
+	sessionsRaw, err := h.auth.ListUserSessionsForAdmin(c.Request().Context(), userID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
+			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:       profile,
+			Passkeys:   buildUserPasskeyViews(passkeysRaw),
+			Error:      "Failed to load user sessions",
+		})
+	}
+
+	linkedClientsRaw, err := h.store.ListUserOIDCClients(userID)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "user_detail.html", userDetailPageData{
+			layoutData: h.newLayoutData(c, adminUser, "User: "+profile.ID),
+			User:       profile,
+			Passkeys:   buildUserPasskeyViews(passkeysRaw),
+			Sessions:   buildUserSessionViews(sessionsRaw),
+			Error:      "Failed to load linked clients",
+		})
+	}
+
+	return h.render(c, http.StatusOK, "user_detail.html", userDetailPageData{
+		layoutData:    h.newLayoutData(c, adminUser, "User: "+profile.ID),
+		User:          profile,
+		Passkeys:      buildUserPasskeyViews(passkeysRaw),
+		Sessions:      buildUserSessionViews(sessionsRaw),
+		LinkedClients: buildUserClientViews(linkedClientsRaw),
+	})
+}
+
+func (h *Handler) UserSessionLogout(c echo.Context) error {
+	userID := strings.TrimSpace(c.Param("id"))
+	sessionID := strings.TrimSpace(c.Param("sessionID"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+	if sessionID == "" {
+		h.setFlash(c, "error", "Invalid session ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	if err := h.auth.LogoutUserSessionForAdmin(c.Request().Context(), userID, sessionID); err != nil {
+		h.auditAdminAction(c, "admin.user.session.logout.failure", false, "user_session", sessionID, err, map[string]any{
+			"user_id": userID,
+		})
+		h.setFlash(c, "error", "Failed to sign out user session")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	h.auditAdminAction(c, "admin.user.session.logout.success", true, "user_session", sessionID, nil, map[string]any{
+		"user_id": userID,
+	})
+	h.setFlash(c, "success", "User session signed out")
+	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+}
+
+func (h *Handler) UserSessionsLogoutAll(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+
+	removed, err := h.auth.LogoutAllUserSessionsForAdmin(c.Request().Context(), userID)
+	if err != nil {
+		h.auditAdminAction(c, "admin.user.session.logout_all.failure", false, "user", userID, err, map[string]any{
+			"recent_reauth": true,
+		})
+		h.setFlash(c, "error", "Failed to sign out all user sessions")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	h.auditAdminAction(c, "admin.user.session.logout_all.success", true, "user", userID, nil, map[string]any{
+		"recent_reauth": true,
+		"removed_count": removed,
+	})
+	if removed == 0 {
+		h.setFlash(c, "success", "No active user sessions to sign out")
+	} else {
+		h.setFlash(c, "success", fmt.Sprintf("Signed out %d user session(s)", removed))
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+}
+
+func (h *Handler) UserPasskeyRevoke(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
+	userID := strings.TrimSpace(c.Param("id"))
+	credentialID := strings.TrimSpace(c.Param("credentialID"))
+	if userID == "" {
+		h.setFlash(c, "error", "Invalid user ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users")
+	}
+	if credentialID == "" {
+		h.setFlash(c, "error", "Invalid passkey ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+	credentialRaw, err := hex.DecodeString(credentialID)
+	if err != nil || len(credentialRaw) == 0 {
+		h.setFlash(c, "error", "Invalid passkey ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	if err := h.store.DeleteCredentialByUserAndID(userID, credentialRaw); err != nil {
+		h.auditAdminAction(c, "admin.user.passkey.revoke.failure", false, "user_credential", credentialID, err, map[string]any{
+			"user_id":       userID,
+			"recent_reauth": true,
+		})
+		switch {
+		case errors.Is(err, store.ErrCredentialNotFound):
+			h.setFlash(c, "error", "Passkey not found")
+		case errors.Is(err, store.ErrCannotDeleteLastCredential):
+			h.setFlash(c, "error", "Cannot revoke the last passkey")
+		default:
+			h.setFlash(c, "error", "Failed to revoke passkey")
+		}
+		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
+	}
+
+	h.auditAdminAction(c, "admin.user.passkey.revoke.success", true, "user_credential", credentialID, nil, map[string]any{
+		"user_id":       userID,
+		"recent_reauth": true,
+	})
+	h.setFlash(c, "success", "User passkey revoked")
+	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
 }
 
 func (h *Handler) InviteAcceptPage(c echo.Context) error {
@@ -2267,6 +2582,10 @@ func parseAuditLogPage(raw string) int {
 	return page
 }
 
+func parseListPage(raw string) int {
+	return parseAuditLogPage(raw)
+}
+
 func parseAuditSuccessFilter(raw string) (string, *bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "success", "true", "1", "yes":
@@ -2302,6 +2621,21 @@ func auditLogURL(page int, action string, success string, actor string, resource
 		return "/admin/audit"
 	}
 	return "/admin/audit?" + encoded
+}
+
+func usersListURL(page int, query string) string {
+	params := url.Values{}
+	if page > 1 {
+		params.Set("page", strconv.Itoa(page))
+	}
+	if strings.TrimSpace(query) != "" {
+		params.Set("q", strings.TrimSpace(query))
+	}
+	encoded := params.Encode()
+	if encoded == "" {
+		return "/admin/users"
+	}
+	return "/admin/users?" + encoded
 }
 
 func buildDashboardAuditPreview(entries []store.AdminAuditEntry, successFilter string) []dashboardAuditPreviewItem {
@@ -2377,6 +2711,54 @@ func buildSessionViews(items []store.AdminSessionInfo) []adminSessionView {
 			RemoteIP:   defaultDisplay(item.RemoteIP),
 			UserAgent:  defaultDisplay(item.UserAgent),
 			Current:    item.Current,
+		})
+	}
+	return out
+}
+
+func buildUserPasskeyViews(items []store.CredentialRecord) []userPasskeyView {
+	out := make([]userPasskeyView, 0, len(items))
+	for _, item := range items {
+		credentialID := hex.EncodeToString(item.ID)
+		label := strings.TrimSpace(item.DeviceName)
+		if label == "" {
+			label = shortDisplay(credentialID, 12, 8)
+		}
+		out = append(out, userPasskeyView{
+			CredentialID: credentialID,
+			Label:        label,
+			CreatedAt:    item.CreatedAt,
+			LastUsedAt:   item.LastUsedAt,
+		})
+	}
+	return out
+}
+
+func buildUserSessionViews(items []store.UserSessionInfo) []userSessionView {
+	out := make([]userSessionView, 0, len(items))
+	for _, item := range items {
+		sessionID := strings.TrimSpace(item.SessionID)
+		out = append(out, userSessionView{
+			SessionID:  sessionID,
+			SessionTag: shortDisplay(sessionID, 10, 8),
+			CreatedAt:  item.CreatedAt,
+			LastSeenAt: item.LastSeenAt,
+			ExpiresAt:  item.ExpiresAt,
+			RemoteIP:   defaultDisplay(item.RemoteIP),
+			UserAgent:  defaultDisplay(item.UserAgent),
+		})
+	}
+	return out
+}
+
+func buildUserClientViews(items []store.UserOIDCClient) []userClientView {
+	out := make([]userClientView, 0, len(items))
+	for _, item := range items {
+		out = append(out, userClientView{
+			ClientID:    strings.TrimSpace(item.ClientID),
+			ClientHost:  strings.TrimSpace(item.ClientHost),
+			FirstSeenAt: item.FirstSeenAt,
+			LastSeenAt:  item.LastSeenAt,
 		})
 	}
 	return out

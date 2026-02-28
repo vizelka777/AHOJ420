@@ -267,6 +267,11 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/`
 - `GET /admin/audit`
 - `GET /admin/security`
+- `GET /admin/users`
+- `GET /admin/users/:id`
+- `POST /admin/users/:id/sessions/logout-all`
+- `POST /admin/users/:id/sessions/:sessionID/logout`
+- `POST /admin/users/:id/passkeys/:credentialID/revoke`
 - `GET /admin/admins`
 - `GET /admin/admins/new`
 - `POST /admin/admins/new`
@@ -295,7 +300,7 @@ Authentication and protection:
 - primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
 - session auth is passkey-only (`/admin/auth/login/*`), separate from regular user sessions
 - admin HTML UI (`/admin/*`) is session-only and always redirects unauthenticated users to `/admin/login`
-- admin HTML UI mutating routes (`POST /admin/logout`, `POST /admin/clients/*`) require CSRF token validation
+- admin HTML UI mutating routes (`POST /admin/logout`, `POST /admin/clients/*`, `POST /admin/users/*`, `POST /admin/security/*`, `POST /admin/admins/*`) require CSRF token validation
   - server issues `admin_csrf` cookie (Secure, HttpOnly, SameSite=Strict)
   - server-rendered forms send hidden `csrf_token` and invalid/missing token returns `403 invalid csrf token`
   - CSRF middleware is scoped to authenticated `/admin/*` UI routes and does not apply to `/admin/auth/*` WebAuthn endpoints
@@ -330,6 +335,17 @@ Security behavior:
   - admin can add a second passkey while already logged in (`/admin/auth/passkeys/register/*`)
   - last remaining admin passkey cannot be deleted
   - admin can sign out one session or all other sessions
+- users support section (`GET /admin/users`, `GET /admin/users/:id`) is available to both `owner` and `admin`
+  - mostly read-only support view (search/list/detail)
+  - no profile editing, no user deletion, no impersonation
+  - safe support mutations:
+    - logout one user session (`POST /admin/users/:id/sessions/:sessionID/logout`)
+    - logout all user sessions (`POST /admin/users/:id/sessions/logout-all`)
+    - revoke one user passkey (`POST /admin/users/:id/passkeys/:credentialID/revoke`)
+  - support mutations are audited:
+    - `admin.user.session.logout.success|failure`
+    - `admin.user.session.logout_all.success|failure`
+    - `admin.user.passkey.revoke.success|failure`
 - multi-admin model:
   - admins are separate users in `admin_users`
   - roles: `owner`, `admin` (stored in `admin_users.role`)
@@ -356,6 +372,8 @@ Security behavior:
     - add/revoke OIDC secret
     - delete admin passkey
     - logout other admin sessions
+    - logout all user sessions
+    - revoke user passkey
   - missing/expired recent re-auth returns `403` with message `recent admin re-auth required` (JSON code `admin_reauth_required`)
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action

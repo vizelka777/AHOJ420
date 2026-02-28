@@ -71,3 +71,43 @@
 Проверки:
 - `go test ./internal/adminui` (dockerized Go) — `ok`.
 - `go test ./...` (dockerized Go) — `ok`.
+
+### Users Support Section MVP
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Добавлен новый раздел `Users` в admin UI:
+  - `GET /admin/users` (поиск + пагинация)
+  - `GET /admin/users/:id` (карточка пользователя)
+- Добавлены safe support actions:
+  - `POST /admin/users/:id/sessions/:sessionID/logout`
+  - `POST /admin/users/:id/sessions/logout-all`
+  - `POST /admin/users/:id/passkeys/:credentialID/revoke`
+- Для user detail реализованы блоки:
+  - summary (id, profile email/phone, verified flags, avatar presence)
+  - passkeys
+  - active sessions
+  - linked OIDC clients
+- Добавлены store read-model методы:
+  - `ListUsersForAdmin`
+  - `GetUserProfileForAdmin`
+- Добавлены adminauth методы для user session inventory/logout:
+  - `CountActiveUserSessionsByUserIDs`
+  - `ListUserSessionsForAdmin`
+  - `LogoutUserSessionForAdmin`
+  - `LogoutAllUserSessionsForAdmin`
+- Подключены security guards:
+  - CSRF на всех mutating `/admin/users/*` routes
+  - recent re-auth на `logout-all` и `passkey revoke`
+- Добавлены audit actions:
+  - `admin.user.session.logout.success|failure`
+  - `admin.user.session.logout_all.success|failure`
+  - `admin.user.passkey.revoke.success|failure`
+- Обновлена навигация: `Overview`, `Users`, `Clients`, `Audit log`, `Security`, `Admins` (owner-only), `Logout`.
+- Обновлена документация: `ADMIN_UI.md`, `README.md`.
+
+Проверки:
+- `go test ./internal/adminui` (dockerized Go) — `ok`.
+- `go test ./internal/adminauth` (dockerized Go) — `ok`.
+- `go test ./...` (dockerized Go) — `ok`.

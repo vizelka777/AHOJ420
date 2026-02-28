@@ -1,0 +1,83 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Users</h1>
+        <p class="hint" style="margin:6px 0 0;">Support view for end users: search, inspect, and run safe security actions.</p>
+      </div>
+      <a class="btn secondary" href="/admin/">Back to overview</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <form method="get" action="/admin/users">
+      <div class="row">
+        <div style="flex:1 1 360px;">
+          <label for="q">Search (id / email / phone)</label>
+          <input id="q" name="q" type="text" value="{{.Query}}" placeholder="user id, profile email, phone, or login id">
+        </div>
+      </div>
+      <div class="actions">
+        <button type="submit">Search</button>
+        <a class="btn secondary" href="/admin/users">Reset</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="panel">
+    {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Email</th>
+            <th>Phone</th>
+            <th>Created</th>
+            <th>Verified</th>
+            <th>Passkeys</th>
+            <th>Sessions</th>
+            <th>Linked clients</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Users}}
+            {{range .Users}}
+              <tr>
+                <td class="mono">{{.ID}}</td>
+                <td>
+                  {{if .ProfileEmail}}{{.ProfileEmail}}{{else}}-{{end}}
+                  <div class="hint mono">{{if .LoginID}}{{.LoginID}}{{else}}-{{end}}</div>
+                </td>
+                <td>{{if .Phone}}{{.Phone}}{{else}}-{{end}}</td>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td>
+                  <div class="chips">
+                    {{if .ProfileEmailVerified}}<span class="chip ok">email verified</span>{{else}}<span class="chip warn">email unverified</span>{{end}}
+                    {{if .PhoneVerified}}<span class="chip ok">phone verified</span>{{else}}<span class="chip warn">phone unverified</span>{{end}}
+                  </div>
+                </td>
+                <td class="mono">{{.PasskeyCount}}</td>
+                <td class="mono">{{.SessionCount}}</td>
+                <td class="mono">{{.LinkedClientCount}}</td>
+                <td><a class="btn secondary" href="/admin/users/{{.ID}}">Open</a></td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="9">No users found.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
+      <div class="hint">Page {{.Page}}</div>
+      <div class="actions" style="margin-top:0;">
+        {{if .PrevURL}}<a class="btn secondary" href="{{.PrevURL}}">Previous</a>{{end}}
+        {{if .NextURL}}<a class="btn secondary" href="{{.NextURL}}">Next</a>{{end}}
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

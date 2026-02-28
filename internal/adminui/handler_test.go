@@ -3,6 +3,7 @@ package adminui
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -438,6 +439,240 @@ func TestSecurityPageRequiresSession(t *testing.T) {
 	}
 	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
 		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestUsersListRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestUsersListSearchWorksByIDEmailAndPhone(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	userA := fakeStore.seedSupportUser("user-a", "alice@login.local", "alice@example.com", "+111")
+	userB := fakeStore.seedSupportUser("user-b", "bob@login.local", "bob@example.com", "+222")
+	fakeStore.userCredentials[userA.ID] = []store.CredentialRecord{
+		{ID: []byte{0x01, 0x02}, CreatedAt: time.Now().UTC().Add(-2 * time.Hour)},
+	}
+	fakeStore.userLinkedClients[userA.ID] = []store.UserOIDCClient{
+		{ClientID: "client-a", FirstSeenAt: time.Now().UTC().Add(-6 * time.Hour), LastSeenAt: time.Now().UTC().Add(-1 * time.Hour)},
+	}
+
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+		userSessions: map[string][]store.UserSessionInfo{
+			userA.ID: {
+				{SessionID: "sess-a", CreatedAt: time.Now().UTC().Add(-3 * time.Hour), LastSeenAt: time.Now().UTC().Add(-15 * time.Minute)},
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	recByEmail := doUIRequest(t, e, http.MethodGet, "/admin/users?q=alice@example.com", nil, auth.sessionCookies())
+	if recByEmail.Code != http.StatusOK {
+		t.Fatalf("expected 200 for email search, got %d body=%s", recByEmail.Code, recByEmail.Body.String())
+	}
+	if !strings.Contains(recByEmail.Body.String(), userA.ID) || strings.Contains(recByEmail.Body.String(), userB.ID) {
+		t.Fatalf("email search did not filter as expected, body=%s", recByEmail.Body.String())
+	}
+
+	recByID := doUIRequest(t, e, http.MethodGet, "/admin/users?q=user-b", nil, auth.sessionCookies())
+	if recByID.Code != http.StatusOK {
+		t.Fatalf("expected 200 for id search, got %d body=%s", recByID.Code, recByID.Body.String())
+	}
+	if !strings.Contains(recByID.Body.String(), userB.ID) || strings.Contains(recByID.Body.String(), userA.ID) {
+		t.Fatalf("id search did not filter as expected, body=%s", recByID.Body.String())
+	}
+
+	recByPhone := doUIRequest(t, e, http.MethodGet, "/admin/users?q=%2B111", nil, auth.sessionCookies())
+	if recByPhone.Code != http.StatusOK {
+		t.Fatalf("expected 200 for phone search, got %d body=%s", recByPhone.Code, recByPhone.Body.String())
+	}
+	if !strings.Contains(recByPhone.Body.String(), userA.ID) || strings.Contains(recByPhone.Body.String(), userB.ID) {
+		t.Fatalf("phone search did not filter as expected, body=%s", recByPhone.Body.String())
+	}
+}
+
+func TestUserDetailRendersSummaryPasskeysSessionsAndClients(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-detail", "detail@login.local", "detail@example.com", "+420")
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{ID: []byte{0x11, 0x22, 0x33}, DeviceName: "Phone", CreatedAt: time.Now().UTC().Add(-4 * time.Hour)},
+		{ID: []byte{0x44, 0x55, 0x66}, DeviceName: "Laptop", CreatedAt: time.Now().UTC().Add(-3 * time.Hour)},
+	}
+	fakeStore.userLinkedClients[user.ID] = []store.UserOIDCClient{
+		{ClientID: "cli-1", ClientHost: "app.example.com", FirstSeenAt: time.Now().UTC().Add(-8 * time.Hour), LastSeenAt: time.Now().UTC().Add(-2 * time.Hour)},
+	}
+
+	auth := &fakeUIAuth{
+		user: store.AdminUser{ID: "admin-1", Login: "admin", DisplayName: "Admin", Role: store.AdminRoleAdmin},
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{
+					SessionID:  "u-sess-1",
+					CreatedAt:  time.Now().UTC().Add(-5 * time.Hour),
+					LastSeenAt: time.Now().UTC().Add(-30 * time.Minute),
+					ExpiresAt:  time.Now().UTC().Add(30 * time.Minute),
+					RemoteIP:   "127.0.0.1",
+					UserAgent:  "Mozilla/5.0",
+				},
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for user detail, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Summary",
+		"Passkeys",
+		"Sessions",
+		"Linked OIDC Clients",
+		"/admin/users/" + user.ID + "/sessions/logout-all",
+		"/admin/users/" + user.ID + "/sessions/u-sess-1/logout",
+		"/admin/users/" + user.ID + "/passkeys/",
+		"cli-1",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q in user detail html, body=%s", expected, body)
+		}
+	}
+}
+
+func TestUserSessionLogoutActionWritesAudit(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-logout-one", "logout-one@login.local", "logout.one@example.com", "+555")
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-15 * time.Minute)},
+				{SessionID: "sess-2", CreatedAt: time.Now().UTC().Add(-90 * time.Minute), LastSeenAt: time.Now().UTC().Add(-10 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/sessions/sess-2/logout", withCSRF(nil, csrfToken), cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on user session logout, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(auth.userSessions[user.ID]) != 1 {
+		t.Fatalf("expected one session remaining, got %+v", auth.userSessions[user.ID])
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.session.logout.success", true) {
+		t.Fatalf("expected admin.user.session.logout.success audit entry")
+	}
+}
+
+func TestUserLogoutAllSessionsRequiresRecentReauth(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-logout-all", "logout-all@login.local", "logout.all@example.com", "+666")
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-a", CreatedAt: time.Now().UTC().Add(-2 * time.Hour), LastSeenAt: time.Now().UTC().Add(-12 * time.Minute)},
+				{SessionID: "sess-b", CreatedAt: time.Now().UTC().Add(-90 * time.Minute), LastSeenAt: time.Now().UTC().Add(-10 * time.Minute)},
+			},
+		},
+	}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+
+	recBlocked := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/sessions/logout-all", withCSRF(nil, csrfToken), cookies)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth, got %d body=%s", recBlocked.Code, recBlocked.Body.String())
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/sessions/logout-all", withCSRF(nil, csrfToken), cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+	if len(auth.userSessions[user.ID]) != 0 {
+		t.Fatalf("expected all user sessions removed, got %+v", auth.userSessions[user.ID])
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.session.logout_all.success", true) {
+		t.Fatalf("expected admin.user.session.logout_all.success audit entry")
+	}
+}
+
+func TestUserPasskeyRevokeRequiresRecentReauthAndWritesAudit(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-passkey", "passkey@login.local", "passkey@example.com", "+777")
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{ID: []byte{0x0a, 0x0b, 0x0c}, DeviceName: "Phone", CreatedAt: time.Now().UTC().Add(-4 * time.Hour)},
+		{ID: []byte{0x0d, 0x0e, 0x0f}, DeviceName: "Laptop", CreatedAt: time.Now().UTC().Add(-3 * time.Hour)},
+	}
+	auth := &fakeUIAuth{disableAutoRecentReauth: true}
+	auditStore := &fakeAuditStore{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/users/"+user.ID, auth.sessionCookies())
+
+	targetCredentialID := hex.EncodeToString(fakeStore.userCredentials[user.ID][0].ID)
+	recBlocked := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/passkeys/"+targetCredentialID+"/revoke", withCSRF(nil, csrfToken), cookies)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth for revoke, got %d body=%s", recBlocked.Code, recBlocked.Body.String())
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/passkeys/"+targetCredentialID+"/revoke", withCSRF(nil, csrfToken), cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth for revoke, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+	if len(fakeStore.userCredentials[user.ID]) != 1 {
+		t.Fatalf("expected one passkey remaining after revoke, got %+v", fakeStore.userCredentials[user.ID])
+	}
+	if !hasAuditAction(auditStore.entries, "admin.user.passkey.revoke.success", true) {
+		t.Fatalf("expected admin.user.passkey.revoke.success audit entry")
+	}
+}
+
+func TestUsersMutatingRoutesRequireCSRF(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-csrf", "csrf@login.local", "csrf@example.com", "+999")
+	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
+		{ID: []byte{0xaa, 0xbb}, CreatedAt: time.Now().UTC().Add(-2 * time.Hour)},
+		{ID: []byte{0xcc, 0xdd}, CreatedAt: time.Now().UTC().Add(-1 * time.Hour)},
+	}
+	auth := &fakeUIAuth{
+		userSessions: map[string][]store.UserSessionInfo{
+			user.ID: {
+				{SessionID: "sess-x", CreatedAt: time.Now().UTC().Add(-90 * time.Minute), LastSeenAt: time.Now().UTC().Add(-2 * time.Minute)},
+			},
+		},
+	}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	noCSRFLogoutOne := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/sessions/sess-x/logout", nil, auth.sessionCookies())
+	if noCSRFLogoutOne.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for logout-one without csrf, got %d body=%s", noCSRFLogoutOne.Code, noCSRFLogoutOne.Body.String())
+	}
+
+	noCSRFLogoutAll := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/sessions/logout-all", nil, auth.sessionCookies())
+	if noCSRFLogoutAll.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for logout-all without csrf, got %d body=%s", noCSRFLogoutAll.Code, noCSRFLogoutAll.Body.String())
+	}
+
+	credentialID := hex.EncodeToString(fakeStore.userCredentials[user.ID][0].ID)
+	noCSRFRevoke := doUIRequest(t, e, http.MethodPost, "/admin/users/"+user.ID+"/passkeys/"+credentialID+"/revoke", nil, auth.sessionCookies())
+	if noCSRFRevoke.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for passkey revoke without csrf, got %d body=%s", noCSRFRevoke.Code, noCSRFRevoke.Body.String())
 	}
 }
 
@@ -1640,6 +1875,7 @@ type fakeUIAuth struct {
 	user                    store.AdminUser
 	passkeys                []store.AdminCredentialInfo
 	sessions                []store.AdminSessionInfo
+	userSessions            map[string][]store.UserSessionInfo
 	recentReauthAt          *time.Time
 	reauthMaxAge            time.Duration
 	disableAutoRecentReauth bool
@@ -1794,6 +2030,65 @@ func (a *fakeUIAuth) InvalidateSessionsForAdminUser(ctx context.Context, adminUs
 	return removed, nil
 }
 
+func (a *fakeUIAuth) CountActiveUserSessionsByUserIDs(ctx context.Context, userIDs []string) (map[string]int, error) {
+	out := make(map[string]int, len(userIDs))
+	for _, userID := range userIDs {
+		normalized := strings.TrimSpace(userID)
+		if normalized == "" {
+			continue
+		}
+		out[normalized] = len(a.userSessions[normalized])
+	}
+	return out, nil
+}
+
+func (a *fakeUIAuth) ListUserSessionsForAdmin(ctx context.Context, userID string) ([]store.UserSessionInfo, error) {
+	userID = strings.TrimSpace(userID)
+	items := a.userSessions[userID]
+	out := make([]store.UserSessionInfo, 0, len(items))
+	for _, item := range items {
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (a *fakeUIAuth) LogoutUserSessionForAdmin(ctx context.Context, userID string, sessionID string) error {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" || sessionID == "" {
+		return errors.New("invalid user/session id")
+	}
+	items := a.userSessions[userID]
+	idx := -1
+	for i, item := range items {
+		if strings.TrimSpace(item.SessionID) == sessionID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("session not found")
+	}
+	if a.userSessions == nil {
+		a.userSessions = map[string][]store.UserSessionInfo{}
+	}
+	a.userSessions[userID] = append(items[:idx], items[idx+1:]...)
+	return nil
+}
+
+func (a *fakeUIAuth) LogoutAllUserSessionsForAdmin(ctx context.Context, userID string) (int, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return 0, errors.New("invalid user id")
+	}
+	removed := len(a.userSessions[userID])
+	if a.userSessions == nil {
+		a.userSessions = map[string][]store.UserSessionInfo{}
+	}
+	a.userSessions[userID] = []store.UserSessionInfo{}
+	return removed, nil
+}
+
 func (a *fakeUIAuth) RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -1922,6 +2217,9 @@ type fakeUIStore struct {
 	adminInvites         map[int64]store.AdminInvite
 	nextAdminUserID      int
 	nextInviteID         int64
+	users                map[string]store.AdminUserProfile
+	userCredentials      map[string][]store.CredentialRecord
+	userLinkedClients    map[string][]store.UserOIDCClient
 }
 
 func newFakeUIStore() *fakeUIStore {
@@ -1945,6 +2243,9 @@ func newFakeUIStore() *fakeUIStore {
 		adminInvites:         map[int64]store.AdminInvite{},
 		nextAdminUserID:      1,
 		nextInviteID:         1,
+		users:                map[string]store.AdminUserProfile{},
+		userCredentials:      map[string][]store.CredentialRecord{},
+		userLinkedClients:    map[string][]store.UserOIDCClient{},
 	}
 }
 
@@ -2455,6 +2756,154 @@ func (s *fakeUIStore) ListAdminInvites(ctx context.Context, adminUserID string) 
 	return out, nil
 }
 
+func (s *fakeUIStore) seedSupportUser(id string, loginID string, profileEmail string, phone string) store.AdminUserProfile {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = fmt.Sprintf("user-%d", len(s.users)+1)
+	}
+	now := time.Now().UTC()
+	item := store.AdminUserProfile{
+		ID:                   id,
+		LoginID:              strings.TrimSpace(loginID),
+		DisplayName:          "User " + id,
+		ProfileEmail:         strings.TrimSpace(profileEmail),
+		Phone:                strings.TrimSpace(phone),
+		ShareProfile:         false,
+		ProfileEmailVerified: strings.TrimSpace(profileEmail) != "",
+		PhoneVerified:        strings.TrimSpace(phone) != "",
+		CreatedAt:            now,
+	}
+	s.users[id] = item
+	return item
+}
+
+func (s *fakeUIStore) ListUsersForAdmin(filter store.AdminUserSupportListFilter) ([]store.AdminUserSupportListItem, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	query := strings.ToLower(strings.TrimSpace(filter.Query))
+
+	items := make([]store.AdminUserSupportListItem, 0, len(s.users))
+	for _, user := range s.users {
+		id := strings.TrimSpace(user.ID)
+		loginID := strings.TrimSpace(user.LoginID)
+		profileEmail := strings.TrimSpace(user.ProfileEmail)
+		phone := strings.TrimSpace(user.Phone)
+
+		if query != "" {
+			if !strings.Contains(strings.ToLower(id), query) &&
+				!strings.Contains(strings.ToLower(loginID), query) &&
+				!strings.Contains(strings.ToLower(profileEmail), query) &&
+				!strings.Contains(strings.ToLower(phone), query) {
+				continue
+			}
+		}
+
+		items = append(items, store.AdminUserSupportListItem{
+			ID:                   id,
+			LoginID:              loginID,
+			ProfileEmail:         profileEmail,
+			Phone:                phone,
+			CreatedAt:            user.CreatedAt,
+			ProfileEmailVerified: user.ProfileEmailVerified,
+			PhoneVerified:        user.PhoneVerified,
+			PasskeyCount:         len(s.userCredentials[id]),
+			LinkedClientCount:    len(s.userLinkedClients[id]),
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].ID > items[j].ID
+		}
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+
+	if offset >= len(items) {
+		return []store.AdminUserSupportListItem{}, nil
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	out := make([]store.AdminUserSupportListItem, 0, end-offset)
+	out = append(out, items[offset:end]...)
+	return out, nil
+}
+
+func (s *fakeUIStore) GetUserProfileForAdmin(userID string) (*store.AdminUserProfile, error) {
+	userID = strings.TrimSpace(userID)
+	item, ok := s.users[userID]
+	if !ok {
+		return nil, store.ErrUserNotFound
+	}
+	copyItem := item
+	return &copyItem, nil
+}
+
+func (s *fakeUIStore) ListCredentialRecords(userID string) ([]store.CredentialRecord, error) {
+	userID = strings.TrimSpace(userID)
+	items := s.userCredentials[userID]
+	out := make([]store.CredentialRecord, 0, len(items))
+	for _, item := range items {
+		copyItem := item
+		copyItem.ID = append([]byte(nil), item.ID...)
+		if item.LastUsedAt != nil {
+			ts := item.LastUsedAt.UTC()
+			copyItem.LastUsedAt = &ts
+		}
+		out = append(out, copyItem)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *fakeUIStore) DeleteCredentialByUserAndID(userID string, credID []byte) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || len(credID) == 0 {
+		return store.ErrCredentialNotFound
+	}
+	items := s.userCredentials[userID]
+	idx := -1
+	for i, item := range items {
+		if bytes.Equal(item.ID, credID) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return store.ErrCredentialNotFound
+	}
+	if len(items) <= 1 {
+		return store.ErrCannotDeleteLastCredential
+	}
+	s.userCredentials[userID] = append(items[:idx], items[idx+1:]...)
+	return nil
+}
+
+func (s *fakeUIStore) ListUserOIDCClients(userID string) ([]store.UserOIDCClient, error) {
+	userID = strings.TrimSpace(userID)
+	items := s.userLinkedClients[userID]
+	out := make([]store.UserOIDCClient, 0, len(items))
+	for _, item := range items {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LastSeenAt.Equal(out[j].LastSeenAt) {
+			return out[i].ClientID < out[j].ClientID
+		}
+		return out[i].LastSeenAt.After(out[j].LastSeenAt)
+	})
+	return out, nil
+}
+
 func extractSecretFromPage(body string) string {
 	startMarker := "<textarea readonly style=\"min-height:80px; font-size:16px;\">"
 	endMarker := "</textarea>"
@@ -2506,6 +2955,15 @@ func extractInputValueByID(body string, id string) string {
 		return ""
 	}
 	return strings.TrimSpace(slice[valuePos : valuePos+valueEnd])
+}
+
+func hasAuditAction(entries []store.AdminAuditEntry, action string, success bool) bool {
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Action) == strings.TrimSpace(action) && entry.Success == success {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAuditDetailsJSONNeverContainsSecretMaterial(t *testing.T) {

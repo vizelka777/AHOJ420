@@ -1,0 +1,151 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">User Detail</h1>
+        <p class="hint mono" style="margin:6px 0 0;">{{if .User}}{{.User.ID}}{{else}}-{{end}}</p>
+      </div>
+      <div class="actions" style="margin-top:0;">
+        <a class="btn secondary" href="/admin/users">Back to users</a>
+      </div>
+    </div>
+  </div>
+
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+
+  {{if .User}}
+  <div class="panel">
+    <h2 style="margin-top:0;">Summary</h2>
+    <div class="grid2">
+      <dl class="kv"><dt>User ID</dt><dd class="mono">{{.User.ID}}</dd></dl>
+      <dl class="kv"><dt>Created</dt><dd class="mono">{{formatTime .User.CreatedAt}}</dd></dl>
+      <dl class="kv"><dt>Login ID</dt><dd class="mono">{{if .User.LoginID}}{{.User.LoginID}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Display Name</dt><dd>{{if .User.DisplayName}}{{.User.DisplayName}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Profile Email</dt><dd>{{if .User.ProfileEmail}}{{.User.ProfileEmail}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Email Verified</dt><dd>{{if .User.ProfileEmailVerified}}<span class="chip ok">yes</span>{{else}}<span class="chip warn">no</span>{{end}}</dd></dl>
+      <dl class="kv"><dt>Phone</dt><dd>{{if .User.Phone}}{{.User.Phone}}{{else}}-{{end}}</dd></dl>
+      <dl class="kv"><dt>Phone Verified</dt><dd>{{if .User.PhoneVerified}}<span class="chip ok">yes</span>{{else}}<span class="chip warn">no</span>{{end}}</dd></dl>
+      <dl class="kv"><dt>Avatar</dt><dd>{{if .User.AvatarKey}}<span class="chip ok">present</span>{{else}}<span class="chip">missing</span>{{end}}</dd></dl>
+      <dl class="kv"><dt>Profile Sharing</dt><dd>{{if .User.ShareProfile}}<span class="chip ok">enabled</span>{{else}}<span class="chip">disabled</span>{{end}}</dd></dl>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2 style="margin:0;">Passkeys</h2>
+    </div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Credential</th>
+            <th>Label</th>
+            <th>Created</th>
+            <th>Last used</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Passkeys}}
+            {{range .Passkeys}}
+              <tr>
+                <td class="mono">{{.CredentialID}}</td>
+                <td>{{.Label}}</td>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td class="mono">{{formatTimePtr .LastUsedAt}}</td>
+                <td>
+                  <form method="post" action="/admin/users/{{$.User.ID}}/passkeys/{{.CredentialID}}/revoke" style="margin:0;" data-require-reauth="1">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <button type="submit" class="warn">Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="5">No passkeys.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2 style="margin:0;">Sessions</h2>
+      <form method="post" action="/admin/users/{{.User.ID}}/sessions/logout-all" style="margin:0;" data-require-reauth="1">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <button type="submit" class="warn">Logout all sessions</button>
+      </form>
+    </div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Session</th>
+            <th>Created</th>
+            <th>Last seen</th>
+            <th>Expires</th>
+            <th>Remote IP</th>
+            <th>User agent</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Sessions}}
+            {{range .Sessions}}
+              <tr>
+                <td class="mono">{{.SessionTag}}</td>
+                <td class="mono">{{formatTime .CreatedAt}}</td>
+                <td class="mono">{{formatTime .LastSeenAt}}</td>
+                <td class="mono">{{formatTime .ExpiresAt}}</td>
+                <td class="mono">{{.RemoteIP}}</td>
+                <td>{{.UserAgent}}</td>
+                <td>
+                  <form method="post" action="/admin/users/{{$.User.ID}}/sessions/{{.SessionID}}/logout" style="margin:0;">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <button type="submit" class="warn">Logout</button>
+                  </form>
+                </td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="7">No active sessions.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Linked OIDC Clients</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Client ID</th>
+            <th>Host</th>
+            <th>First seen</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .LinkedClients}}
+            {{range .LinkedClients}}
+              <tr>
+                <td class="mono">{{.ClientID}}</td>
+                <td class="mono">{{if .ClientHost}}{{.ClientHost}}{{else}}-{{end}}</td>
+                <td class="mono">{{formatTime .FirstSeenAt}}</td>
+                <td class="mono">{{formatTime .LastSeenAt}}</td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="4">No linked clients.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {{end}}
+</div>
+{{end}}

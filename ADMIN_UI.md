@@ -7,6 +7,7 @@ Internal server-rendered admin panel for OIDC client management.
 - session-only auth (`admin_session` cookie)
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - overview dashboard (`GET /admin/`) with role-aware operational summary
+- users support section (`/admin/users`) for end-user lookup and security actions
 - passkey login via `/admin/auth/login/*`
 - admin self-security page (`/admin/security`) for passkeys + sessions
 - step-up re-auth for sensitive actions (recent passkey assertion required)
@@ -23,6 +24,11 @@ Protected (admin session required):
 - `GET /admin/`
 - `GET /admin/audit`
 - `GET /admin/security`
+- `GET /admin/users`
+- `GET /admin/users/:id`
+- `POST /admin/users/:id/sessions/logout-all`
+- `POST /admin/users/:id/sessions/:sessionID/logout`
+- `POST /admin/users/:id/passkeys/:credentialID/revoke`
 - `GET /admin/admins`
 - `GET /admin/admins/new`
 - `POST /admin/admins/new`
@@ -86,6 +92,8 @@ Protected (admin session required):
   - revoke OIDC client secret
   - delete admin passkey
   - logout other admin sessions
+  - revoke end-user passkey (`POST /admin/users/:id/passkeys/:credentialID/revoke`)
+  - logout all end-user sessions (`POST /admin/users/:id/sessions/logout-all`)
 - audit actions:
   - `admin.auth.reauth.success`
   - `admin.auth.reauth.failure`
@@ -154,6 +162,38 @@ Protected (admin session required):
   - `admin.auth.session.logout.success|failure`
   - `admin.auth.session.logout_others.success|failure`
 
+## Users support section (`/admin/users`)
+- access:
+  - available to `owner` and `admin`
+  - requires admin session + host guard
+- list page (`GET /admin/users`):
+  - search by user id / profile email / phone / login id
+  - paginated table with:
+    - id
+    - profile email / phone
+    - created_at
+    - verified flags
+    - passkey count
+    - active session count
+    - linked client count
+- detail page (`GET /admin/users/:id`):
+  - summary (id, created_at, profile contacts + verification, avatar presence)
+  - passkeys list (credential id, label, created_at, last_used_at)
+  - active sessions list (session id, created_at, last_seen_at, expires_at, ip, user-agent)
+  - linked OIDC clients list (client id, first_seen_at, last_seen_at)
+- allowed support actions (mutating, audited):
+  - `POST /admin/users/:id/sessions/:sessionID/logout`
+    - audit: `admin.user.session.logout.success|failure`
+  - `POST /admin/users/:id/sessions/logout-all`
+    - requires recent re-auth
+    - audit: `admin.user.session.logout_all.success|failure`
+  - `POST /admin/users/:id/passkeys/:credentialID/revoke`
+    - requires recent re-auth
+    - audit: `admin.user.passkey.revoke.success|failure`
+- security posture:
+  - all mutating routes are CSRF-protected by existing admin UI CSRF middleware
+  - section is mostly read-only (no profile editing, no user deletion, no impersonation)
+
 ## One-time secret reveal
 When creating a secret with `Generate secret automatically`:
 - plaintext secret is shown only in immediate success response page
@@ -179,6 +219,8 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/index.html`
 - `web/templates/admin/audit.html`
 - `web/templates/admin/security.html`
+- `web/templates/admin/users_list.html`
+- `web/templates/admin/user_detail.html`
 - `web/templates/admin/admins_list.html`
 - `web/templates/admin/admin_new.html`
 - `web/templates/admin/admin_detail.html`

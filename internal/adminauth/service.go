@@ -34,6 +34,9 @@ const (
 	adminAddPasskeyCookieName    = "admin_passkey_add_session_id"
 	adminReauthSessionCookieName = "admin_reauth_session_id"
 	adminInviteSessionCookieName = "admin_invite_session_id"
+	userSessionKeyPrefix         = "sess:"
+	userRecoveryKeyPrefix        = "recovery:"
+	userSessionMetaPrefix        = "sessmeta:"
 )
 
 var (
@@ -92,6 +95,17 @@ type inviteRegistrationSession struct {
 	AdminUserID string               `json:"admin_user_id"`
 	TokenHash   string               `json:"token_hash"`
 	Session     webauthn.SessionData `json:"session"`
+}
+
+type userDeviceSessionMeta struct {
+	SessionID    string `json:"session_id"`
+	UserID       string `json:"user_id"`
+	DeviceID     string `json:"device_id"`
+	CredentialID string `json:"credential_id"`
+	UserAgent    string `json:"user_agent"`
+	IP           string `json:"ip"`
+	CreatedAtUTC int64  `json:"created_at_utc"`
+	LastSeenUTC  int64  `json:"last_seen_utc"`
 }
 
 type sessionRecord struct {
@@ -1068,6 +1082,193 @@ func (s *Service) InvalidateSessionsForAdminUser(ctx context.Context, adminUserI
 	return removed, nil
 }
 
+func (s *Service) ListUserSessionsForAdmin(ctx context.Context, userID string) ([]store.UserSessionInfo, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []store.UserSessionInfo{}, nil
+	}
+
+	target := map[string]struct{}{userID: {}}
+	grouped, err := s.listActiveUserSessions(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	items := grouped[userID]
+	out := make([]store.UserSessionInfo, 0, len(items))
+	out = append(out, items...)
+	return out, nil
+}
+
+func (s *Service) CountActiveUserSessionsByUserIDs(ctx context.Context, userIDs []string) (map[string]int, error) {
+	target := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		normalized := strings.TrimSpace(userID)
+		if normalized == "" {
+			continue
+		}
+		target[normalized] = struct{}{}
+	}
+
+	counts := make(map[string]int, len(target))
+	if len(target) == 0 {
+		return counts, nil
+	}
+
+	grouped, err := s.listActiveUserSessions(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	for userID := range target {
+		counts[userID] = len(grouped[userID])
+	}
+	return counts, nil
+}
+
+func (s *Service) LogoutUserSessionForAdmin(ctx context.Context, userID string, sessionID string) error {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" || sessionID == "" {
+		return errAdminSessionInvalid
+	}
+
+	metaPayload, err := s.stateStore.Get(ctx, userSessionMetaRedisKey(sessionID))
+	if err != nil {
+		return errAdminSessionInvalid
+	}
+	var meta userDeviceSessionMeta
+	if err := json.Unmarshal(metaPayload, &meta); err != nil {
+		return errAdminSessionInvalid
+	}
+	if strings.TrimSpace(meta.UserID) != userID {
+		return errAdminSessionInvalid
+	}
+
+	ownerPayload, err := s.stateStore.Get(ctx, userSessionRedisKey(sessionID))
+	if err != nil {
+		return errAdminSessionInvalid
+	}
+	if strings.TrimSpace(string(ownerPayload)) != userID {
+		return errAdminSessionInvalid
+	}
+
+	if err := s.stateStore.Del(ctx, userSessionRedisKey(sessionID)); err != nil {
+		return err
+	}
+	_ = s.stateStore.Del(ctx, userRecoveryRedisKey(sessionID))
+	_ = s.stateStore.Del(ctx, userSessionMetaRedisKey(sessionID))
+	return nil
+}
+
+func (s *Service) LogoutAllUserSessionsForAdmin(ctx context.Context, userID string) (int, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return 0, errAdminSessionInvalid
+	}
+
+	sessions, err := s.ListUserSessionsForAdmin(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+
+	removed := 0
+	for _, session := range sessions {
+		sessionID := strings.TrimSpace(session.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		if err := s.stateStore.Del(ctx, userSessionRedisKey(sessionID)); err != nil {
+			return removed, err
+		}
+		_ = s.stateStore.Del(ctx, userRecoveryRedisKey(sessionID))
+		_ = s.stateStore.Del(ctx, userSessionMetaRedisKey(sessionID))
+		removed++
+	}
+	return removed, nil
+}
+
+func (s *Service) listActiveUserSessions(ctx context.Context, targetUsers map[string]struct{}) (map[string][]store.UserSessionInfo, error) {
+	result := make(map[string][]store.UserSessionInfo, len(targetUsers))
+	if len(targetUsers) == 0 {
+		return result, nil
+	}
+
+	metaKeys, err := s.stateStore.Keys(ctx, userSessionMetaRedisKey("*"))
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	seenSession := make(map[string]struct{}, len(metaKeys))
+
+	for _, key := range metaKeys {
+		sessionID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), userSessionMetaPrefix))
+		if sessionID == "" {
+			continue
+		}
+		if _, ok := seenSession[sessionID]; ok {
+			continue
+		}
+		seenSession[sessionID] = struct{}{}
+
+		metaPayload, err := s.stateStore.Get(ctx, userSessionMetaRedisKey(sessionID))
+		if err != nil {
+			continue
+		}
+		var meta userDeviceSessionMeta
+		if err := json.Unmarshal(metaPayload, &meta); err != nil {
+			continue
+		}
+
+		userID := strings.TrimSpace(meta.UserID)
+		if userID == "" {
+			continue
+		}
+		if _, ok := targetUsers[userID]; !ok {
+			continue
+		}
+
+		ownerPayload, err := s.stateStore.Get(ctx, userSessionRedisKey(sessionID))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(ownerPayload)) != userID {
+			continue
+		}
+
+		createdAt := time.Time{}
+		if meta.CreatedAtUTC > 0 {
+			createdAt = time.Unix(meta.CreatedAtUTC, 0).UTC()
+		}
+		lastSeenAt := createdAt
+		if meta.LastSeenUTC > 0 {
+			lastSeenAt = time.Unix(meta.LastSeenUTC, 0).UTC()
+		}
+
+		expiresAt := time.Time{}
+		if ttl, ttlErr := s.stateStore.TTL(ctx, userSessionRedisKey(sessionID)); ttlErr == nil && ttl > 0 {
+			expiresAt = now.Add(ttl).UTC()
+		}
+
+		result[userID] = append(result[userID], store.UserSessionInfo{
+			SessionID:  sessionID,
+			CreatedAt:  createdAt,
+			LastSeenAt: lastSeenAt,
+			ExpiresAt:  expiresAt,
+			RemoteIP:   strings.TrimSpace(meta.IP),
+			UserAgent:  strings.TrimSpace(meta.UserAgent),
+		})
+	}
+
+	for userID := range result {
+		sort.Slice(result[userID], func(i, j int) bool {
+			if result[userID][i].LastSeenAt.Equal(result[userID][j].LastSeenAt) {
+				return result[userID][i].CreatedAt.After(result[userID][j].CreatedAt)
+			}
+			return result[userID][i].LastSeenAt.After(result[userID][j].LastSeenAt)
+		})
+	}
+	return result, nil
+}
+
 func (s *Service) listAdminSessions(ctx context.Context, adminUserID string, currentSessionID string) ([]store.AdminSessionInfo, error) {
 	adminUserID = strings.TrimSpace(adminUserID)
 	if adminUserID == "" {
@@ -1432,6 +1633,18 @@ func adminAddPasskeyRedisKey(id string) string {
 
 func adminSessionRedisKey(id string) string {
 	return "admin:sess:" + strings.TrimSpace(id)
+}
+
+func userSessionRedisKey(id string) string {
+	return userSessionKeyPrefix + strings.TrimSpace(id)
+}
+
+func userRecoveryRedisKey(id string) string {
+	return userRecoveryKeyPrefix + strings.TrimSpace(id)
+}
+
+func userSessionMetaRedisKey(id string) string {
+	return userSessionMetaPrefix + strings.TrimSpace(id)
 }
 
 func encodeCredentialID(raw []byte) string {
