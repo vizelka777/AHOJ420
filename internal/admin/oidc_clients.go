@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -28,12 +29,22 @@ type OIDCClientStore interface {
 	RevokeOIDCClientSecret(clientID string, secretID int64) error
 }
 
-type OIDCClientHandler struct {
-	store OIDCClientStore
+type OIDCClientReloader interface {
+	ReloadClients(ctx context.Context) error
 }
 
-func NewOIDCClientHandler(clientStore OIDCClientStore) *OIDCClientHandler {
-	return &OIDCClientHandler{store: clientStore}
+type AdminAuditStore interface {
+	CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error
+}
+
+type OIDCClientHandler struct {
+	store      OIDCClientStore
+	reloader   OIDCClientReloader
+	auditStore AdminAuditStore
+}
+
+func NewOIDCClientHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditStore AdminAuditStore) *OIDCClientHandler {
+	return &OIDCClientHandler{store: clientStore, reloader: reloader, auditStore: auditStore}
 }
 
 func RegisterOIDCClientRoutes(group *echo.Group, handler *OIDCClientHandler) {
@@ -191,25 +202,39 @@ func (h *OIDCClientHandler) GetOIDCClient(c echo.Context) error {
 }
 
 func (h *OIDCClientHandler) CreateOIDCClient(c echo.Context) error {
+	action := "admin.oidc_client.create"
+	clientID := ""
+	var secretID int64
+	details := map[string]any{}
+	success := false
+	var opErr error
+	defer func() {
+		h.logAndAudit(c, action, clientID, secretID, success, opErr, details)
+	}()
+
 	var req createOIDCClientRequest
 	if err := decodeJSON(c, &req); err != nil {
-		logAdminAction("admin.oidc_client.create", "", 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = "invalid_request_body"
 		return writeError(c, http.StatusBadRequest, "invalid request body")
 	}
 
-	clientID := strings.TrimSpace(req.ID)
+	clientID = strings.TrimSpace(req.ID)
 	if clientID == "" {
-		logAdminAction("admin.oidc_client.create", "", 0, c.RealIP(), false, errors.New("missing client id"))
+		opErr = errors.New("missing client id")
+		details["error"] = "missing_client_id"
 		return writeError(c, http.StatusBadRequest, "client id is required")
 	}
 
 	initialSecret := strings.TrimSpace(req.InitialSecret)
 	if req.Confidential && initialSecret == "" {
-		logAdminAction("admin.oidc_client.create", clientID, 0, c.RealIP(), false, errors.New("missing initial secret"))
+		opErr = errors.New("missing initial secret")
+		details["error"] = "missing_initial_secret"
 		return writeError(c, http.StatusBadRequest, "initial_secret is required for confidential clients")
 	}
 	if !req.Confidential && initialSecret != "" {
-		logAdminAction("admin.oidc_client.create", clientID, 0, c.RealIP(), false, errors.New("initial secret provided for public client"))
+		opErr = errors.New("initial secret provided for public client")
+		details["error"] = "initial_secret_for_public_client"
 		return writeError(c, http.StatusBadRequest, "initial_secret is not allowed for public clients")
 	}
 
@@ -225,6 +250,7 @@ func (h *OIDCClientHandler) CreateOIDCClient(c echo.Context) error {
 		Scopes:        append([]string(nil), req.Scopes...),
 		RedirectURIs:  append([]string(nil), req.RedirectURIs...),
 	}
+	details = clientAuditDetails(client)
 
 	secrets := []store.OIDCClientSecretInput{}
 	if req.Confidential {
@@ -232,40 +258,59 @@ func (h *OIDCClientHandler) CreateOIDCClient(c echo.Context) error {
 			PlainSecret: initialSecret,
 			Label:       strings.TrimSpace(req.InitialSecretLabel),
 		})
+		details["initial_secret_label"] = strings.TrimSpace(req.InitialSecretLabel)
 	}
 
-	err := h.store.CreateOIDCClient(client, secrets)
-	if err != nil {
-		logAdminAction("admin.oidc_client.create", clientID, 0, c.RealIP(), false, err)
+	if err := h.store.CreateOIDCClient(client, secrets); err != nil {
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
+	}
+	if err := h.reloadRuntime(c.Request().Context()); err != nil {
+		opErr = err
+		details["error"] = "runtime_reload_failed"
+		return writeError(c, http.StatusInternalServerError, "client created in storage but runtime reload failed")
 	}
 
 	detail, err := h.getClientDetail(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.create", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
 	}
 
-	logAdminAction("admin.oidc_client.create", clientID, 0, c.RealIP(), true, nil)
+	success = true
 	return c.JSON(http.StatusCreated, detail)
 }
 
 func (h *OIDCClientHandler) UpdateOIDCClient(c echo.Context) error {
+	action := "admin.oidc_client.update"
 	clientID := strings.TrimSpace(c.Param("id"))
+	var secretID int64
+	details := map[string]any{}
+	success := false
+	var opErr error
+	defer func() {
+		h.logAndAudit(c, action, clientID, secretID, success, opErr, details)
+	}()
+
 	if clientID == "" {
-		logAdminAction("admin.oidc_client.update", "", 0, c.RealIP(), false, errors.New("missing client id"))
+		opErr = errors.New("missing client id")
+		details["error"] = "missing_client_id"
 		return writeError(c, http.StatusBadRequest, "client id is required")
 	}
 
 	var req updateOIDCClientRequest
 	if err := decodeJSON(c, &req); err != nil {
-		logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = "invalid_request_body"
 		return writeError(c, http.StatusBadRequest, "invalid request body")
 	}
 
 	current, err := h.store.GetOIDCClient(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
 	}
 
@@ -278,7 +323,8 @@ func (h *OIDCClientHandler) UpdateOIDCClient(c echo.Context) error {
 	}
 	if req.Confidential != nil && *req.Confidential != current.Confidential {
 		err := errors.New("confidential flag change is not supported in mvp")
-		logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = "confidential_flag_change_not_supported"
 		return writeError(c, http.StatusConflict, "confidential flag change is not supported in mvp")
 	}
 	if req.RequirePKCE != nil {
@@ -296,139 +342,221 @@ func (h *OIDCClientHandler) UpdateOIDCClient(c echo.Context) error {
 	if req.Scopes != nil {
 		updated.Scopes = append([]string(nil), (*req.Scopes)...)
 	}
+	details = clientAuditDetails(updated)
 
 	if err := h.store.UpdateOIDCClient(updated); err != nil {
-		logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
+	}
+	if err := h.reloadRuntime(c.Request().Context()); err != nil {
+		opErr = err
+		details["error"] = "runtime_reload_failed"
+		return writeError(c, http.StatusInternalServerError, "client updated in storage but runtime reload failed")
 	}
 
 	detail, err := h.getClientDetail(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
 	}
 
-	logAdminAction("admin.oidc_client.update", clientID, 0, c.RealIP(), true, nil)
+	success = true
 	return c.JSON(http.StatusOK, detail)
 }
 
 func (h *OIDCClientHandler) ReplaceOIDCClientRedirectURIs(c echo.Context) error {
+	action := "admin.oidc_client.redirect_uris.replace"
 	clientID := strings.TrimSpace(c.Param("id"))
+	var secretID int64
+	details := map[string]any{}
+	success := false
+	var opErr error
+	defer func() {
+		h.logAndAudit(c, action, clientID, secretID, success, opErr, details)
+	}()
+
 	if clientID == "" {
-		logAdminAction("admin.oidc_client.redirect_uris.replace", "", 0, c.RealIP(), false, errors.New("missing client id"))
+		opErr = errors.New("missing client id")
+		details["error"] = "missing_client_id"
 		return writeError(c, http.StatusBadRequest, "client id is required")
 	}
 
 	var req replaceRedirectURIsRequest
 	if err := decodeJSON(c, &req); err != nil {
-		logAdminAction("admin.oidc_client.redirect_uris.replace", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = "invalid_request_body"
 		return writeError(c, http.StatusBadRequest, "invalid request body")
 	}
 	normalizedURIs := normalizeStringList(req.RedirectURIs)
+	details["redirect_uri_count"] = len(normalizedURIs)
 	if len(normalizedURIs) == 0 {
-		logAdminAction("admin.oidc_client.redirect_uris.replace", clientID, 0, c.RealIP(), false, errors.New("empty redirect uris"))
+		opErr = errors.New("empty redirect uris")
+		details["error"] = "empty_redirect_uris"
 		return writeError(c, http.StatusBadRequest, "redirect_uris must not be empty")
 	}
 
 	if err := h.store.ReplaceOIDCClientRedirectURIs(clientID, normalizedURIs); err != nil {
-		logAdminAction("admin.oidc_client.redirect_uris.replace", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
+	}
+	if err := h.reloadRuntime(c.Request().Context()); err != nil {
+		opErr = err
+		details["error"] = "runtime_reload_failed"
+		return writeError(c, http.StatusInternalServerError, "client redirect uris replaced in storage but runtime reload failed")
 	}
 
 	detail, err := h.getClientDetail(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.redirect_uris.replace", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
 	}
+	details["enabled"] = detail.Client.Enabled
+	details["confidential"] = detail.Client.Confidential
+	details["auth_method"] = detail.Client.AuthMethod
+	details["grant_types"] = append([]string(nil), detail.Client.GrantTypes...)
+	details["response_types"] = append([]string(nil), detail.Client.ResponseTypes...)
+	details["scope_count"] = len(detail.Client.Scopes)
 
-	logAdminAction("admin.oidc_client.redirect_uris.replace", clientID, 0, c.RealIP(), true, nil)
+	success = true
 	return c.JSON(http.StatusOK, detail)
 }
 
 func (h *OIDCClientHandler) AddOIDCClientSecret(c echo.Context) error {
+	action := "admin.oidc_client.secret.add"
 	clientID := strings.TrimSpace(c.Param("id"))
+	var secretID int64
+	details := map[string]any{}
+	success := false
+	var opErr error
+	defer func() {
+		h.logAndAudit(c, action, clientID, secretID, success, opErr, details)
+	}()
+
 	if clientID == "" {
-		logAdminAction("admin.oidc_client.secret.add", "", 0, c.RealIP(), false, errors.New("missing client id"))
+		opErr = errors.New("missing client id")
+		details["error"] = "missing_client_id"
 		return writeError(c, http.StatusBadRequest, "client id is required")
 	}
 
 	var req addOIDCClientSecretRequest
 	if err := decodeJSON(c, &req); err != nil {
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = "invalid_request_body"
 		return writeError(c, http.StatusBadRequest, "invalid request body")
 	}
+	details["generated"] = req.Generate
+	details["label"] = strings.TrimSpace(req.Label)
 
 	plainSecret := strings.TrimSpace(req.Secret)
 	if req.Generate && plainSecret != "" {
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, errors.New("generate and secret together"))
+		opErr = errors.New("generate and secret together")
+		details["error"] = "generate_and_secret_together"
 		return writeError(c, http.StatusBadRequest, "provide either generate=true or secret, not both")
 	}
 	if req.Generate {
 		generated, err := generateSecret()
 		if err != nil {
-			logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, err)
+			opErr = err
+			details["error"] = "secret_generation_failed"
 			return writeError(c, http.StatusInternalServerError, "failed to generate secret")
 		}
 		plainSecret = generated
 	}
 	if plainSecret == "" {
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, errors.New("missing secret"))
+		opErr = errors.New("missing secret")
+		details["error"] = "missing_secret"
 		return writeError(c, http.StatusBadRequest, "secret is required")
 	}
 
 	if err := h.store.AddOIDCClientSecret(clientID, plainSecret, strings.TrimSpace(req.Label)); err != nil {
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
 	}
 
 	secrets, err := h.store.ListOIDCClientSecrets(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeError(c, http.StatusInternalServerError, "failed to list oidc client secrets")
 	}
 
 	latest := latestActiveSecret(secrets)
 	if latest == nil {
-		err := errors.New("added secret was not found")
-		logAdminAction("admin.oidc_client.secret.add", clientID, 0, c.RealIP(), false, err)
+		opErr = errors.New("added secret was not found")
+		details["error"] = "added_secret_not_found"
 		return writeError(c, http.StatusInternalServerError, "failed to load created secret")
 	}
+	secretID = latest.ID
 
 	resp := addOIDCClientSecretResponse{Secret: newOIDCClientSecretDTO(*latest)}
 	if req.Generate {
 		resp.PlainSecret = plainSecret
 	}
+	if err := h.reloadRuntime(c.Request().Context()); err != nil {
+		opErr = err
+		details["error"] = "runtime_reload_failed"
+		return writeError(c, http.StatusInternalServerError, "client secret added in storage but runtime reload failed")
+	}
+	details["secret_id"] = latest.ID
+	details["label"] = latest.Label
+	details["generated"] = req.Generate
 
-	logAdminAction("admin.oidc_client.secret.add", clientID, latest.ID, c.RealIP(), true, nil)
+	success = true
 	return c.JSON(http.StatusCreated, resp)
 }
 
 func (h *OIDCClientHandler) RevokeOIDCClientSecret(c echo.Context) error {
+	action := "admin.oidc_client.secret.revoke"
 	clientID := strings.TrimSpace(c.Param("id"))
+	var secretID int64
+	details := map[string]any{}
+	success := false
+	var opErr error
+	defer func() {
+		h.logAndAudit(c, action, clientID, secretID, success, opErr, details)
+	}()
+
 	if clientID == "" {
-		logAdminAction("admin.oidc_client.secret.revoke", "", 0, c.RealIP(), false, errors.New("missing client id"))
+		opErr = errors.New("missing client id")
+		details["error"] = "missing_client_id"
 		return writeError(c, http.StatusBadRequest, "client id is required")
 	}
 
 	secretIDRaw := strings.TrimSpace(c.Param("secretID"))
-	secretID, err := strconv.ParseInt(secretIDRaw, 10, 64)
+	parsedSecretID, err := strconv.ParseInt(secretIDRaw, 10, 64)
+	secretID = parsedSecretID
+	details["secret_id"] = secretID
 	if err != nil || secretID <= 0 {
-		logAdminAction("admin.oidc_client.secret.revoke", clientID, 0, c.RealIP(), false, errors.New("invalid secret id"))
+		opErr = errors.New("invalid secret id")
+		details["error"] = "invalid_secret_id"
 		return writeError(c, http.StatusBadRequest, "invalid secret id")
 	}
 
 	if err := h.store.RevokeOIDCClientSecret(clientID, secretID); err != nil {
-		logAdminAction("admin.oidc_client.secret.revoke", clientID, secretID, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeMappedStoreError(c, err)
+	}
+	if err := h.reloadRuntime(c.Request().Context()); err != nil {
+		opErr = err
+		details["error"] = "runtime_reload_failed"
+		return writeError(c, http.StatusInternalServerError, "client secret revoked in storage but runtime reload failed")
 	}
 
 	secrets, err := h.store.ListOIDCClientSecrets(clientID)
 	if err != nil {
-		logAdminAction("admin.oidc_client.secret.revoke", clientID, secretID, c.RealIP(), false, err)
+		opErr = err
+		details["error"] = auditErrorCode(err)
 		return writeError(c, http.StatusInternalServerError, "failed to list oidc client secrets")
 	}
+	details["revoked"] = true
 
-	logAdminAction("admin.oidc_client.secret.revoke", clientID, secretID, c.RealIP(), true, nil)
+	success = true
 	return c.JSON(http.StatusOK, revokeOIDCClientSecretResponse{
 		Secrets: newOIDCClientSecretDTOs(secrets),
 	})
@@ -590,10 +718,98 @@ func writeError(c echo.Context, status int, message string) error {
 	return c.JSON(status, map[string]string{"message": message})
 }
 
-func logAdminAction(action string, clientID string, secretID int64, realIP string, success bool, err error) {
+func (h *OIDCClientHandler) reloadRuntime(ctx context.Context) error {
+	if h.reloader == nil {
+		return nil
+	}
+	return h.reloader.ReloadClients(ctx)
+}
+
+func (h *OIDCClientHandler) logAndAudit(c echo.Context, action string, clientID string, secretID int64, success bool, opErr error, details map[string]any) {
+	requestID := requestIDFromContext(c)
+	realIP := strings.TrimSpace(c.RealIP())
+
 	if success {
-		log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s success=true", action, clientID, secretID, realIP)
+		log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s request_id=%s success=true", action, clientID, secretID, realIP, requestID)
+	} else {
+		log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s request_id=%s success=false error=%v", action, clientID, secretID, realIP, requestID, opErr)
+	}
+
+	if h.auditStore == nil {
 		return
 	}
-	log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s success=false error=%v", action, clientID, secretID, realIP, err)
+
+	entry := store.AdminAuditEntry{
+		Action:       strings.TrimSpace(action),
+		Success:      success,
+		ActorType:    "token",
+		ActorID:      "admin_api_token",
+		RemoteIP:     realIP,
+		RequestID:    requestID,
+		ResourceType: "oidc_client",
+		ResourceID:   strings.TrimSpace(clientID),
+		DetailsJSON:  buildAuditDetailsJSON(details, secretID, opErr),
+	}
+	if err := h.auditStore.CreateAdminAuditEntry(c.Request().Context(), entry); err != nil {
+		log.Printf("admin audit insert failed action=%s client_id=%s secret_id=%d request_id=%s error=%v", action, clientID, secretID, requestID, err)
+	}
+}
+
+func buildAuditDetailsJSON(details map[string]any, secretID int64, opErr error) json.RawMessage {
+	payload := map[string]any{}
+	for key, value := range details {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		// Keep only safe metadata keys for admin audit.
+		if strings.Contains(trimmedKey, "plain_secret") || strings.Contains(trimmedKey, "secret_hash") {
+			continue
+		}
+		payload[trimmedKey] = value
+	}
+	if secretID > 0 {
+		payload["secret_id"] = secretID
+	}
+	if opErr != nil && payload["error"] == nil {
+		payload["error"] = auditErrorCode(opErr)
+	}
+	if len(payload) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return encoded
+}
+
+func clientAuditDetails(client store.OIDCClient) map[string]any {
+	return map[string]any{
+		"enabled":            client.Enabled,
+		"confidential":       client.Confidential,
+		"auth_method":        strings.TrimSpace(client.AuthMethod),
+		"grant_types":        append([]string(nil), client.GrantTypes...),
+		"response_types":     append([]string(nil), client.ResponseTypes...),
+		"redirect_uri_count": len(client.RedirectURIs),
+		"scope_count":        len(client.Scopes),
+	}
+}
+
+func auditErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, store.ErrOIDCClientNotFound):
+		return "oidc_client_not_found"
+	case errors.Is(err, store.ErrOIDCClientSecretNotFound):
+		return "oidc_client_secret_not_found"
+	case isConflictError(err):
+		return "conflict"
+	case isBadRequestError(err):
+		return "bad_request"
+	default:
+		return "internal_error"
+	}
 }

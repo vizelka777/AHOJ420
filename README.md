@@ -76,7 +76,8 @@ Optional for key rotation:
 
 Admin API:
 - `ADMIN_API_TOKEN=<long-random-shared-secret>`
-- if unset, `/admin/api/*` returns `503` ("admin api disabled")
+- `ADMIN_API_HOST=admin.ahoj420.eu`
+- if either is unset, `/admin/api/*` returns `503` ("admin api disabled")
 
 Avatar storage:
 - `AVATAR_PUBLIC_BASE=https://avatar.ahoj420.eu/` (required in `prod` to emit `picture` claim)
@@ -233,6 +234,7 @@ Base path:
 - `/admin/api/oidc/clients`
 
 Auth:
+- host guard: requests must come to `ADMIN_API_HOST` (wrong host returns `404`)
 - `Authorization: Bearer <ADMIN_API_TOKEN>`
 
 Routes:
@@ -245,8 +247,14 @@ Routes:
 - `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
 
 Security behavior:
+- admin API is enabled only when both `ADMIN_API_TOKEN` and `ADMIN_API_HOST` are set
+- wrong host is rejected in-app (does not rely only on reverse proxy routing)
 - secret hashes and plaintext secrets are never returned from list/detail endpoints
 - `plain_secret` is returned only one-time in `POST .../secrets` when `generate=true`
 - create endpoint expects explicit `initial_secret` for confidential clients and does not echo it back
+- successful mutating admin operations trigger OIDC runtime client reload immediately (no process restart required)
+- if DB mutation succeeds but runtime reload fails, endpoint returns `500` and operator action is required
+- `/admin/api/*` has dedicated IP-based rate limiting (`429` on exceed)
+- admin requests include `X-Request-ID` response header
 
-Minimal audit logging is emitted on mutating endpoints with action/client/secret/ip/success fields.
+Mutating admin actions are persisted in PostgreSQL `admin_audit_log` and also written to app logs.

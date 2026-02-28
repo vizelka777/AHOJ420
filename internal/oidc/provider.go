@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -321,6 +322,7 @@ type clientConfig struct {
 }
 
 type MemStorage struct {
+	clientsMu   sync.RWMutex
 	clients     map[string]*StaticClient
 	redis       *redis.Client
 	userStore   *UserStore
@@ -384,6 +386,14 @@ func loadRuntimeClients(clientStore OIDCClientStore, prodMode bool) (map[string]
 		}
 	} else if hasOIDCClientBootstrapEnv() {
 		log.Printf("OIDC bootstrap env detected but skipped: database already has %d clients", len(allClients))
+	}
+
+	return buildRuntimeClientsFromStore(clientStore)
+}
+
+func buildRuntimeClientsFromStore(clientStore OIDCClientStore) (map[string]*StaticClient, error) {
+	if clientStore == nil {
+		return nil, errors.New("oidc client store is nil")
 	}
 
 	enabledClients, err := clientStore.ListEnabledOIDCClients()
@@ -800,6 +810,53 @@ func sortedClientIDs(clients map[string]*StaticClient) []string {
 	return ids
 }
 
+func (s *MemStorage) runtimeClient(clientID string) (*StaticClient, bool) {
+	s.clientsMu.RLock()
+	client, ok := s.clients[clientID]
+	s.clientsMu.RUnlock()
+	return client, ok
+}
+
+func (s *MemStorage) setRuntimeClients(clients map[string]*StaticClient) {
+	s.clientsMu.Lock()
+	s.clients = clients
+	s.clientsMu.Unlock()
+}
+
+func (s *MemStorage) ReloadClients(ctx context.Context) error {
+	if s == nil {
+		return errors.New("mem storage is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	clients, err := buildRuntimeClientsFromStore(s.clientStore)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	s.setRuntimeClients(clients)
+
+	ids := sortedClientIDs(clients)
+	if len(ids) == 0 {
+		log.Printf("OIDC clients reloaded: no enabled clients")
+	} else {
+		log.Printf("OIDC clients reloaded: %s", strings.Join(ids, ", "))
+	}
+	return nil
+}
+
 func (s *MemStorage) Health(ctx context.Context) error {
 	return s.redis.Ping(ctx).Err()
 }
@@ -808,7 +865,7 @@ func (s *MemStorage) CreateAuthRequest(ctx context.Context, authRequest *oidc.Au
 	if clientID == "" && authRequest != nil {
 		clientID = authRequest.ClientID
 	}
-	client, ok := s.clients[clientID]
+	client, ok := s.runtimeClient(clientID)
 	if !ok {
 		return nil, fmt.Errorf("client not found")
 	}
@@ -1283,14 +1340,14 @@ func (s *MemStorage) GetRefreshTokenInfo(ctx context.Context, clientID, token st
 }
 
 func (s *MemStorage) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
-	if client, ok := s.clients[clientID]; ok {
+	if client, ok := s.runtimeClient(clientID); ok {
 		return client, nil
 	}
 	return nil, fmt.Errorf("client not found")
 }
 
 func (s *MemStorage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string) error {
-	client, ok := s.clients[clientID]
+	client, ok := s.runtimeClient(clientID)
 	if !ok {
 		return fmt.Errorf("client not found")
 	}

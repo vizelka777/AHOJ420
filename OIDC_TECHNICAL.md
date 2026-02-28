@@ -55,6 +55,11 @@ Runtime clients are loaded from DB tables:
 - `oidc_client_redirect_uris` (1:N redirect URIs)
 - `oidc_client_secrets` (hashed secrets with revocation metadata)
 
+Runtime behavior:
+- OIDC provider keeps an in-process runtime snapshot for fast client lookup.
+- Admin mutating endpoints trigger explicit runtime reload from DB.
+- Reload is atomic (new snapshot replaces old one only after full successful build).
+
 `OIDC_CLIENTS_JSON` / `OIDC_CLIENTS_FILE` are bootstrap-only import sources for empty DB.
 
 Bootstrap JSON shape:
@@ -195,8 +200,10 @@ This API is intended only for owner/internal admin usage.
 
 Authentication:
 - shared bearer token from env: `ADMIN_API_TOKEN`
+- admin host guard from env: `ADMIN_API_HOST`
 - requests must include `Authorization: Bearer <token>`
-- if `ADMIN_API_TOKEN` is not set, admin API middleware returns `503` for all admin routes
+- requests must target the configured admin host (`ADMIN_API_HOST`); wrong host gets `404`
+- if either `ADMIN_API_TOKEN` or `ADMIN_API_HOST` is not set, admin API middleware returns `503` for all admin routes
 
 Routes:
 - `GET /admin/api/oidc/clients`
@@ -212,12 +219,19 @@ Behavior notes:
 - plaintext/hash of existing secrets are never returned
 - add-secret endpoint supports generated secret mode (`generate=true`) and returns one-time `plain_secret` only in that creation response
 - for MVP, changing `confidential` flag via update endpoint is blocked (`409`) to avoid unsafe transitions
+- successful mutating operations reload OIDC runtime clients immediately from DB (no restart required)
+- reload is all-or-nothing: if reload fails, previous runtime snapshot remains active
+- when DB mutation succeeds but reload fails, endpoint returns `500` with explicit runtime reload failure message
+- admin API applies dedicated IP-based rate limiting on `/admin/api/*` (`429` on exceed)
+- admin requests get `X-Request-ID`; this id is included in audit records
 
 Audit logging:
-- mutating routes write log events:
+- mutating routes write log events and persist audit records in PostgreSQL table `admin_audit_log`
+- actions:
   - `admin.oidc_client.create`
   - `admin.oidc_client.update`
   - `admin.oidc_client.redirect_uris.replace`
   - `admin.oidc_client.secret.add`
   - `admin.oidc_client.secret.revoke`
-- each log includes action, client id, optional secret id, source IP (`RealIP`), and success/failure.
+- each audit entry stores: `action`, `success`, `remote_ip`, `request_id`, `resource_type`, `resource_id`, `details_json`
+- `details_json` is safe metadata only (no plaintext secret, no `secret_hash`, no auth header).

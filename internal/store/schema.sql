@@ -85,6 +85,29 @@ CREATE INDEX IF NOT EXISTS oidc_client_secrets_active_idx
     ON oidc_client_secrets (client_id)
     WHERE revoked_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    action TEXT NOT NULL,
+    success BOOLEAN NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT 'token',
+    actor_id TEXT NOT NULL DEFAULT 'admin_api_token',
+    remote_ip TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    resource_type TEXT NOT NULL DEFAULT '',
+    resource_id TEXT NOT NULL DEFAULT '',
+    details_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx
+    ON admin_audit_log (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx
+    ON admin_audit_log (action, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS admin_audit_log_resource_idx
+    ON admin_audit_log (resource_type, resource_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS user_oidc_clients (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_id TEXT NOT NULL,

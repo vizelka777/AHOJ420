@@ -465,6 +465,286 @@ func TestRuntimeClientFromDBKeepsRedirectScopesAndGrantTypes(t *testing.T) {
 	}
 }
 
+func TestReloadClientsAppliesUpdatedClientDataWithoutRestart(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	registry := newFakeOIDCClientStore()
+	registry.clients["reload-client"] = store.OIDCClient{
+		ID:            "reload-client",
+		Name:          "Reload Client",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://old.example/callback"},
+	}
+
+	storage, err := NewMemStorage(rdb, &UserStore{}, registry, false, "")
+	if err != nil {
+		t.Fatalf("NewMemStorage failed: %v", err)
+	}
+
+	beforeClient, err := storage.GetClientByClientID(context.Background(), "reload-client")
+	if err != nil {
+		t.Fatalf("GetClientByClientID before change failed: %v", err)
+	}
+	beforeStatic := mustStaticClient(t, beforeClient)
+	if got := beforeStatic.RedirectURIs(); len(got) != 1 || got[0] != "https://old.example/callback" {
+		t.Fatalf("unexpected redirect before reload: %+v", got)
+	}
+
+	updated := cloneOIDCClient(registry.clients["reload-client"])
+	updated.RedirectURIs = []string{"https://new.example/callback"}
+	registry.clients["reload-client"] = updated
+
+	stillOldClient, err := storage.GetClientByClientID(context.Background(), "reload-client")
+	if err != nil {
+		t.Fatalf("GetClientByClientID before reload failed: %v", err)
+	}
+	stillOld := mustStaticClient(t, stillOldClient)
+	if got := stillOld.RedirectURIs(); len(got) != 1 || got[0] != "https://old.example/callback" {
+		t.Fatalf("runtime snapshot changed before reload: %+v", got)
+	}
+
+	if err := storage.ReloadClients(context.Background()); err != nil {
+		t.Fatalf("ReloadClients failed: %v", err)
+	}
+
+	afterClient, err := storage.GetClientByClientID(context.Background(), "reload-client")
+	if err != nil {
+		t.Fatalf("GetClientByClientID after reload failed: %v", err)
+	}
+	afterStatic := mustStaticClient(t, afterClient)
+	if got := afterStatic.RedirectURIs(); len(got) != 1 || got[0] != "https://new.example/callback" {
+		t.Fatalf("redirect was not updated after reload: %+v", got)
+	}
+}
+
+func TestReloadClientsBlocksDisabledClientWithoutRestart(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	registry := newFakeOIDCClientStore()
+	registry.clients["toggle-client"] = store.OIDCClient{
+		ID:            "toggle-client",
+		Name:          "Toggle Client",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://enabled.example/callback"},
+	}
+
+	storage, err := NewMemStorage(rdb, &UserStore{}, registry, false, "")
+	if err != nil {
+		t.Fatalf("NewMemStorage failed: %v", err)
+	}
+	if _, err := storage.GetClientByClientID(context.Background(), "toggle-client"); err != nil {
+		t.Fatalf("client should be visible before disable: %v", err)
+	}
+
+	disabled := cloneOIDCClient(registry.clients["toggle-client"])
+	disabled.Enabled = false
+	registry.clients["toggle-client"] = disabled
+
+	if _, err := storage.GetClientByClientID(context.Background(), "toggle-client"); err != nil {
+		t.Fatalf("runtime snapshot should still be old before reload: %v", err)
+	}
+
+	if err := storage.ReloadClients(context.Background()); err != nil {
+		t.Fatalf("ReloadClients failed: %v", err)
+	}
+	if _, err := storage.GetClientByClientID(context.Background(), "toggle-client"); err == nil {
+		t.Fatal("disabled client must be unavailable right after reload")
+	}
+}
+
+func TestReloadClientsAppliesSecretRevokeWithoutRestart(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	registry := newFakeOIDCClientStore()
+	registry.clients["secret-client"] = store.OIDCClient{
+		ID:            "secret-client",
+		Name:          "Secret Client",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://secret.example/callback"},
+	}
+	registry.secrets["secret-client"] = []store.OIDCClientSecret{
+		{
+			ID:         1,
+			ClientID:   "secret-client",
+			SecretHash: mustHashSecret(t, "active-secret"),
+			Label:      "primary",
+		},
+		{
+			ID:         2,
+			ClientID:   "secret-client",
+			SecretHash: mustHashSecret(t, "other-secret"),
+			Label:      "secondary",
+		},
+	}
+
+	storage, err := NewMemStorage(rdb, &UserStore{}, registry, false, "")
+	if err != nil {
+		t.Fatalf("NewMemStorage failed: %v", err)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "secret-client", "active-secret"); err != nil {
+		t.Fatalf("active secret must pass before revoke: %v", err)
+	}
+
+	revokedAt := time.Now().UTC()
+	secretRows := append([]store.OIDCClientSecret(nil), registry.secrets["secret-client"]...)
+	secretRows[0].RevokedAt = &revokedAt
+	registry.secrets["secret-client"] = secretRows
+
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "secret-client", "active-secret"); err != nil {
+		t.Fatalf("runtime snapshot should still accept old secret before reload: %v", err)
+	}
+
+	if err := storage.ReloadClients(context.Background()); err != nil {
+		t.Fatalf("ReloadClients failed: %v", err)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "secret-client", "active-secret"); err == nil {
+		t.Fatal("revoked secret must fail right after reload")
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "secret-client", "other-secret"); err != nil {
+		t.Fatalf("non-revoked secret must continue to pass after reload: %v", err)
+	}
+}
+
+func TestReloadClientsAppliesAddedSecretWithoutRestart(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	registry := newFakeOIDCClientStore()
+	registry.clients["add-secret-client"] = store.OIDCClient{
+		ID:            "add-secret-client",
+		Name:          "Add Secret Client",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://secret.example/callback"},
+	}
+	registry.secrets["add-secret-client"] = []store.OIDCClientSecret{
+		{
+			ID:         1,
+			ClientID:   "add-secret-client",
+			SecretHash: mustHashSecret(t, "secret-one"),
+			Label:      "one",
+		},
+	}
+
+	storage, err := NewMemStorage(rdb, &UserStore{}, registry, false, "")
+	if err != nil {
+		t.Fatalf("NewMemStorage failed: %v", err)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "add-secret-client", "secret-two"); err == nil {
+		t.Fatal("new secret must fail before it exists in runtime snapshot")
+	}
+
+	registry.secrets["add-secret-client"] = append(registry.secrets["add-secret-client"], store.OIDCClientSecret{
+		ID:         2,
+		ClientID:   "add-secret-client",
+		SecretHash: mustHashSecret(t, "secret-two"),
+		Label:      "two",
+	})
+
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "add-secret-client", "secret-two"); err == nil {
+		t.Fatal("runtime snapshot must still reject new secret before reload")
+	}
+	if err := storage.ReloadClients(context.Background()); err != nil {
+		t.Fatalf("ReloadClients failed: %v", err)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "add-secret-client", "secret-two"); err != nil {
+		t.Fatalf("new secret must pass after reload: %v", err)
+	}
+}
+
+func TestReloadClientsFailureKeepsPreviousSnapshot(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	registry := newFakeOIDCClientStore()
+	registry.clients["stable-client"] = store.OIDCClient{
+		ID:            "stable-client",
+		Name:          "Stable Client",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://stable.example/callback"},
+	}
+	registry.secrets["stable-client"] = []store.OIDCClientSecret{
+		{
+			ID:         1,
+			ClientID:   "stable-client",
+			SecretHash: mustHashSecret(t, "stable-secret"),
+			Label:      "stable",
+		},
+	}
+
+	storage, err := NewMemStorage(rdb, &UserStore{}, registry, false, "")
+	if err != nil {
+		t.Fatalf("NewMemStorage failed: %v", err)
+	}
+	beforeClient, err := storage.GetClientByClientID(context.Background(), "stable-client")
+	if err != nil {
+		t.Fatalf("GetClientByClientID before failed reload failed: %v", err)
+	}
+	beforeStatic := mustStaticClient(t, beforeClient)
+	if got := beforeStatic.RedirectURIs(); len(got) != 1 || got[0] != "https://stable.example/callback" {
+		t.Fatalf("unexpected redirect before failed reload: %+v", got)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "stable-client", "stable-secret"); err != nil {
+		t.Fatalf("stable secret must pass before failed reload: %v", err)
+	}
+
+	broken := cloneOIDCClient(registry.clients["stable-client"])
+	broken.RedirectURIs = []string{}
+	registry.clients["stable-client"] = broken
+
+	if err := storage.ReloadClients(context.Background()); err == nil {
+		t.Fatal("expected reload failure for invalid client redirect_uris")
+	}
+
+	afterClient, err := storage.GetClientByClientID(context.Background(), "stable-client")
+	if err != nil {
+		t.Fatalf("old runtime snapshot must stay available after reload failure: %v", err)
+	}
+	afterStatic := mustStaticClient(t, afterClient)
+	if got := afterStatic.RedirectURIs(); len(got) != 1 || got[0] != "https://stable.example/callback" {
+		t.Fatalf("runtime snapshot must stay unchanged after failed reload: %+v", got)
+	}
+	if err := storage.AuthorizeClientIDSecret(context.Background(), "stable-client", "stable-secret"); err != nil {
+		t.Fatalf("old secret must still pass after failed reload: %v", err)
+	}
+}
+
+func mustStaticClient(t *testing.T, client any) *StaticClient {
+	t.Helper()
+	staticClient, ok := client.(*StaticClient)
+	if !ok {
+		t.Fatalf("unexpected client type: %T", client)
+	}
+	return staticClient
+}
+
 type fakeOIDCClientStore struct {
 	clients        map[string]store.OIDCClient
 	secrets        map[string][]store.OIDCClientSecret

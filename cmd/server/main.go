@@ -57,6 +57,7 @@ func main() {
 		log.Fatalf("Failed to init auth: %v", err)
 	}
 	adminToken := strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN"))
+	adminHost := strings.TrimSpace(os.Getenv("ADMIN_API_HOST"))
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -133,9 +134,17 @@ func main() {
 	e.POST("/auth/qr/approve", authService.ApproveQRLogin, sensitiveLimiter)
 	e.GET("/auth/qr/status", authService.QRLoginStatus, sensitiveLimiter)
 
-	adminHandler := admin.NewOIDCClientHandler(userStore)
+	var oidcReloader admin.OIDCClientReloader
+	if reloader, ok := oidcProvider.Storage.(admin.OIDCClientReloader); ok {
+		oidcReloader = reloader
+	} else {
+		log.Printf("OIDC storage does not implement admin runtime reload interface")
+	}
+	adminHandler := admin.NewOIDCClientHandler(userStore, oidcReloader, userStore)
 	adminGroup := e.Group("/admin/api")
-	adminGroup.Use(admin.AdminAPIMiddleware(adminToken))
+	adminGroup.Use(admin.AdminRequestIDMiddleware())
+	adminGroup.Use(admin.AdminAPIMiddleware(adminToken, adminHost))
+	adminGroup.Use(admin.AdminRateLimitMiddleware(admin.DefaultAdminRateLimitConfig))
 	admin.RegisterOIDCClientRoutes(adminGroup, adminHandler)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,11 @@ import (
 	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
 
 const testAdminToken = "admin-token-123"
+const testAdminHost = "admin.example.test"
 
 func TestAdminUnauthorized(t *testing.T) {
 	api := setupTestAdminAPI(newFakeOIDCClientStore(), testAdminToken)
@@ -34,10 +37,58 @@ func TestAdminUnauthorized(t *testing.T) {
 }
 
 func TestAdminDisabledWithoutToken(t *testing.T) {
-	api := setupTestAdminAPI(newFakeOIDCClientStore(), "")
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		"",
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
 	rec := doJSONRequest(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when admin api token is missing, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminDisabledWithoutHost(t *testing.T) {
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		"",
+		&fakeOIDCClientReloader{},
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+	rec := doJSONRequest(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when admin api host is missing, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminHostGuard(t *testing.T) {
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	recOK := doJSONRequestWithHost(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil, testAdminHost)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 for correct admin host, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+
+	recWithPort := doJSONRequestWithHost(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil, testAdminHost+":443")
+	if recWithPort.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin host with port, got %d body=%s", recWithPort.Code, recWithPort.Body.String())
+	}
+
+	recWrong := doJSONRequestWithHost(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil, "ahoj420.eu")
+	if recWrong.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for wrong host, got %d body=%s", recWrong.Code, recWrong.Body.String())
 	}
 }
 
@@ -398,15 +449,448 @@ func TestReplaceRedirectURIs(t *testing.T) {
 	}
 }
 
+func TestMutationEndpointsCallReloader(t *testing.T) {
+	fake := newFakeOIDCClientStore()
+	if err := fake.CreateOIDCClient(store.OIDCClient{
+		ID:            "upd-client",
+		Name:          "Update Client",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.com/callback"},
+	}, nil); err != nil {
+		t.Fatalf("CreateOIDCClient(upd-client) failed: %v", err)
+	}
+	if err := fake.CreateOIDCClient(store.OIDCClient{
+		ID:            "conf-client",
+		Name:          "Conf Client",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.com/conf"},
+	}, []store.OIDCClientSecretInput{{PlainSecret: "one", Label: "one"}, {PlainSecret: "two", Label: "two"}}); err != nil {
+		t.Fatalf("CreateOIDCClient(conf-client) failed: %v", err)
+	}
+	reloader := &fakeOIDCClientReloader{}
+	api := setupTestAdminAPIWithReloader(fake, testAdminToken, reloader)
+
+	createRec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"id":             "new-public",
+		"name":           "New Public",
+		"enabled":        true,
+		"confidential":   false,
+		"require_pkce":   true,
+		"auth_method":    "none",
+		"grant_types":    []string{"authorization_code"},
+		"response_types": []string{"code"},
+		"scopes":         []string{"openid"},
+		"redirect_uris":  []string{"https://example.com/new"},
+	})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create expected 201, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+	if reloader.calls != 1 {
+		t.Fatalf("expected reload calls=1 after create, got %d", reloader.calls)
+	}
+
+	updateRec := doJSONRequest(t, api, http.MethodPut, "/admin/api/oidc/clients/upd-client", testAdminToken, map[string]any{
+		"name": "Updated Name",
+	})
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update expected 200, got %d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	if reloader.calls != 2 {
+		t.Fatalf("expected reload calls=2 after update, got %d", reloader.calls)
+	}
+
+	redirectRec := doJSONRequest(t, api, http.MethodPut, "/admin/api/oidc/clients/upd-client/redirect-uris", testAdminToken, map[string]any{
+		"redirect_uris": []string{"https://example.com/new-callback"},
+	})
+	if redirectRec.Code != http.StatusOK {
+		t.Fatalf("redirect replace expected 200, got %d body=%s", redirectRec.Code, redirectRec.Body.String())
+	}
+	if reloader.calls != 3 {
+		t.Fatalf("expected reload calls=3 after redirect replace, got %d", reloader.calls)
+	}
+
+	addSecretRec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients/conf-client/secrets", testAdminToken, map[string]any{
+		"secret": "three",
+		"label":  "three",
+	})
+	if addSecretRec.Code != http.StatusCreated {
+		t.Fatalf("add secret expected 201, got %d body=%s", addSecretRec.Code, addSecretRec.Body.String())
+	}
+	if reloader.calls != 4 {
+		t.Fatalf("expected reload calls=4 after add secret, got %d", reloader.calls)
+	}
+
+	secrets, err := fake.ListOIDCClientSecrets("conf-client")
+	if err != nil {
+		t.Fatalf("ListOIDCClientSecrets failed: %v", err)
+	}
+	if len(secrets) < 2 {
+		t.Fatalf("expected at least 2 secrets to test revoke, got %d", len(secrets))
+	}
+
+	revokeRec := doJSONRequest(t, api, http.MethodPost, fmt.Sprintf("/admin/api/oidc/clients/conf-client/secrets/%d/revoke", secrets[len(secrets)-1].ID), testAdminToken, nil)
+	if revokeRec.Code != http.StatusOK {
+		t.Fatalf("revoke expected 200, got %d body=%s", revokeRec.Code, revokeRec.Body.String())
+	}
+	if reloader.calls != 5 {
+		t.Fatalf("expected reload calls=5 after revoke secret, got %d", reloader.calls)
+	}
+}
+
+func TestMutationEndpointsReturn500WhenReloadFails(t *testing.T) {
+	type mutationCase struct {
+		name    string
+		prepare func(t *testing.T, fake *fakeOIDCClientStore) (method string, path string, payload any)
+	}
+
+	cases := []mutationCase{
+		{
+			name: "create",
+			prepare: func(t *testing.T, fake *fakeOIDCClientStore) (string, string, any) {
+				return http.MethodPost, "/admin/api/oidc/clients", map[string]any{
+					"id":             "reload-create",
+					"name":           "Reload Create",
+					"enabled":        true,
+					"confidential":   false,
+					"require_pkce":   true,
+					"auth_method":    "none",
+					"grant_types":    []string{"authorization_code"},
+					"response_types": []string{"code"},
+					"scopes":         []string{"openid"},
+					"redirect_uris":  []string{"https://example.com/create"},
+				}
+			},
+		},
+		{
+			name: "update",
+			prepare: func(t *testing.T, fake *fakeOIDCClientStore) (string, string, any) {
+				if err := fake.CreateOIDCClient(store.OIDCClient{
+					ID:            "upd-fail",
+					Name:          "Update Fail",
+					Enabled:       true,
+					Confidential:  false,
+					RequirePKCE:   true,
+					AuthMethod:    "none",
+					GrantTypes:    []string{"authorization_code"},
+					ResponseTypes: []string{"code"},
+					Scopes:        []string{"openid"},
+					RedirectURIs:  []string{"https://example.com/update"},
+				}, nil); err != nil {
+					t.Fatalf("seed update client failed: %v", err)
+				}
+				return http.MethodPut, "/admin/api/oidc/clients/upd-fail", map[string]any{"name": "Updated"}
+			},
+		},
+		{
+			name: "replace_redirects",
+			prepare: func(t *testing.T, fake *fakeOIDCClientStore) (string, string, any) {
+				if err := fake.CreateOIDCClient(store.OIDCClient{
+					ID:            "redir-fail",
+					Name:          "Redirect Fail",
+					Enabled:       true,
+					Confidential:  false,
+					RequirePKCE:   true,
+					AuthMethod:    "none",
+					GrantTypes:    []string{"authorization_code"},
+					ResponseTypes: []string{"code"},
+					Scopes:        []string{"openid"},
+					RedirectURIs:  []string{"https://example.com/old"},
+				}, nil); err != nil {
+					t.Fatalf("seed redirect client failed: %v", err)
+				}
+				return http.MethodPut, "/admin/api/oidc/clients/redir-fail/redirect-uris", map[string]any{
+					"redirect_uris": []string{"https://example.com/new"},
+				}
+			},
+		},
+		{
+			name: "add_secret",
+			prepare: func(t *testing.T, fake *fakeOIDCClientStore) (string, string, any) {
+				if err := fake.CreateOIDCClient(store.OIDCClient{
+					ID:            "secret-fail",
+					Name:          "Secret Fail",
+					Enabled:       true,
+					Confidential:  true,
+					RequirePKCE:   true,
+					AuthMethod:    "basic",
+					GrantTypes:    []string{"authorization_code"},
+					ResponseTypes: []string{"code"},
+					Scopes:        []string{"openid"},
+					RedirectURIs:  []string{"https://example.com/conf"},
+				}, []store.OIDCClientSecretInput{{PlainSecret: "one", Label: "one"}}); err != nil {
+					t.Fatalf("seed secret client failed: %v", err)
+				}
+				return http.MethodPost, "/admin/api/oidc/clients/secret-fail/secrets", map[string]any{"secret": "two"}
+			},
+		},
+		{
+			name: "revoke_secret",
+			prepare: func(t *testing.T, fake *fakeOIDCClientStore) (string, string, any) {
+				if err := fake.CreateOIDCClient(store.OIDCClient{
+					ID:            "revoke-fail",
+					Name:          "Revoke Fail",
+					Enabled:       true,
+					Confidential:  true,
+					RequirePKCE:   true,
+					AuthMethod:    "basic",
+					GrantTypes:    []string{"authorization_code"},
+					ResponseTypes: []string{"code"},
+					Scopes:        []string{"openid"},
+					RedirectURIs:  []string{"https://example.com/conf"},
+				}, []store.OIDCClientSecretInput{{PlainSecret: "one", Label: "one"}, {PlainSecret: "two", Label: "two"}}); err != nil {
+					t.Fatalf("seed revoke client failed: %v", err)
+				}
+				secrets, err := fake.ListOIDCClientSecrets("revoke-fail")
+				if err != nil {
+					t.Fatalf("seed revoke secret listing failed: %v", err)
+				}
+				if len(secrets) < 2 {
+					t.Fatalf("expected at least two secrets for revoke test")
+				}
+				return http.MethodPost, fmt.Sprintf("/admin/api/oidc/clients/revoke-fail/secrets/%d/revoke", secrets[0].ID), nil
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeOIDCClientStore()
+			method, path, payload := tc.prepare(t, fake)
+
+			reloader := &fakeOIDCClientReloader{err: errors.New("reload failed")}
+			api := setupTestAdminAPIWithReloader(fake, testAdminToken, reloader)
+			rec := doJSONRequest(t, api, method, path, testAdminToken, payload)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "runtime reload failed") {
+				t.Fatalf("expected runtime reload failure message, got body=%s", rec.Body.String())
+			}
+			if reloader.calls != 1 {
+				t.Fatalf("expected reloader to be called once, got %d", reloader.calls)
+			}
+		})
+	}
+}
+
+func TestInvalidMutationRequestDoesNotCallReloader(t *testing.T) {
+	reloader := &fakeOIDCClientReloader{}
+	api := setupTestAdminAPIWithReloader(newFakeOIDCClientStore(), testAdminToken, reloader)
+
+	rec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"name": "missing-id",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid create request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if reloader.calls != 0 {
+		t.Fatalf("reloader must not be called on invalid request, got calls=%d", reloader.calls)
+	}
+}
+
+func TestAuditInsertOnSuccessDoesNotLeakSecrets(t *testing.T) {
+	auditStore := &fakeAdminAuditStore{}
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		auditStore,
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	secret := "super-secret-value"
+	rec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"id":                   "audit-conf",
+		"name":                 "Audit Confidential",
+		"enabled":              true,
+		"confidential":         true,
+		"require_pkce":         true,
+		"auth_method":          "basic",
+		"grant_types":          []string{"authorization_code"},
+		"response_types":       []string{"code"},
+		"scopes":               []string{"openid"},
+		"redirect_uris":        []string{"https://example.com/callback"},
+		"initial_secret":       secret,
+		"initial_secret_label": "initial",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(auditStore.entries) == 0 {
+		t.Fatalf("expected at least one audit entry")
+	}
+
+	entry := auditStore.entries[len(auditStore.entries)-1]
+	if !entry.Success {
+		t.Fatalf("expected successful audit entry, got %+v", entry)
+	}
+	if entry.Action != "admin.oidc_client.create" {
+		t.Fatalf("unexpected action: %s", entry.Action)
+	}
+	details := string(entry.DetailsJSON)
+	if strings.Contains(details, secret) {
+		t.Fatalf("audit details leaked plaintext secret: %s", details)
+	}
+	if strings.Contains(details, "secret_hash") {
+		t.Fatalf("audit details leaked secret_hash: %s", details)
+	}
+}
+
+func TestAuditInsertOnFailure(t *testing.T) {
+	auditStore := &fakeAdminAuditStore{}
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		auditStore,
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	rec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"name": "missing-id",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(auditStore.entries) == 0 {
+		t.Fatalf("expected audit entry for failed mutation")
+	}
+	entry := auditStore.entries[len(auditStore.entries)-1]
+	if entry.Success {
+		t.Fatalf("expected failure audit entry, got %+v", entry)
+	}
+	if entry.Action != "admin.oidc_client.create" {
+		t.Fatalf("unexpected action in failure audit: %s", entry.Action)
+	}
+}
+
+func TestRequestIDAddedAndStoredInAudit(t *testing.T) {
+	auditStore := &fakeAdminAuditStore{}
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		auditStore,
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	rec := doJSONRequest(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"id":             "reqid-public",
+		"name":           "Request ID Public",
+		"enabled":        true,
+		"confidential":   false,
+		"require_pkce":   true,
+		"auth_method":    "none",
+		"grant_types":    []string{"authorization_code"},
+		"response_types": []string{"code"},
+		"scopes":         []string{"openid"},
+		"redirect_uris":  []string{"https://example.com/callback"},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	requestID := strings.TrimSpace(rec.Header().Get(echo.HeaderXRequestID))
+	if requestID == "" {
+		t.Fatalf("expected response request id header")
+	}
+	if len(auditStore.entries) == 0 {
+		t.Fatalf("expected audit entry for mutation")
+	}
+	entry := auditStore.entries[len(auditStore.entries)-1]
+	if strings.TrimSpace(entry.RequestID) == "" {
+		t.Fatalf("expected request id in audit entry")
+	}
+	if entry.RequestID != requestID {
+		t.Fatalf("request id mismatch: response=%s audit=%s", requestID, entry.RequestID)
+	}
+}
+
+func TestAdminRateLimit(t *testing.T) {
+	api := setupTestAdminAPIWithConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1), Burst: 1, ExpiresIn: time.Minute},
+	)
+
+	rec1 := doJSONRequestWithHostAndIP(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil, testAdminHost, "198.51.100.10:10001")
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected first request to pass, got %d body=%s", rec1.Code, rec1.Body.String())
+	}
+
+	rec2 := doJSONRequestWithHostAndIP(t, api, http.MethodGet, "/admin/api/oidc/clients", testAdminToken, nil, testAdminHost, "198.51.100.10:10001")
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to be rate-limited, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
 func setupTestAdminAPI(fakeStore *fakeOIDCClientStore, token string) *echo.Echo {
+	return setupTestAdminAPIWithConfig(
+		fakeStore,
+		token,
+		testAdminHost,
+		&fakeOIDCClientReloader{},
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+}
+
+func setupTestAdminAPIWithReloader(fakeStore *fakeOIDCClientStore, token string, reloader *fakeOIDCClientReloader) *echo.Echo {
+	return setupTestAdminAPIWithConfig(
+		fakeStore,
+		token,
+		testAdminHost,
+		reloader,
+		&fakeAdminAuditStore{},
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+}
+
+func setupTestAdminAPIWithConfig(
+	fakeStore *fakeOIDCClientStore,
+	token string,
+	host string,
+	reloader *fakeOIDCClientReloader,
+	auditStore *fakeAdminAuditStore,
+	limiterConfig AdminRateLimitConfig,
+) *echo.Echo {
 	e := echo.New()
 	group := e.Group("/admin/api")
-	group.Use(AdminAPIMiddleware(token))
-	RegisterOIDCClientRoutes(group, NewOIDCClientHandler(fakeStore))
+	group.Use(AdminRequestIDMiddleware())
+	group.Use(AdminAPIMiddleware(token, host))
+	group.Use(AdminRateLimitMiddleware(limiterConfig))
+	RegisterOIDCClientRoutes(group, NewOIDCClientHandler(fakeStore, reloader, auditStore))
 	return e
 }
 
 func doJSONRequest(t *testing.T, e *echo.Echo, method string, path string, token string, payload any) *httptest.ResponseRecorder {
+	return doJSONRequestWithHostAndIP(t, e, method, path, token, payload, testAdminHost, "203.0.113.10:1234")
+}
+
+func doJSONRequestWithHost(t *testing.T, e *echo.Echo, method string, path string, token string, payload any, host string) *httptest.ResponseRecorder {
+	return doJSONRequestWithHostAndIP(t, e, method, path, token, payload, host, "203.0.113.10:1234")
+}
+
+func doJSONRequestWithHostAndIP(t *testing.T, e *echo.Echo, method string, path string, token string, payload any, host string, remoteAddr string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var body *bytes.Reader
@@ -421,6 +905,8 @@ func doJSONRequest(t *testing.T, e *echo.Echo, method string, path string, token
 	}
 	req := httptest.NewRequest(method, path, body)
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Host = host
+	req.RemoteAddr = remoteAddr
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
 	}
@@ -707,4 +1193,29 @@ func contains(items []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+type fakeOIDCClientReloader struct {
+	calls int
+	err   error
+}
+
+func (f *fakeOIDCClientReloader) ReloadClients(ctx context.Context) error {
+	f.calls++
+	return f.err
+}
+
+type fakeAdminAuditStore struct {
+	entries []store.AdminAuditEntry
+	err     error
+}
+
+func (f *fakeAdminAuditStore) CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error {
+	if f.err != nil {
+		return f.err
+	}
+	clone := entry
+	clone.DetailsJSON = append([]byte(nil), entry.DetailsJSON...)
+	f.entries = append(f.entries, clone)
+	return nil
 }
