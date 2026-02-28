@@ -53,6 +53,12 @@ type AdminAuditStore interface {
 type SessionAuth interface {
 	SessionUser(c echo.Context) (*store.AdminUser, bool)
 	LogoutSession(c echo.Context) error
+	ListPasskeys(c echo.Context) ([]store.AdminCredentialInfo, error)
+	DeletePasskey(c echo.Context, credentialID int64) error
+	CurrentSessionID(c echo.Context) (string, bool)
+	ListSessions(c echo.Context) ([]store.AdminSessionInfo, error)
+	LogoutSessionByID(c echo.Context, sessionID string) error
+	LogoutOtherSessions(c echo.Context) (int, error)
 	RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc
 	AttachSessionActorMiddleware() echo.MiddlewareFunc
 }
@@ -226,6 +232,33 @@ type auditLogPageData struct {
 	NextURL          string
 }
 
+type adminPasskeyView struct {
+	ID            int64
+	CredentialID  string
+	CredentialTag string
+	CreatedAt     time.Time
+	LastUsedAt    *time.Time
+	Transports    []string
+}
+
+type adminSessionView struct {
+	SessionID  string
+	SessionTag string
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	RemoteIP   string
+	UserAgent  string
+	Current    bool
+}
+
+type securityPageData struct {
+	layoutData
+	Passkeys []adminPasskeyView
+	Sessions []adminSessionView
+	Error    string
+}
+
 func NewHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditStore AdminAuditStore, sessionAuth SessionAuth) (*Handler, error) {
 	if clientStore == nil {
 		return nil, fmt.Errorf("adminui requires oidc client store")
@@ -253,7 +286,11 @@ func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
 	group.GET("/audit", handler.AuditLog)
+	group.GET("/security", handler.SecurityPage)
 	group.POST("/logout", handler.Logout)
+	group.POST("/security/passkeys/:id/delete", handler.SecurityPasskeyDelete)
+	group.POST("/security/sessions/:id/logout", handler.SecuritySessionLogout)
+	group.POST("/security/sessions/logout-others", handler.SecuritySessionsLogoutOthers)
 	group.GET("/clients", handler.ClientsList)
 	group.GET("/clients/new", handler.ClientNew)
 	group.POST("/clients/new", handler.ClientCreate)
@@ -331,6 +368,98 @@ func (h *Handler) AuditLog(c echo.Context) error {
 		PrevURL:          prevURL,
 		NextURL:          nextURL,
 	})
+}
+
+func (h *Handler) SecurityPage(c echo.Context) error {
+	if strings.TrimSpace(c.QueryParam("passkey_added")) == "1" {
+		h.setFlash(c, "success", "Passkey added")
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	adminUser := h.currentAdmin(c)
+	passkeys, err := h.auth.ListPasskeys(c)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "security.html", securityPageData{
+			layoutData: h.newLayoutData(c, adminUser, "Admin Security"),
+			Error:      "Failed to load passkeys",
+		})
+	}
+
+	sessions, err := h.auth.ListSessions(c)
+	if err != nil {
+		return h.render(c, http.StatusInternalServerError, "security.html", securityPageData{
+			layoutData: h.newLayoutData(c, adminUser, "Admin Security"),
+			Passkeys:   buildPasskeyViews(passkeys),
+			Error:      "Failed to load sessions",
+		})
+	}
+
+	return h.render(c, http.StatusOK, "security.html", securityPageData{
+		layoutData: h.newLayoutData(c, adminUser, "Admin Security"),
+		Passkeys:   buildPasskeyViews(passkeys),
+		Sessions:   buildSessionViews(sessions),
+	})
+}
+
+func (h *Handler) SecurityPasskeyDelete(c echo.Context) error {
+	credentialID, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || credentialID <= 0 {
+		h.setFlash(c, "error", "Invalid passkey ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	if err := h.auth.DeletePasskey(c, credentialID); err != nil {
+		switch {
+		case errors.Is(err, store.ErrAdminCredentialLast):
+			h.setFlash(c, "error", "Cannot delete the last passkey")
+		case errors.Is(err, store.ErrAdminCredentialNotFound):
+			h.setFlash(c, "error", "Passkey not found")
+		default:
+			h.setFlash(c, "error", "Failed to delete passkey")
+		}
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	h.setFlash(c, "success", "Passkey deleted")
+	return c.Redirect(http.StatusSeeOther, "/admin/security")
+}
+
+func (h *Handler) SecuritySessionLogout(c echo.Context) error {
+	sessionID := strings.TrimSpace(c.Param("id"))
+	if sessionID == "" {
+		h.setFlash(c, "error", "Invalid session ID")
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	currentSessionID, _ := h.auth.CurrentSessionID(c)
+	if err := h.auth.LogoutSessionByID(c, sessionID); err != nil {
+		h.setFlash(c, "error", "Failed to sign out session")
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	if sessionID == currentSessionID {
+		h.clearCSRFCookie(c)
+		h.setFlash(c, "success", "Signed out current session")
+		return c.Redirect(http.StatusSeeOther, "/admin/login")
+	}
+
+	h.setFlash(c, "success", "Session signed out")
+	return c.Redirect(http.StatusSeeOther, "/admin/security")
+}
+
+func (h *Handler) SecuritySessionsLogoutOthers(c echo.Context) error {
+	removed, err := h.auth.LogoutOtherSessions(c)
+	if err != nil {
+		h.setFlash(c, "error", "Failed to sign out other sessions")
+		return c.Redirect(http.StatusSeeOther, "/admin/security")
+	}
+
+	if removed == 0 {
+		h.setFlash(c, "success", "No other sessions to sign out")
+	} else {
+		h.setFlash(c, "success", fmt.Sprintf("Signed out %d other session(s)", removed))
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/security")
 }
 
 func (h *Handler) LoginPage(c echo.Context) error {
@@ -1322,6 +1451,54 @@ func defaultDisplay(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func buildPasskeyViews(items []store.AdminCredentialInfo) []adminPasskeyView {
+	out := make([]adminPasskeyView, 0, len(items))
+	for _, item := range items {
+		credentialID := strings.TrimSpace(item.CredentialID)
+		out = append(out, adminPasskeyView{
+			ID:            item.ID,
+			CredentialID:  credentialID,
+			CredentialTag: shortDisplay(credentialID, 12, 10),
+			CreatedAt:     item.CreatedAt,
+			LastUsedAt:    item.LastUsedAt,
+			Transports:    append([]string(nil), item.Transports...),
+		})
+	}
+	return out
+}
+
+func buildSessionViews(items []store.AdminSessionInfo) []adminSessionView {
+	out := make([]adminSessionView, 0, len(items))
+	for _, item := range items {
+		sessionID := strings.TrimSpace(item.SessionID)
+		out = append(out, adminSessionView{
+			SessionID:  sessionID,
+			SessionTag: shortDisplay(sessionID, 10, 8),
+			CreatedAt:  item.CreatedAt,
+			LastSeenAt: item.LastSeenAt,
+			ExpiresAt:  item.ExpiresAt,
+			RemoteIP:   defaultDisplay(item.RemoteIP),
+			UserAgent:  defaultDisplay(item.UserAgent),
+			Current:    item.Current,
+		})
+	}
+	return out
+}
+
+func shortDisplay(value string, head int, tail int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if head < 1 || tail < 1 {
+		return value
+	}
+	if len(value) <= head+tail+1 {
+		return value
+	}
+	return value[:head] + "..." + value[len(value)-tail:]
 }
 
 func formatAuditDetailsForDisplay(raw json.RawMessage) (string, bool) {

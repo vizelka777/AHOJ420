@@ -3,11 +3,13 @@ package adminauth
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -178,6 +180,208 @@ func TestLogoutRevokesSessionAndFurtherAccessFails(t *testing.T) {
 	}
 }
 
+func TestAddPasskeyFlowWhileLoggedIn(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-primary"),
+		PublicKey: []byte("pk-primary"),
+	}); err != nil {
+		t.Fatalf("seed primary credential: %v", err)
+	}
+
+	wa := &fakeWebAuthn{
+		beginRegistrationSession: &webauthn.SessionData{Challenge: "add-passkey-challenge"},
+		finishRegistrationCredential: &webauthn.Credential{
+			ID:        []byte("cred-secondary"),
+			PublicKey: []byte("pk-secondary"),
+			Transport: []protocol.AuthenticatorTransport{protocol.USB},
+		},
+	}
+	svc := newTestAdminAuthService(st, wa)
+	e := echo.New()
+	e.POST("/admin/auth/passkeys/register/begin", svc.BeginAddPasskey)
+	e.POST("/admin/auth/passkeys/register/finish", svc.FinishAddPasskey)
+
+	adminSession := issueAdminSessionCookie(t, svc, adminUser.ID)
+
+	beginRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/passkeys/register/begin", nil, []*http.Cookie{adminSession}, "")
+	if beginRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on add-passkey begin, got %d body=%s", beginRec.Code, beginRec.Body.String())
+	}
+	addCookie := responseCookie(beginRec, adminAddPasskeyCookieName)
+	if addCookie == nil || strings.TrimSpace(addCookie.Value) == "" {
+		t.Fatalf("expected %s cookie", adminAddPasskeyCookieName)
+	}
+
+	finishRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/passkeys/register/finish", nil, []*http.Cookie{adminSession, addCookie}, "")
+	if finishRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on add-passkey finish, got %d body=%s", finishRec.Code, finishRec.Body.String())
+	}
+
+	credentials, err := st.ListAdminCredentials(adminUser.ID)
+	if err != nil {
+		t.Fatalf("list admin credentials failed: %v", err)
+	}
+	if len(credentials) != 2 {
+		t.Fatalf("expected second credential to be stored, got %d", len(credentials))
+	}
+
+	if !auditActionExists(st.auditEntries, "admin.auth.passkey.add.success", true) {
+		t.Fatalf("expected admin.auth.passkey.add.success audit entry")
+	}
+}
+
+func TestDeletePasskeyBlocksLastCredential(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-a"),
+		PublicKey: []byte("pk-a"),
+	}); err != nil {
+		t.Fatalf("seed credential A: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-b"),
+		PublicKey: []byte("pk-b"),
+	}); err != nil {
+		t.Fatalf("seed credential B: %v", err)
+	}
+
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{})
+	adminSession := issueAdminSessionCookie(t, svc, adminUser.ID)
+	credentials, err := st.ListAdminCredentials(adminUser.ID)
+	if err != nil {
+		t.Fatalf("list credentials failed: %v", err)
+	}
+	if len(credentials) != 2 {
+		t.Fatalf("expected 2 credentials before delete, got %d", len(credentials))
+	}
+
+	ctx := newAdminAuthContext(t, http.MethodPost, "/admin/security/passkeys/delete", []*http.Cookie{adminSession})
+	if err := svc.DeletePasskey(ctx, credentials[0].ID); err != nil {
+		t.Fatalf("delete non-last passkey failed: %v", err)
+	}
+	if !auditActionExists(st.auditEntries, "admin.auth.passkey.delete.success", true) {
+		t.Fatalf("expected admin.auth.passkey.delete.success audit entry")
+	}
+
+	credentials, err = st.ListAdminCredentials(adminUser.ID)
+	if err != nil {
+		t.Fatalf("list credentials after delete failed: %v", err)
+	}
+	if len(credentials) != 1 {
+		t.Fatalf("expected exactly one credential after delete, got %d", len(credentials))
+	}
+
+	ctxLast := newAdminAuthContext(t, http.MethodPost, "/admin/security/passkeys/delete", []*http.Cookie{adminSession})
+	err = svc.DeletePasskey(ctxLast, credentials[0].ID)
+	if !errors.Is(err, store.ErrAdminCredentialLast) {
+		t.Fatalf("expected ErrAdminCredentialLast when deleting final passkey, got %v", err)
+	}
+	if !auditActionExists(st.auditEntries, "admin.auth.passkey.delete.failure", false) {
+		t.Fatalf("expected admin.auth.passkey.delete.failure audit entry")
+	}
+}
+
+func TestAdminSessionInventoryAndLogoutOthers(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{})
+
+	currentCookie := issueAdminSessionCookie(t, svc, adminUser.ID)
+	otherCookie := issueAdminSessionCookie(t, svc, adminUser.ID)
+	thirdCookie := issueAdminSessionCookie(t, svc, adminUser.ID)
+	if strings.TrimSpace(otherCookie.Value) == strings.TrimSpace(currentCookie.Value) || strings.TrimSpace(thirdCookie.Value) == strings.TrimSpace(currentCookie.Value) {
+		t.Fatalf("expected distinct session IDs")
+	}
+
+	ctxList := newAdminAuthContext(t, http.MethodGet, "/admin/security", []*http.Cookie{currentCookie})
+	sessions, err := svc.ListSessions(ctxList)
+	if err != nil {
+		t.Fatalf("list sessions failed: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("expected three active sessions, got %d", len(sessions))
+	}
+	currentCount := 0
+	for _, item := range sessions {
+		if item.Current {
+			currentCount++
+		}
+	}
+	if currentCount != 1 {
+		t.Fatalf("expected exactly one current session, got %d", currentCount)
+	}
+
+	ctxOthers := newAdminAuthContext(t, http.MethodPost, "/admin/security/sessions/logout-others", []*http.Cookie{currentCookie})
+	removed, err := svc.LogoutOtherSessions(ctxOthers)
+	if err != nil {
+		t.Fatalf("logout other sessions failed: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("expected two sessions removed, got %d", removed)
+	}
+	if !auditActionExists(st.auditEntries, "admin.auth.session.logout_others.success", true) {
+		t.Fatalf("expected admin.auth.session.logout_others.success audit entry")
+	}
+
+	ctxAfter := newAdminAuthContext(t, http.MethodGet, "/admin/security", []*http.Cookie{currentCookie})
+	after, err := svc.ListSessions(ctxAfter)
+	if err != nil {
+		t.Fatalf("list sessions after logout others failed: %v", err)
+	}
+	if len(after) != 1 || !after[0].Current {
+		t.Fatalf("expected only current session to remain, got %+v", after)
+	}
+}
+
+func TestLogoutSpecificAdminSession(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{})
+
+	currentCookie := issueAdminSessionCookie(t, svc, adminUser.ID)
+	otherCookie := issueAdminSessionCookie(t, svc, adminUser.ID)
+
+	ctxOther := newAdminAuthContext(t, http.MethodPost, "/admin/security/sessions/logout", []*http.Cookie{currentCookie})
+	if err := svc.LogoutSessionByID(ctxOther, otherCookie.Value); err != nil {
+		t.Fatalf("logout other session failed: %v", err)
+	}
+	if !auditActionExists(st.auditEntries, "admin.auth.session.logout.success", true) {
+		t.Fatalf("expected admin.auth.session.logout.success audit entry")
+	}
+
+	ctxAfterOther := newAdminAuthContext(t, http.MethodGet, "/admin/security", []*http.Cookie{currentCookie})
+	sessions, err := svc.ListSessions(ctxAfterOther)
+	if err != nil {
+		t.Fatalf("list sessions after logout other failed: %v", err)
+	}
+	if len(sessions) != 1 || !sessions[0].Current || strings.TrimSpace(sessions[0].SessionID) != strings.TrimSpace(currentCookie.Value) {
+		t.Fatalf("expected only current session to remain after single logout, got %+v", sessions)
+	}
+
+	ctxCurrent := newAdminAuthContext(t, http.MethodPost, "/admin/security/sessions/logout", []*http.Cookie{currentCookie})
+	if err := svc.LogoutSessionByID(ctxCurrent, currentCookie.Value); err != nil {
+		t.Fatalf("logout current session failed: %v", err)
+	}
+	if _, ok := svc.SessionUser(ctxCurrent); ok {
+		t.Fatalf("expected current session to become invalid after logout")
+	}
+}
+
 func TestExpiredAdminSessionRejected(t *testing.T) {
 	st := newFakeAdminStore()
 	adminUser, err := st.CreateAdminUser("owner", "Owner")
@@ -252,6 +456,19 @@ func issueAdminSessionCookie(t *testing.T, svc *Service, adminUserID string) *ht
 		t.Fatalf("expected %s cookie from setSession", adminSessionCookieName)
 	}
 	return cookie
+}
+
+func newAdminAuthContext(t *testing.T, method string, path string, cookies []*http.Cookie) echo.Context {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(method, path, nil)
+	for _, cookie := range cookies {
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+	}
+	rec := httptest.NewRecorder()
+	return e.NewContext(req, rec)
 }
 
 func doAdminAuthRequest(t *testing.T, e *echo.Echo, method string, path string, payload any, cookies []*http.Cookie, host string) *httptest.ResponseRecorder {
@@ -355,6 +572,47 @@ func (s *fakeAdminSessionStateStore) Del(ctx context.Context, key string) error 
 	return nil
 }
 
+func (s *fakeAdminSessionStateStore) Keys(ctx context.Context, pattern string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prefix := strings.TrimSpace(pattern)
+	if strings.HasSuffix(prefix, "*") {
+		prefix = strings.TrimSuffix(prefix, "*")
+	}
+
+	out := make([]string, 0, len(s.data))
+	now := time.Now()
+	for key, rec := range s.data {
+		if !rec.expiresAt.IsZero() && now.After(rec.expiresAt) {
+			continue
+		}
+		if strings.HasPrefix(key, prefix) {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (s *fakeAdminSessionStateStore) TTL(ctx context.Context, key string) (time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.data[strings.TrimSpace(key)]
+	if !ok {
+		return -2 * time.Second, nil
+	}
+	if rec.expiresAt.IsZero() {
+		return -1 * time.Second, nil
+	}
+	ttl := time.Until(rec.expiresAt)
+	if ttl < 0 {
+		return -2 * time.Second, nil
+	}
+	return ttl, nil
+}
+
 type fakeWebAuthn struct {
 	beginRegistrationOptions     *protocol.CredentialCreation
 	beginRegistrationSession     *webauthn.SessionData
@@ -433,10 +691,19 @@ func (f *fakeWebAuthn) FinishDiscoverableLogin(handler webauthn.DiscoverableUser
 type fakeAdminStore struct {
 	mu               sync.Mutex
 	nextUserID       int
+	nextCredentialID int64
 	users            map[string]*store.AdminUser
 	usersByLogin     map[string]string
 	credentialOwners map[string]string
+	credentialMeta   map[string]credentialMeta
 	auditEntries     []store.AdminAuditEntry
+}
+
+type credentialMeta struct {
+	ID         int64
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	Transports []string
 }
 
 func newFakeAdminStore() *fakeAdminStore {
@@ -444,6 +711,7 @@ func newFakeAdminStore() *fakeAdminStore {
 		users:            make(map[string]*store.AdminUser),
 		usersByLogin:     make(map[string]string),
 		credentialOwners: make(map[string]string),
+		credentialMeta:   make(map[string]credentialMeta),
 		auditEntries:     make([]store.AdminAuditEntry, 0),
 	}
 }
@@ -549,6 +817,21 @@ func (f *fakeAdminStore) AddAdminCredential(adminUserID string, credential *weba
 	user.Credentials = append(user.Credentials, copied)
 	user.UpdatedAt = time.Now().UTC()
 	f.credentialOwners[key] = user.ID
+	f.nextCredentialID++
+	transports := make([]string, 0, len(copied.Transport))
+	for _, transport := range copied.Transport {
+		trimmed := strings.TrimSpace(string(transport))
+		if trimmed == "" {
+			continue
+		}
+		transports = append(transports, trimmed)
+	}
+	f.credentialMeta[key] = credentialMeta{
+		ID:         f.nextCredentialID,
+		CreatedAt:  time.Now().UTC(),
+		LastUsedAt: nil,
+		Transports: transports,
+	}
 	return nil
 }
 
@@ -568,10 +851,88 @@ func (f *fakeAdminStore) UpdateAdminCredential(credential *webauthn.Credential) 
 		if bytes.Equal(user.Credentials[idx].ID, credential.ID) {
 			user.Credentials[idx].Authenticator.SignCount = credential.Authenticator.SignCount
 			user.UpdatedAt = time.Now().UTC()
+			if meta, ok := f.credentialMeta[string(credential.ID)]; ok {
+				now := time.Now().UTC()
+				meta.LastUsedAt = &now
+				f.credentialMeta[string(credential.ID)] = meta
+			}
 			return nil
 		}
 	}
 	return store.ErrAdminCredentialNotFound
+}
+
+func (f *fakeAdminStore) ListAdminCredentials(adminUserID string) ([]store.AdminCredentialInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	user, ok := f.users[strings.TrimSpace(adminUserID)]
+	if !ok {
+		return nil, store.ErrAdminUserNotFound
+	}
+	out := make([]store.AdminCredentialInfo, 0, len(user.Credentials))
+	for _, credential := range user.Credentials {
+		key := string(credential.ID)
+		meta := f.credentialMeta[key]
+		item := store.AdminCredentialInfo{
+			ID:           meta.ID,
+			CredentialID: base64.RawURLEncoding.EncodeToString(credential.ID),
+			CreatedAt:    meta.CreatedAt,
+			Transports:   append([]string(nil), meta.Transports...),
+		}
+		if meta.LastUsedAt != nil {
+			value := meta.LastUsedAt.UTC()
+			item.LastUsedAt = &value
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (f *fakeAdminStore) DeleteAdminCredential(adminUserID string, credentialID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	user, ok := f.users[strings.TrimSpace(adminUserID)]
+	if !ok {
+		return store.ErrAdminUserNotFound
+	}
+	if credentialID <= 0 {
+		return store.ErrAdminCredentialNotFound
+	}
+	if len(user.Credentials) <= 1 {
+		return store.ErrAdminCredentialLast
+	}
+	idx := -1
+	var key string
+	for i, credential := range user.Credentials {
+		meta := f.credentialMeta[string(credential.ID)]
+		if meta.ID == credentialID {
+			idx = i
+			key = string(credential.ID)
+			break
+		}
+	}
+	if idx < 0 {
+		return store.ErrAdminCredentialNotFound
+	}
+	delete(f.credentialOwners, key)
+	delete(f.credentialMeta, key)
+	user.Credentials = append(user.Credentials[:idx], user.Credentials[idx+1:]...)
+	user.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+func (f *fakeAdminStore) CountAdminCredentialsForUser(adminUserID string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	user, ok := f.users[strings.TrimSpace(adminUserID)]
+	if !ok {
+		return 0, store.ErrAdminUserNotFound
+	}
+	return len(user.Credentials), nil
 }
 
 func (f *fakeAdminStore) CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error {
@@ -609,6 +970,15 @@ func cloneCredential(in webauthn.Credential) webauthn.Credential {
 func containsString(items []string, needle string) bool {
 	for _, item := range items {
 		if item == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func auditActionExists(entries []store.AdminAuditEntry, action string, success bool) bool {
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Action) == strings.TrimSpace(action) && entry.Success == success {
 			return true
 		}
 	}

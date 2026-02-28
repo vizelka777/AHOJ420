@@ -1,0 +1,237 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Admin Security</h1>
+  <p class="hint">Manage your admin passkeys and active admin sessions.</p>
+  {{if .Error}}
+    <div class="error">{{.Error}}</div>
+  {{end}}
+</div>
+
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0;">Passkeys</h2>
+      <p class="hint" style="margin:6px 0 0;">Deleting the last passkey is blocked.</p>
+    </div>
+    <button type="button" id="add-passkey-btn">Add another passkey</button>
+  </div>
+  <div id="add-passkey-error" class="error" style="display:none; margin-top:12px;"></div>
+
+  <div class="table-wrap" style="margin-top:14px;">
+    <table>
+      <thead>
+        <tr>
+          <th>Passkey</th>
+          <th>Created</th>
+          <th>Last used</th>
+          <th>Transports</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{if .Passkeys}}
+          {{range .Passkeys}}
+            <tr>
+              <td class="mono" title="{{.CredentialID}}">{{.CredentialTag}}</td>
+              <td class="mono">{{formatTime .CreatedAt}}</td>
+              <td class="mono">{{formatTimePtr .LastUsedAt}}</td>
+              <td>{{if .Transports}}{{joinComma .Transports}}{{else}}-{{end}}</td>
+              <td>
+                <form method="post" action="/admin/security/passkeys/{{.ID}}/delete" style="margin:0;">
+                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                  <button type="submit" class="warn">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {{end}}
+        {{else}}
+          <tr>
+            <td colspan="5">No passkeys found.</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0;">Active Sessions</h2>
+      <p class="hint" style="margin:6px 0 0;">You can sign out one session or all other sessions.</p>
+    </div>
+    <form method="post" action="/admin/security/sessions/logout-others" style="margin:0;">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <button type="submit" class="secondary">Sign out other sessions</button>
+    </form>
+  </div>
+
+  <div class="table-wrap" style="margin-top:14px;">
+    <table>
+      <thead>
+        <tr>
+          <th>Session</th>
+          <th>Created</th>
+          <th>Last seen</th>
+          <th>Expires</th>
+          <th>Remote IP</th>
+          <th>User agent</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{if .Sessions}}
+          {{range .Sessions}}
+            <tr>
+              <td class="mono">
+                {{.SessionTag}}
+                {{if .Current}}<span class="chip ok" style="margin-left:6px;">current</span>{{end}}
+              </td>
+              <td class="mono">{{formatTime .CreatedAt}}</td>
+              <td class="mono">{{formatTime .LastSeenAt}}</td>
+              <td class="mono">{{formatTime .ExpiresAt}}</td>
+              <td class="mono">{{.RemoteIP}}</td>
+              <td>{{.UserAgent}}</td>
+              <td>
+                <form method="post" action="/admin/security/sessions/{{.SessionID}}/logout" style="margin:0;">
+                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                  <button type="submit" class="{{if .Current}}warn{{else}}secondary{{end}}">
+                    {{if .Current}}Sign out this session{{else}}Sign out{{end}}
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {{end}}
+        {{else}}
+          <tr>
+            <td colspan="7">No active sessions found.</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(function () {
+  const addButton = document.getElementById("add-passkey-btn");
+  const errorBox = document.getElementById("add-passkey-error");
+
+  if (!addButton) {
+    return;
+  }
+
+  function setError(message) {
+    errorBox.style.display = "block";
+    errorBox.textContent = message || "Passkey registration failed";
+  }
+
+  function clearError() {
+    errorBox.style.display = "none";
+    errorBox.textContent = "";
+  }
+
+  function b64uToBytes(value) {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(base64);
+    return Uint8Array.from(bin, function (ch) { return ch.charCodeAt(0); });
+  }
+
+  function bytesToB64u(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function normalizeCreationOptions(publicKey) {
+    publicKey.challenge = b64uToBytes(publicKey.challenge);
+    if (publicKey.user && publicKey.user.id) {
+      publicKey.user.id = b64uToBytes(publicKey.user.id);
+    }
+    if (publicKey.excludeCredentials) {
+      publicKey.excludeCredentials = publicKey.excludeCredentials.map(function (item) {
+        return Object.assign({}, item, { id: b64uToBytes(item.id) });
+      });
+    }
+    return publicKey;
+  }
+
+  async function beginRegistration() {
+    const res = await fetch("/admin/auth/passkeys/register/begin", {
+      method: "POST",
+      credentials: "include"
+    });
+    if (!res.ok) {
+      let message = "Unable to start passkey registration";
+      try {
+        const payload = await res.json();
+        if (payload && payload.message) {
+          message = payload.message;
+        }
+      } catch (_) {}
+      throw new Error(message);
+    }
+    const payload = await res.json();
+    return payload.publicKey || payload;
+  }
+
+  async function finishRegistration(credential) {
+    const transports = credential.response && typeof credential.response.getTransports === "function"
+      ? credential.response.getTransports()
+      : [];
+
+    const body = {
+      id: credential.id,
+      type: credential.type,
+      rawId: bytesToB64u(credential.rawId),
+      response: {
+        attestationObject: bytesToB64u(credential.response.attestationObject),
+        clientDataJSON: bytesToB64u(credential.response.clientDataJSON),
+        transports: transports
+      }
+    };
+
+    const res = await fetch("/admin/auth/passkeys/register/finish", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      let message = "Passkey registration failed";
+      try {
+        const payload = await res.json();
+        if (payload && payload.message) {
+          message = payload.message;
+        }
+      } catch (_) {}
+      throw new Error(message);
+    }
+  }
+
+  addButton.addEventListener("click", async function () {
+    clearError();
+    addButton.disabled = true;
+    addButton.textContent = "Adding passkey...";
+
+    try {
+      const publicKey = normalizeCreationOptions(await beginRegistration());
+      const credential = await navigator.credentials.create({ publicKey: publicKey });
+      if (!credential) {
+        throw new Error("No passkey credential returned");
+      }
+      await finishRegistration(credential);
+      window.location.href = "/admin/security?passkey_added=1";
+    } catch (err) {
+      setError(err && err.message ? err.message : "Passkey registration failed");
+      addButton.disabled = false;
+      addButton.textContent = "Add another passkey";
+    }
+  });
+})();
+</script>
+{{end}}

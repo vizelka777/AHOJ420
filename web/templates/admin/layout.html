@@ -162,8 +162,10 @@
       <div class="menu">
         <a href="/admin/"><strong>AHOJ420 Admin</strong></a>
         {{if .Admin}}
+          <a href="/admin/">Overview</a>
           <a href="/admin/clients">Clients</a>
-          <a href="/admin/audit">Audit</a>
+          <a href="/admin/audit">Audit log</a>
+          <a href="/admin/security">Security</a>
         {{end}}
       </div>
       {{if .Admin}}

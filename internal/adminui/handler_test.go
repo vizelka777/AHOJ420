@@ -210,6 +210,156 @@ func TestAuditLogPagination(t *testing.T) {
 	}
 }
 
+func TestSecurityPageRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/security", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestSecurityPageRendersPasskeysAndSessions(t *testing.T) {
+	auth := &fakeUIAuth{
+		passkeys: []store.AdminCredentialInfo{
+			{ID: 11, CredentialID: "cred-one", CreatedAt: time.Now().UTC().Add(-2 * time.Hour)},
+			{ID: 12, CredentialID: "cred-two", CreatedAt: time.Now().UTC().Add(-1 * time.Hour)},
+		},
+		sessions: []store.AdminSessionInfo{
+			{
+				SessionID:  "ok",
+				CreatedAt:  time.Now().UTC().Add(-1 * time.Hour),
+				LastSeenAt: time.Now().UTC().Add(-5 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(25 * time.Minute),
+				RemoteIP:   "10.10.0.1",
+				UserAgent:  "Mozilla/5.0",
+				Current:    true,
+			},
+			{
+				SessionID:  "other-session-1",
+				CreatedAt:  time.Now().UTC().Add(-30 * time.Minute),
+				LastSeenAt: time.Now().UTC().Add(-3 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(27 * time.Minute),
+				RemoteIP:   "10.10.0.2",
+				UserAgent:  "curl/8.0",
+				Current:    false,
+			},
+		},
+	}
+
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/security", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Admin Security") || !strings.Contains(body, "Passkeys") || !strings.Contains(body, "Active Sessions") {
+		t.Fatalf("expected security sections in html")
+	}
+	if !strings.Contains(body, "current") {
+		t.Fatalf("expected current session badge in html")
+	}
+	if !strings.Contains(body, `action="/admin/security/passkeys/`) || !strings.Contains(body, `action="/admin/security/sessions/`) {
+		t.Fatalf("expected security mutate forms in html")
+	}
+	if strings.Count(body, `name="csrf_token" value="`) < 3 {
+		t.Fatalf("expected csrf hidden fields in security forms")
+	}
+}
+
+func TestSecurityPasskeyDeleteCSRFAndLastCredentialGuard(t *testing.T) {
+	auth := &fakeUIAuth{
+		passkeys: []store.AdminCredentialInfo{
+			{ID: 21, CredentialID: "cred-a", CreatedAt: time.Now().UTC().Add(-2 * time.Hour)},
+			{ID: 22, CredentialID: "cred-b", CreatedAt: time.Now().UTC().Add(-1 * time.Hour)},
+		},
+		sessions: []store.AdminSessionInfo{
+			{SessionID: "ok", CreatedAt: time.Now().UTC().Add(-1 * time.Hour), LastSeenAt: time.Now().UTC().Add(-1 * time.Minute), ExpiresAt: time.Now().UTC().Add(20 * time.Minute), Current: true},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	noToken := doUIRequest(t, e, http.MethodPost, "/admin/security/passkeys/21/delete", nil, auth.sessionCookies())
+	if noToken.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without csrf token, got %d body=%s", noToken.Code, noToken.Body.String())
+	}
+
+	recDelete := doUIRequest(t, e, http.MethodPost, "/admin/security/passkeys/21/delete", withCSRF(nil, csrfToken), cookies)
+	if recDelete.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on delete with csrf token, got %d body=%s", recDelete.Code, recDelete.Body.String())
+	}
+	if len(auth.passkeys) != 1 || auth.passkeys[0].ID != 22 {
+		t.Fatalf("expected passkey 21 to be deleted, remaining=%+v", auth.passkeys)
+	}
+
+	recLast := doUIRequest(t, e, http.MethodPost, "/admin/security/passkeys/22/delete", withCSRF(nil, csrfToken), cookies)
+	if recLast.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 on guarded delete attempt, got %d body=%s", recLast.Code, recLast.Body.String())
+	}
+	if len(auth.passkeys) != 1 || auth.passkeys[0].ID != 22 {
+		t.Fatalf("expected last passkey to stay untouched, remaining=%+v", auth.passkeys)
+	}
+}
+
+func TestSecuritySessionLogoutAndLogoutOthersWithCSRF(t *testing.T) {
+	auth := &fakeUIAuth{
+		passkeys: []store.AdminCredentialInfo{
+			{ID: 31, CredentialID: "cred-a", CreatedAt: time.Now().UTC().Add(-1 * time.Hour)},
+			{ID: 32, CredentialID: "cred-b", CreatedAt: time.Now().UTC().Add(-30 * time.Minute)},
+		},
+		sessions: []store.AdminSessionInfo{
+			{
+				SessionID:  "ok",
+				CreatedAt:  time.Now().UTC().Add(-1 * time.Hour),
+				LastSeenAt: time.Now().UTC().Add(-2 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(20 * time.Minute),
+				Current:    true,
+			},
+			{
+				SessionID:  "sess-2",
+				CreatedAt:  time.Now().UTC().Add(-40 * time.Minute),
+				LastSeenAt: time.Now().UTC().Add(-3 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(18 * time.Minute),
+				Current:    false,
+			},
+			{
+				SessionID:  "sess-3",
+				CreatedAt:  time.Now().UTC().Add(-20 * time.Minute),
+				LastSeenAt: time.Now().UTC().Add(-1 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(25 * time.Minute),
+				Current:    false,
+			},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	noToken := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/sess-2/logout", nil, auth.sessionCookies())
+	if noToken.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without csrf token, got %d body=%s", noToken.Code, noToken.Body.String())
+	}
+
+	recOne := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/sess-2/logout", withCSRF(nil, csrfToken), cookies)
+	if recOne.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 for single session logout, got %d body=%s", recOne.Code, recOne.Body.String())
+	}
+	if len(auth.sessions) != 2 {
+		t.Fatalf("expected one session removed, sessions=%+v", auth.sessions)
+	}
+
+	recOthers := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/logout-others", withCSRF(nil, csrfToken), cookies)
+	if recOthers.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 for logout others, got %d body=%s", recOthers.Code, recOthers.Body.String())
+	}
+	if len(auth.sessions) != 1 || !auth.sessions[0].Current || auth.sessions[0].SessionID != "ok" {
+		t.Fatalf("expected only current session to remain, sessions=%+v", auth.sessions)
+	}
+}
+
 func TestCreateClientCSRFMissingTokenRejected(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -743,6 +893,8 @@ func responseCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
 type fakeUIAuth struct {
 	logoutCalled bool
 	user         store.AdminUser
+	passkeys     []store.AdminCredentialInfo
+	sessions     []store.AdminSessionInfo
 }
 
 func (a *fakeUIAuth) SessionUser(c echo.Context) (*store.AdminUser, bool) {
@@ -763,6 +915,102 @@ func (a *fakeUIAuth) LogoutSession(c echo.Context) error {
 	a.logoutCalled = true
 	c.SetCookie(&http.Cookie{Name: "admin_session", Value: "", Path: "/admin", MaxAge: -1})
 	return nil
+}
+
+func (a *fakeUIAuth) ListPasskeys(c echo.Context) ([]store.AdminCredentialInfo, error) {
+	out := make([]store.AdminCredentialInfo, 0, len(a.passkeys))
+	for _, item := range a.passkeys {
+		copyItem := item
+		if item.LastUsedAt != nil {
+			ts := item.LastUsedAt.UTC()
+			copyItem.LastUsedAt = &ts
+		}
+		copyItem.Transports = append([]string(nil), item.Transports...)
+		out = append(out, copyItem)
+	}
+	return out, nil
+}
+
+func (a *fakeUIAuth) DeletePasskey(c echo.Context, credentialID int64) error {
+	if credentialID <= 0 {
+		return store.ErrAdminCredentialNotFound
+	}
+	if len(a.passkeys) <= 1 {
+		return store.ErrAdminCredentialLast
+	}
+	idx := -1
+	for i, item := range a.passkeys {
+		if item.ID == credentialID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return store.ErrAdminCredentialNotFound
+	}
+	a.passkeys = append(a.passkeys[:idx], a.passkeys[idx+1:]...)
+	return nil
+}
+
+func (a *fakeUIAuth) CurrentSessionID(c echo.Context) (string, bool) {
+	for _, item := range a.sessions {
+		if item.Current {
+			return strings.TrimSpace(item.SessionID), true
+		}
+	}
+	return "ok", true
+}
+
+func (a *fakeUIAuth) ListSessions(c echo.Context) ([]store.AdminSessionInfo, error) {
+	out := make([]store.AdminSessionInfo, 0, len(a.sessions))
+	for _, item := range a.sessions {
+		copyItem := item
+		out = append(out, copyItem)
+	}
+	return out, nil
+}
+
+func (a *fakeUIAuth) LogoutSessionByID(c echo.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("invalid session id")
+	}
+	idx := -1
+	wasCurrent := false
+	for i, item := range a.sessions {
+		if strings.TrimSpace(item.SessionID) == sessionID {
+			idx = i
+			wasCurrent = item.Current
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("session not found")
+	}
+	a.sessions = append(a.sessions[:idx], a.sessions[idx+1:]...)
+	if wasCurrent {
+		c.SetCookie(&http.Cookie{Name: "admin_session", Value: "", Path: "/admin", MaxAge: -1})
+	}
+	return nil
+}
+
+func (a *fakeUIAuth) LogoutOtherSessions(c echo.Context) (int, error) {
+	currentID, ok := a.CurrentSessionID(c)
+	if !ok {
+		return 0, errors.New("missing current session")
+	}
+	filtered := make([]store.AdminSessionInfo, 0, len(a.sessions))
+	removed := 0
+	for _, item := range a.sessions {
+		if strings.TrimSpace(item.SessionID) == currentID {
+			item.Current = true
+			filtered = append(filtered, item)
+			continue
+		}
+		removed++
+	}
+	a.sessions = filtered
+	return removed, nil
 }
 
 func (a *fakeUIAuth) RequireSessionMiddleware(loginPath string) echo.MiddlewareFunc {

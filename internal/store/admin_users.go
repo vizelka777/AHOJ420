@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,7 @@ var (
 	ErrAdminUserNotFound       = errors.New("admin user not found")
 	ErrAdminCredentialNotFound = errors.New("admin credential not found")
 	ErrAdminUserDisabled       = errors.New("admin user is disabled")
+	ErrAdminCredentialLast     = errors.New("cannot delete last admin credential")
 )
 
 type AdminUser struct {
@@ -26,6 +28,14 @@ type AdminUser struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	Credentials []webauthn.Credential
+}
+
+type AdminCredentialInfo struct {
+	ID           int64
+	CredentialID string
+	CreatedAt    time.Time
+	LastUsedAt   *time.Time
+	Transports   []string
 }
 
 func (u *AdminUser) WebAuthnID() []byte {
@@ -242,6 +252,116 @@ func (s *Store) UpdateAdminCredential(credential *webauthn.Credential) error {
 	return nil
 }
 
+func (s *Store) ListAdminCredentials(adminUserID string) ([]AdminCredentialInfo, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return nil, ErrAdminUserNotFound
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, credential_id, created_at, last_used_at, transports
+		FROM admin_credentials
+		WHERE admin_user_id = $1
+		ORDER BY created_at ASC, id ASC
+	`, adminUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]AdminCredentialInfo, 0, 4)
+	for rows.Next() {
+		var (
+			item         AdminCredentialInfo
+			credentialID []byte
+			lastUsedAt   sql.NullTime
+			transports   pq.StringArray
+		)
+		if err := rows.Scan(&item.ID, &credentialID, &item.CreatedAt, &lastUsedAt, &transports); err != nil {
+			return nil, err
+		}
+		item.CredentialID = encodeCredentialDisplayID(credentialID)
+		if lastUsedAt.Valid {
+			value := lastUsedAt.Time.UTC()
+			item.LastUsedAt = &value
+		}
+		item.Transports = make([]string, 0, len(transports))
+		for _, transport := range transports {
+			trimmed := strings.TrimSpace(transport)
+			if trimmed == "" {
+				continue
+			}
+			item.Transports = append(item.Transports, trimmed)
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) CountAdminCredentialsForUser(adminUserID string) (int, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return 0, ErrAdminUserNotFound
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admin_credentials WHERE admin_user_id = $1`, adminUserID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) DeleteAdminCredential(adminUserID string, credentialID int64) error {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return ErrAdminUserNotFound
+	}
+	if credentialID <= 0 {
+		return ErrAdminCredentialNotFound
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists bool
+	if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM admin_users WHERE id = $1)`, adminUserID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrAdminUserNotFound
+	}
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM admin_credentials WHERE admin_user_id = $1`, adminUserID).Scan(&count); err != nil {
+		return err
+	}
+	if count <= 1 {
+		return ErrAdminCredentialLast
+	}
+
+	res, err := tx.Exec(`DELETE FROM admin_credentials WHERE id = $1 AND admin_user_id = $2`, credentialID, adminUserID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrAdminCredentialNotFound
+	}
+
+	if _, err := tx.Exec(`UPDATE admin_users SET updated_at = NOW() WHERE id = $1`, adminUserID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) listAdminCredentials(adminUserID string) ([]webauthn.Credential, error) {
 	rows, err := s.db.Query(`
 		SELECT credential_id, public_key, aaguid, sign_count, transports
@@ -292,4 +412,11 @@ func (s *Store) listAdminCredentials(adminUserID string) ([]webauthn.Credential,
 
 func normalizeAdminLogin(login string) string {
 	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func encodeCredentialDisplayID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
 }

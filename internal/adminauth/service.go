@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ const (
 	adminSessionCookieName      = "admin_session"
 	adminRegSessionCookieName   = "admin_reg_session_id"
 	adminLoginSessionCookieName = "admin_login_session_id"
+	adminAddPasskeyCookieName   = "admin_passkey_add_session_id"
 )
 
 var (
@@ -43,6 +45,9 @@ type adminStore interface {
 	GetAdminUserByCredentialID(credentialID []byte) (*store.AdminUser, error)
 	AddAdminCredential(adminUserID string, credential *webauthn.Credential) error
 	UpdateAdminCredential(credential *webauthn.Credential) error
+	ListAdminCredentials(adminUserID string) ([]store.AdminCredentialInfo, error)
+	DeleteAdminCredential(adminUserID string, credentialID int64) error
+	CountAdminCredentialsForUser(adminUserID string) (int, error)
 	CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error
 }
 
@@ -68,14 +73,19 @@ type registrationSession struct {
 }
 
 type sessionRecord struct {
-	AdminUserID  string `json:"admin_user_id"`
-	CreatedAtUTC int64  `json:"created_at_utc"`
+	AdminUserID   string `json:"admin_user_id"`
+	CreatedAtUTC  int64  `json:"created_at_utc"`
+	LastSeenAtUTC int64  `json:"last_seen_at_utc"`
+	RemoteIP      string `json:"remote_ip"`
+	UserAgent     string `json:"user_agent"`
 }
 
 type adminSessionStateStore interface {
 	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
 	Get(ctx context.Context, key string) ([]byte, error)
 	Del(ctx context.Context, key string) error
+	Keys(ctx context.Context, pattern string) ([]string, error)
+	TTL(ctx context.Context, key string) (time.Duration, error)
 }
 
 type redisAdminSessionStateStore struct {
@@ -99,6 +109,22 @@ func (s *redisAdminSessionStateStore) Get(ctx context.Context, key string) ([]by
 
 func (s *redisAdminSessionStateStore) Del(ctx context.Context, key string) error {
 	return s.client.Del(ctx, key).Err()
+}
+
+func (s *redisAdminSessionStateStore) Keys(ctx context.Context, pattern string) ([]string, error) {
+	out := make([]string, 0, 16)
+	iter := s.client.Scan(ctx, 0, strings.TrimSpace(pattern), 0).Iterator()
+	for iter.Next(ctx) {
+		out = append(out, strings.TrimSpace(iter.Val()))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *redisAdminSessionStateStore) TTL(ctx context.Context, key string) (time.Duration, error) {
+	return s.client.TTL(ctx, strings.TrimSpace(key)).Result()
 }
 
 func New(s *store.Store, r *redis.Client) (*Service, error) {
@@ -153,6 +179,8 @@ func RegisterRoutes(group *echo.Group, svc *Service) {
 	group.POST("/register/finish", svc.FinishRegistration)
 	group.POST("/login/begin", svc.BeginLogin)
 	group.POST("/login/finish", svc.FinishLogin)
+	group.POST("/passkeys/register/begin", svc.BeginAddPasskey)
+	group.POST("/passkeys/register/finish", svc.FinishAddPasskey)
 	group.POST("/logout", svc.Logout)
 }
 
@@ -411,6 +439,108 @@ func (s *Service) FinishLogin(c echo.Context) error {
 	})
 }
 
+func (s *Service) BeginAddPasskey(c echo.Context) error {
+	adminUser, _, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "unknown", "", "admin_credential", "", map[string]any{"error": "missing_session"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "admin session is required"})
+	}
+
+	options, session, err := s.wa.BeginRegistration(adminUser,
+		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+			ResidentKey:      protocol.ResidentKeyRequirementRequired,
+			UserVerification: protocol.VerificationRequired,
+		}),
+	)
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "begin_registration_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to begin passkey registration"})
+	}
+
+	sessionID, err := newRandomID()
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "session_id_generation_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to create registration session"})
+	}
+
+	payload, err := json.Marshal(registrationSession{
+		AdminUserID: adminUser.ID,
+		Session:     *session,
+	})
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "session_encode_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to encode registration session"})
+	}
+	if err := s.stateStore.Set(c.Request().Context(), adminAddPasskeyRedisKey(sessionID), payload, 5*time.Minute); err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "session_store_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to store registration session"})
+	}
+
+	setCookie(c, &http.Cookie{
+		Name:     adminAddPasskeyCookieName,
+		Value:    sessionID,
+		Path:     "/admin/auth",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   300,
+	})
+
+	return c.JSON(http.StatusOK, options)
+}
+
+func (s *Service) FinishAddPasskey(c echo.Context) error {
+	adminUser, _, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "unknown", "", "admin_credential", "", map[string]any{"error": "missing_session"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "admin session is required"})
+	}
+
+	addCookie, err := c.Cookie(adminAddPasskeyCookieName)
+	if err != nil || strings.TrimSpace(addCookie.Value) == "" {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "missing_registration_cookie"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "passkey registration session is missing"})
+	}
+
+	key := adminAddPasskeyRedisKey(strings.TrimSpace(addCookie.Value))
+	payload, err := s.stateStore.Get(c.Request().Context(), key)
+	if err != nil {
+		clearCookie(c, adminAddPasskeyCookieName, "/admin/auth")
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "registration_session_expired"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "passkey registration session expired"})
+	}
+	_ = s.stateStore.Del(c.Request().Context(), key)
+	clearCookie(c, adminAddPasskeyCookieName, "/admin/auth")
+
+	var reg registrationSession
+	if err := json.Unmarshal(payload, &reg); err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "registration_session_invalid"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "passkey registration session is invalid"})
+	}
+	if strings.TrimSpace(reg.AdminUserID) != strings.TrimSpace(adminUser.ID) {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "session_user_mismatch"})
+		return c.JSON(http.StatusForbidden, map[string]string{"message": "registration session does not belong to current admin"})
+	}
+
+	credential, err := s.wa.FinishRegistration(adminUser, reg.Session, c.Request())
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "finish_registration_failed"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "passkey verification failed"})
+	}
+
+	if err := s.store.AddAdminCredential(adminUser.ID, credential); err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.add.failure", false, "admin_user", adminUser.ID, "admin_credential", "", map[string]any{"error": "credential_store_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to store admin credential"})
+	}
+
+	credentialDisplayID := encodeCredentialID(credential.ID)
+	s.auditAdminAction(c, "admin.auth.passkey.add.success", true, "admin_user", adminUser.ID, "admin_credential", credentialDisplayID, map[string]any{"credential_id": credentialDisplayID})
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":        "ok",
+		"credential_id": credentialDisplayID,
+	})
+}
+
 func (s *Service) Logout(c echo.Context) error {
 	if err := s.LogoutSession(c); err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "not authenticated"})
@@ -436,6 +566,207 @@ func (s *Service) LogoutSession(c echo.Context) error {
 	return nil
 }
 
+func (s *Service) CurrentSessionID(c echo.Context) (string, bool) {
+	_, sessionID, err := s.sessionUser(c)
+	if err != nil || strings.TrimSpace(sessionID) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(sessionID), true
+}
+
+func (s *Service) ListPasskeys(c echo.Context) ([]store.AdminCredentialInfo, error) {
+	adminUser, _, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		return nil, errAdminSessionInvalid
+	}
+	return s.store.ListAdminCredentials(adminUser.ID)
+}
+
+func (s *Service) DeletePasskey(c echo.Context, credentialID int64) error {
+	adminUser, _, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.passkey.delete.failure", false, "unknown", "", "admin_credential", strconv.FormatInt(credentialID, 10), map[string]any{"error": "missing_session"})
+		return errAdminSessionInvalid
+	}
+	if credentialID <= 0 {
+		s.auditAdminAction(c, "admin.auth.passkey.delete.failure", false, "admin_user", adminUser.ID, "admin_credential", strconv.FormatInt(credentialID, 10), map[string]any{"error": "invalid_credential_id"})
+		return store.ErrAdminCredentialNotFound
+	}
+
+	if err := s.store.DeleteAdminCredential(adminUser.ID, credentialID); err != nil {
+		s.auditAdminAction(c, "admin.auth.passkey.delete.failure", false, "admin_user", adminUser.ID, "admin_credential", strconv.FormatInt(credentialID, 10), map[string]any{"error": securityErrorCode(err)})
+		return err
+	}
+
+	s.auditAdminAction(c, "admin.auth.passkey.delete.success", true, "admin_user", adminUser.ID, "admin_credential", strconv.FormatInt(credentialID, 10), map[string]any{"credential_id": credentialID})
+	return nil
+}
+
+func (s *Service) ListSessions(c echo.Context) ([]store.AdminSessionInfo, error) {
+	adminUser, currentSessionID, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		return nil, errAdminSessionInvalid
+	}
+	return s.listAdminSessions(c.Request().Context(), adminUser.ID, currentSessionID)
+}
+
+func (s *Service) LogoutSessionByID(c echo.Context, sessionID string) error {
+	adminUser, currentSessionID, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.session.logout.failure", false, "unknown", "", "admin_session", strings.TrimSpace(sessionID), map[string]any{"error": "missing_session"})
+		return errAdminSessionInvalid
+	}
+
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		s.auditAdminAction(c, "admin.auth.session.logout.failure", false, "admin_user", adminUser.ID, "admin_session", "", map[string]any{"error": "invalid_session_id"})
+		return errAdminSessionInvalid
+	}
+
+	record, _, err := s.loadSessionRecord(c.Request().Context(), sessionID)
+	if err != nil || strings.TrimSpace(record.AdminUserID) != strings.TrimSpace(adminUser.ID) {
+		s.auditAdminAction(c, "admin.auth.session.logout.failure", false, "admin_user", adminUser.ID, "admin_session", sessionID, map[string]any{"error": "session_not_found"})
+		return errAdminSessionInvalid
+	}
+
+	if err := s.stateStore.Del(c.Request().Context(), adminSessionRedisKey(sessionID)); err != nil {
+		s.auditAdminAction(c, "admin.auth.session.logout.failure", false, "admin_user", adminUser.ID, "admin_session", sessionID, map[string]any{"error": "session_delete_failed"})
+		return err
+	}
+	if sessionID == currentSessionID {
+		clearCookie(c, adminSessionCookieName, "/admin")
+	}
+
+	s.auditAdminAction(c, "admin.auth.session.logout.success", true, "admin_user", adminUser.ID, "admin_session", sessionID, map[string]any{"current": sessionID == currentSessionID})
+	return nil
+}
+
+func (s *Service) LogoutOtherSessions(c echo.Context) (int, error) {
+	adminUser, currentSessionID, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.session.logout_others.failure", false, "unknown", "", "admin_session", "", map[string]any{"error": "missing_session"})
+		return 0, errAdminSessionInvalid
+	}
+
+	sessions, err := s.listAdminSessions(c.Request().Context(), adminUser.ID, currentSessionID)
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.session.logout_others.failure", false, "admin_user", adminUser.ID, "admin_session", "", map[string]any{"error": "session_list_failed"})
+		return 0, err
+	}
+
+	removed := 0
+	for _, session := range sessions {
+		if session.Current {
+			continue
+		}
+		if err := s.stateStore.Del(c.Request().Context(), adminSessionRedisKey(session.SessionID)); err != nil {
+			s.auditAdminAction(c, "admin.auth.session.logout_others.failure", false, "admin_user", adminUser.ID, "admin_session", session.SessionID, map[string]any{"error": "session_delete_failed"})
+			return removed, err
+		}
+		removed++
+	}
+
+	s.auditAdminAction(c, "admin.auth.session.logout_others.success", true, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"removed_count": removed})
+	return removed, nil
+}
+
+func (s *Service) listAdminSessions(ctx context.Context, adminUserID string, currentSessionID string) ([]store.AdminSessionInfo, error) {
+	adminUserID = strings.TrimSpace(adminUserID)
+	if adminUserID == "" {
+		return nil, errAdminSessionInvalid
+	}
+
+	keys, err := s.stateStore.Keys(ctx, adminSessionRedisKey("*"))
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	out := make([]store.AdminSessionInfo, 0, len(keys))
+	for _, key := range keys {
+		sessionID := strings.TrimPrefix(strings.TrimSpace(key), "admin:sess:")
+		if sessionID == "" {
+			continue
+		}
+
+		record, ttl, err := s.loadSessionRecord(ctx, sessionID)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(record.AdminUserID) != adminUserID {
+			continue
+		}
+		createdAt := time.Unix(record.CreatedAtUTC, 0).UTC()
+		lastSeenAt := createdAt
+		if record.LastSeenAtUTC > 0 {
+			lastSeenAt = time.Unix(record.LastSeenAtUTC, 0).UTC()
+		}
+
+		expiresAt := createdAt.Add(s.sessionAbsoluteTTL)
+		if ttl > 0 {
+			idleExpiresAt := now.Add(ttl).UTC()
+			if idleExpiresAt.Before(expiresAt) {
+				expiresAt = idleExpiresAt
+			}
+		}
+
+		out = append(out, store.AdminSessionInfo{
+			SessionID:  sessionID,
+			CreatedAt:  createdAt,
+			LastSeenAt: lastSeenAt,
+			ExpiresAt:  expiresAt,
+			RemoteIP:   strings.TrimSpace(record.RemoteIP),
+			UserAgent:  strings.TrimSpace(record.UserAgent),
+			Current:    strings.TrimSpace(currentSessionID) == sessionID,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Current != out[j].Current {
+			return out[i].Current
+		}
+		if out[i].LastSeenAt.Equal(out[j].LastSeenAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].LastSeenAt.After(out[j].LastSeenAt)
+	})
+	return out, nil
+}
+
+func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sessionRecord, time.Duration, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return sessionRecord{}, 0, errAdminSessionInvalid
+	}
+
+	key := adminSessionRedisKey(sessionID)
+	payload, err := s.stateStore.Get(ctx, key)
+	if err != nil {
+		return sessionRecord{}, 0, err
+	}
+
+	var record sessionRecord
+	if err := json.Unmarshal(payload, &record); err != nil {
+		_ = s.stateStore.Del(ctx, key)
+		return sessionRecord{}, 0, err
+	}
+	record.AdminUserID = strings.TrimSpace(record.AdminUserID)
+	if record.AdminUserID == "" || record.CreatedAtUTC <= 0 {
+		_ = s.stateStore.Del(ctx, key)
+		return sessionRecord{}, 0, errAdminSessionInvalid
+	}
+	if record.LastSeenAtUTC <= 0 {
+		record.LastSeenAtUTC = record.CreatedAtUTC
+	}
+	record.RemoteIP = strings.TrimSpace(record.RemoteIP)
+	record.UserAgent = strings.TrimSpace(record.UserAgent)
+
+	ttl, err := s.stateStore.TTL(ctx, key)
+	if err != nil {
+		ttl = 0
+	}
+	return record, ttl, nil
+}
+
 func (s *Service) sessionUser(c echo.Context) (*store.AdminUser, string, error) {
 	cookie, err := c.Cookie(adminSessionCookieName)
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
@@ -459,6 +790,11 @@ func (s *Service) sessionUser(c echo.Context) (*store.AdminUser, string, error) 
 		_ = s.stateStore.Del(c.Request().Context(), key)
 		return nil, "", errAdminSessionInvalid
 	}
+	if record.LastSeenAtUTC <= 0 {
+		record.LastSeenAtUTC = record.CreatedAtUTC
+	}
+	record.RemoteIP = strings.TrimSpace(record.RemoteIP)
+	record.UserAgent = strings.TrimSpace(record.UserAgent)
 
 	createdAt := time.Unix(record.CreatedAtUTC, 0).UTC()
 	if time.Since(createdAt) > s.sessionAbsoluteTTL {
@@ -474,7 +810,18 @@ func (s *Service) sessionUser(c echo.Context) (*store.AdminUser, string, error) 
 		return nil, "", errAdminSessionInvalid
 	}
 
-	if err := s.stateStore.Set(c.Request().Context(), key, payload, s.sessionIdleTTL); err != nil {
+	record.LastSeenAtUTC = time.Now().UTC().Unix()
+	if realIP := strings.TrimSpace(c.RealIP()); realIP != "" {
+		record.RemoteIP = realIP
+	}
+	if ua := strings.TrimSpace(c.Request().UserAgent()); ua != "" {
+		record.UserAgent = ua
+	}
+	updatedPayload, err := json.Marshal(record)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.stateStore.Set(c.Request().Context(), key, updatedPayload, s.sessionIdleTTL); err != nil {
 		return nil, "", err
 	}
 	setCookie(c, &http.Cookie{
@@ -495,9 +842,13 @@ func (s *Service) setSession(c echo.Context, adminUserID string) (string, error)
 	if err != nil {
 		return "", err
 	}
+	now := time.Now().UTC()
 	record := sessionRecord{
-		AdminUserID:  strings.TrimSpace(adminUserID),
-		CreatedAtUTC: time.Now().UTC().Unix(),
+		AdminUserID:   strings.TrimSpace(adminUserID),
+		CreatedAtUTC:  now.Unix(),
+		LastSeenAtUTC: now.Unix(),
+		RemoteIP:      strings.TrimSpace(c.RealIP()),
+		UserAgent:     strings.TrimSpace(c.Request().UserAgent()),
 	}
 	payload, err := json.Marshal(record)
 	if err != nil {
@@ -550,17 +901,21 @@ func (s *Service) ensureBootstrapUser() (*store.AdminUser, error) {
 }
 
 func (s *Service) auditAuth(c echo.Context, action string, success bool, actorType string, actorID string, details map[string]any) {
+	s.auditAdminAction(c, action, success, actorType, actorID, "admin_user", actorID, details)
+}
+
+func (s *Service) auditAdminAction(c echo.Context, action string, success bool, actorType string, actorID string, resourceType string, resourceID string, details map[string]any) {
 	if s.store == nil {
 		return
 	}
 
 	detailsJSON := map[string]any{}
 	for key, value := range details {
-		trimmed := strings.TrimSpace(key)
+		trimmed := strings.ToLower(strings.TrimSpace(key))
 		if trimmed == "" {
 			continue
 		}
-		if strings.Contains(trimmed, "secret") || strings.Contains(trimmed, "authorization") {
+		if strings.Contains(trimmed, "secret") || strings.Contains(trimmed, "authorization") || strings.Contains(trimmed, "token") {
 			continue
 		}
 		detailsJSON[trimmed] = value
@@ -571,18 +926,36 @@ func (s *Service) auditAuth(c echo.Context, action string, success bool, actorTy
 	}
 
 	entry := store.AdminAuditEntry{
-		Action:       action,
+		Action:       strings.TrimSpace(action),
 		Success:      success,
 		ActorType:    defaultString(strings.TrimSpace(actorType), "unknown"),
 		ActorID:      strings.TrimSpace(actorID),
 		RemoteIP:     strings.TrimSpace(c.RealIP()),
 		RequestID:    requestID(c),
-		ResourceType: "admin_user",
-		ResourceID:   strings.TrimSpace(actorID),
+		ResourceType: defaultString(strings.TrimSpace(resourceType), "admin_user"),
+		ResourceID:   strings.TrimSpace(resourceID),
 		DetailsJSON:  payload,
 	}
 	if err := s.store.CreateAdminAuditEntry(c.Request().Context(), entry); err != nil {
-		log.Printf("admin auth audit insert failed action=%s actor_type=%s actor_id=%s error=%v", action, entry.ActorType, entry.ActorID, err)
+		log.Printf("admin auth audit insert failed action=%s actor_type=%s actor_id=%s resource_type=%s resource_id=%s error=%v", entry.Action, entry.ActorType, entry.ActorID, entry.ResourceType, entry.ResourceID, err)
+	}
+}
+
+func securityErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, store.ErrAdminCredentialNotFound):
+		return "admin_credential_not_found"
+	case errors.Is(err, store.ErrAdminCredentialLast):
+		return "last_admin_credential"
+	case errors.Is(err, store.ErrAdminUserNotFound):
+		return "admin_user_not_found"
+	case errors.Is(err, errAdminSessionInvalid):
+		return "admin_session_invalid"
+	default:
+		return "internal_error"
 	}
 }
 
@@ -613,8 +986,19 @@ func adminLoginRedisKey(id string) string {
 	return "admin:login:" + strings.TrimSpace(id)
 }
 
+func adminAddPasskeyRedisKey(id string) string {
+	return "admin:passkey:add:" + strings.TrimSpace(id)
+}
+
 func adminSessionRedisKey(id string) string {
 	return "admin:sess:" + strings.TrimSpace(id)
+}
+
+func encodeCredentialID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func setCookie(c echo.Context, cookie *http.Cookie) {

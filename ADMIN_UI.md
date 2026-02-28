@@ -7,6 +7,7 @@ Internal server-rendered admin panel for OIDC client management.
 - session-only auth (`admin_session` cookie)
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - passkey login via `/admin/auth/login/*`
+- admin self-security page (`/admin/security`) for passkeys + sessions
 - no token fallback for browser UI routes
 - no dynamic registration / no self-service onboarding
 
@@ -17,7 +18,11 @@ Public:
 Protected (admin session required):
 - `GET /admin/`
 - `GET /admin/audit`
+- `GET /admin/security`
 - `POST /admin/logout`
+- `POST /admin/security/passkeys/:id/delete`
+- `POST /admin/security/sessions/:id/logout`
+- `POST /admin/security/sessions/logout-others`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
 - `POST /admin/clients/new`
@@ -38,6 +43,24 @@ Protected (admin session required):
   - cryptographically random token is generated server-side (`admin_csrf`, Secure, HttpOnly, SameSite=Strict, Path=/admin)
   - token is injected into templates via shared `layoutData.CSRFToken`
   - all mutating forms include `<input type="hidden" name="csrf_token" ...>`
+
+## Admin security page (`/admin/security`)
+- passkeys:
+  - lists current admin credentials (safe display ID + metadata)
+  - add passkey flow for logged-in admin via:
+    - `POST /admin/auth/passkeys/register/begin`
+    - `POST /admin/auth/passkeys/register/finish`
+  - delete passkey via CSRF-protected form
+  - last remaining passkey cannot be deleted
+- sessions:
+  - lists active admin sessions from session state store (created/last_seen/expires/ip/user-agent/current)
+  - sign out one session (including current session)
+  - sign out all other sessions (current remains)
+- audit actions emitted:
+  - `admin.auth.passkey.add.success|failure`
+  - `admin.auth.passkey.delete.success|failure`
+  - `admin.auth.session.logout.success|failure`
+  - `admin.auth.session.logout_others.success|failure`
 
 ## One-time secret reveal
 When creating a secret with `Generate secret automatically`:
@@ -63,6 +86,7 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/login.html`
 - `web/templates/admin/index.html`
 - `web/templates/admin/audit.html`
+- `web/templates/admin/security.html`
 - `web/templates/admin/clients_list.html`
 - `web/templates/admin/client_detail.html`
 - `web/templates/admin/client_new.html`

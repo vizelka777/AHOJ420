@@ -242,6 +242,8 @@ Admin auth endpoints (`/admin/auth`):
 - `POST /admin/auth/register/finish`
 - `POST /admin/auth/login/begin`
 - `POST /admin/auth/login/finish`
+- `POST /admin/auth/passkeys/register/begin` (logged-in admin adds extra passkey)
+- `POST /admin/auth/passkeys/register/finish` (logged-in admin adds extra passkey)
 - `POST /admin/auth/logout`
 
 Admin OIDC client endpoints (`/admin/api/oidc/clients`):
@@ -258,6 +260,7 @@ Admin HTML UI routes (`/admin/*`):
 - `POST /admin/logout`
 - `GET /admin/`
 - `GET /admin/audit`
+- `GET /admin/security`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
 - `POST /admin/clients/new`
@@ -269,6 +272,9 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/clients/:id/secrets/new`
 - `POST /admin/clients/:id/secrets`
 - `POST /admin/clients/:id/secrets/:secretID/revoke`
+- `POST /admin/security/passkeys/:id/delete`
+- `POST /admin/security/sessions/:id/logout`
+- `POST /admin/security/sessions/logout-others`
 
 Authentication and protection:
 - primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
@@ -294,6 +300,10 @@ Security behavior:
 - `plain_secret` is returned one-time only in `POST .../secrets` when `generate=true`
 - generated secret in HTML UI is shown one-time on the immediate success page and never persisted for later reads
 - admin audit viewer (`GET /admin/audit`) is read-only and redacts sensitive keys from rendered `details_json`
+- admin security page (`GET /admin/security`) is read-only for inventory and CSRF-protected for all mutations
+  - admin can add a second passkey while already logged in (`/admin/auth/passkeys/register/*`)
+  - last remaining admin passkey cannot be deleted
+  - admin can sign out one session or all other sessions
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
 - admin requests include `X-Request-ID`
