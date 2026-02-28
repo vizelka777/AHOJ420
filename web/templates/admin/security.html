@@ -37,7 +37,7 @@
               <td class="mono">{{formatTimePtr .LastUsedAt}}</td>
               <td>{{if .Transports}}{{joinComma .Transports}}{{else}}-{{end}}</td>
               <td>
-                <form method="post" action="/admin/security/passkeys/{{.ID}}/delete" style="margin:0;">
+                <form method="post" action="/admin/security/passkeys/{{.ID}}/delete" style="margin:0;" data-require-reauth="1">
                   <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                   <button type="submit" class="warn">Delete</button>
                 </form>
@@ -60,7 +60,7 @@
       <h2 style="margin:0;">Active Sessions</h2>
       <p class="hint" style="margin:6px 0 0;">You can sign out one session or all other sessions.</p>
     </div>
-    <form method="post" action="/admin/security/sessions/logout-others" style="margin:0;">
+    <form method="post" action="/admin/security/sessions/logout-others" style="margin:0;" data-require-reauth="1">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <button type="submit" class="secondary">Sign out other sessions</button>
     </form>
@@ -93,7 +93,7 @@
               <td class="mono">{{.RemoteIP}}</td>
               <td>{{.UserAgent}}</td>
               <td>
-                <form method="post" action="/admin/security/sessions/{{.SessionID}}/logout" style="margin:0;">
+                <form method="post" action="/admin/security/sessions/{{.SessionID}}/logout" style="margin:0;" data-require-reauth="1" data-reauth-check="logout-other-session" data-session-current="{{if .Current}}1{{else}}0{{end}}">
                   <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                   <button type="submit" class="{{if .Current}}warn{{else}}secondary{{end}}">
                     {{if .Current}}Sign out this session{{else}}Sign out{{end}}

@@ -8,6 +8,7 @@ Internal server-rendered admin panel for OIDC client management.
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - passkey login via `/admin/auth/login/*`
 - admin self-security page (`/admin/security`) for passkeys + sessions
+- step-up re-auth for sensitive actions (recent passkey assertion required)
 - no token fallback for browser UI routes
 - no dynamic registration / no self-service onboarding
 
@@ -43,6 +44,24 @@ Protected (admin session required):
   - cryptographically random token is generated server-side (`admin_csrf`, Secure, HttpOnly, SameSite=Strict, Path=/admin)
   - token is injected into templates via shared `layoutData.CSRFToken`
   - all mutating forms include `<input type="hidden" name="csrf_token" ...>`
+
+## Step-up re-authentication
+- endpoints:
+  - `POST /admin/auth/reauth/begin`
+  - `POST /admin/auth/reauth/finish`
+- re-auth state is stored in admin session record as `recent_auth_at_utc`
+- default TTL for recent re-auth is `5m` (`ADMIN_REAUTH_TTL_MINUTES`, default `5`)
+- sensitive actions require fresh re-auth and return `403` when missing/expired (`recent admin re-auth required`, code `admin_reauth_required` for JSON requests)
+- sensitive actions covered:
+  - create confidential OIDC client
+  - disable OIDC client
+  - add OIDC client secret
+  - revoke OIDC client secret
+  - delete admin passkey
+  - logout other admin sessions
+- audit actions:
+  - `admin.auth.reauth.success`
+  - `admin.auth.reauth.failure`
 
 ## Admin security page (`/admin/security`)
 - passkeys:

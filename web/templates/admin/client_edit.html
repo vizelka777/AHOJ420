@@ -14,7 +14,7 @@
     <dl class="kv"><dt>Updated at</dt><dd class="mono">{{formatTime .UpdatedAt}}</dd></dl>
   </div>
 
-  <form method="post" action="/admin/clients/{{.ClientID}}/edit">
+  <form method="post" action="/admin/clients/{{.ClientID}}/edit" data-require-reauth="1" data-reauth-check="disable-client" data-client-enabled="{{if .OriginalEnabled}}1{{else}}0{{end}}">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <div class="row">
       <div>

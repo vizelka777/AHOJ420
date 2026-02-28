@@ -114,6 +114,110 @@ func TestAdminLoginBeginFinishIssuesAdminSessionCookie(t *testing.T) {
 	}
 }
 
+func TestAdminReauthBeginFinishUpdatesRecentAuthAndAudits(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-reauth"),
+		PublicKey: []byte("pk-reauth"),
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+
+	wa := &fakeWebAuthn{
+		beginLoginSession: &webauthn.SessionData{Challenge: "reauth-challenge"},
+		finishLoginRawID:  []byte("cred-reauth"),
+		finishLoginCredential: &webauthn.Credential{
+			ID: []byte("cred-reauth"),
+			Authenticator: webauthn.Authenticator{
+				SignCount: 10,
+			},
+		},
+	}
+	svc := newTestAdminAuthService(st, wa)
+	e := echo.New()
+	e.POST("/admin/auth/reauth/begin", svc.BeginReauth)
+	e.POST("/admin/auth/reauth/finish", svc.FinishReauth)
+
+	adminSession := issueAdminSessionCookie(t, svc, adminUser.ID)
+	overwriteSessionRecentAuth(t, svc, adminSession.Value, time.Now().UTC().Add(-20*time.Minute).Unix())
+
+	beginRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/reauth/begin", nil, []*http.Cookie{adminSession}, "")
+	if beginRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on reauth begin, got %d body=%s", beginRec.Code, beginRec.Body.String())
+	}
+	reauthCookie := responseCookie(beginRec, adminReauthSessionCookieName)
+	if reauthCookie == nil || strings.TrimSpace(reauthCookie.Value) == "" {
+		t.Fatalf("expected %s cookie on reauth begin", adminReauthSessionCookieName)
+	}
+
+	before := time.Now().UTC().Unix()
+	finishRec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/reauth/finish", nil, []*http.Cookie{adminSession, reauthCookie}, "")
+	if finishRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on reauth finish, got %d body=%s", finishRec.Code, finishRec.Body.String())
+	}
+
+	record := readSessionRecordForTest(t, svc, adminSession.Value)
+	if record.RecentAuthAtUTC < before {
+		t.Fatalf("expected RecentAuthAtUTC to be refreshed, got %d before=%d", record.RecentAuthAtUTC, before)
+	}
+
+	if !auditActionExists(st.auditEntries, "admin.auth.reauth.success", true) {
+		t.Fatalf("expected admin.auth.reauth.success audit entry")
+	}
+}
+
+func TestAdminReauthFailureWritesAudit(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if err := st.AddAdminCredential(adminUser.ID, &webauthn.Credential{
+		ID:        []byte("cred-reauth-fail"),
+		PublicKey: []byte("pk-reauth-fail"),
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{})
+	e := echo.New()
+	e.POST("/admin/auth/reauth/finish", svc.FinishReauth)
+
+	adminSession := issueAdminSessionCookie(t, svc, adminUser.ID)
+	rec := doAdminAuthRequest(t, e, http.MethodPost, "/admin/auth/reauth/finish", nil, []*http.Cookie{adminSession}, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on reauth finish without cookie, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !auditActionExists(st.auditEntries, "admin.auth.reauth.failure", false) {
+		t.Fatalf("expected admin.auth.reauth.failure audit entry")
+	}
+}
+
+func TestHasRecentReauthHonorsTTL(t *testing.T) {
+	st := newFakeAdminStore()
+	adminUser, err := st.CreateAdminUser("owner", "Owner")
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	svc := newTestAdminAuthService(st, &fakeWebAuthn{})
+	adminSession := issueAdminSessionCookie(t, svc, adminUser.ID)
+
+	ctx := newAdminAuthContext(t, http.MethodGet, "/admin/security", []*http.Cookie{adminSession})
+	if !svc.HasRecentReauth(ctx, 5*time.Minute) {
+		t.Fatalf("expected fresh session to be treated as recently reauthenticated")
+	}
+
+	overwriteSessionRecentAuth(t, svc, adminSession.Value, time.Now().UTC().Add(-15*time.Minute).Unix())
+	ctxExpired := newAdminAuthContext(t, http.MethodGet, "/admin/security", []*http.Cookie{adminSession})
+	if svc.HasRecentReauth(ctxExpired, 5*time.Minute) {
+		t.Fatalf("expected expired reauth to be rejected")
+	}
+}
+
 func TestProtectedAdminAPIRequiresSessionAndHostGuard(t *testing.T) {
 	st := newFakeAdminStore()
 	adminUser, err := st.CreateAdminUser("owner", "Owner")
@@ -469,6 +573,32 @@ func newAdminAuthContext(t *testing.T, method string, path string, cookies []*ht
 	}
 	rec := httptest.NewRecorder()
 	return e.NewContext(req, rec)
+}
+
+func readSessionRecordForTest(t *testing.T, svc *Service, sessionID string) sessionRecord {
+	t.Helper()
+	payload, err := svc.stateStore.Get(context.Background(), adminSessionRedisKey(strings.TrimSpace(sessionID)))
+	if err != nil {
+		t.Fatalf("get session payload failed: %v", err)
+	}
+	var record sessionRecord
+	if err := json.Unmarshal(payload, &record); err != nil {
+		t.Fatalf("unmarshal session record failed: %v", err)
+	}
+	return record
+}
+
+func overwriteSessionRecentAuth(t *testing.T, svc *Service, sessionID string, recentAuthAtUTC int64) {
+	t.Helper()
+	record := readSessionRecordForTest(t, svc, sessionID)
+	record.RecentAuthAtUTC = recentAuthAtUTC
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal session record failed: %v", err)
+	}
+	if err := svc.stateStore.Set(context.Background(), adminSessionRedisKey(strings.TrimSpace(sessionID)), payload, svc.sessionIdleTTL); err != nil {
+		t.Fatalf("set session payload failed: %v", err)
+	}
 }
 
 func doAdminAuthRequest(t *testing.T, e *echo.Echo, method string, path string, payload any, cookies []*http.Cookie, host string) *httptest.ResponseRecorder {

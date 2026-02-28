@@ -7,7 +7,7 @@
     <div class="error">{{.Error}}</div>
   {{end}}
 
-  <form method="post" action="/admin/clients/new">
+  <form method="post" action="/admin/clients/new" data-require-reauth="1" data-reauth-check="create-confidential-client">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <div class="row">
       <div>

@@ -55,6 +55,8 @@ type SessionAuth interface {
 	LogoutSession(c echo.Context) error
 	ListPasskeys(c echo.Context) ([]store.AdminCredentialInfo, error)
 	DeletePasskey(c echo.Context, credentialID int64) error
+	ReauthMaxAge() time.Duration
+	HasRecentReauth(c echo.Context, maxAge time.Duration) bool
 	CurrentSessionID(c echo.Context) (string, bool)
 	ListSessions(c echo.Context) ([]store.AdminSessionInfo, error)
 	LogoutSessionByID(c echo.Context, sessionID string) error
@@ -77,10 +79,11 @@ type flashMessage struct {
 }
 
 type layoutData struct {
-	Title     string
-	Admin     *store.AdminUser
-	Flash     *flashMessage
-	CSRFToken string
+	Title            string
+	Admin            *store.AdminUser
+	Flash            *flashMessage
+	CSRFToken        string
+	ReauthTTLSeconds int
 }
 
 type dashboardSummary struct {
@@ -167,13 +170,14 @@ type clientCreatePageData struct {
 
 type clientEditPageData struct {
 	layoutData
-	ClientID      string
-	Confidential  bool
-	Form          clientFormData
-	Error         string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	RedirectCount int
+	ClientID        string
+	Confidential    bool
+	OriginalEnabled bool
+	Form            clientFormData
+	Error           string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	RedirectCount   int
 }
 
 type redirectURIsPageData struct {
@@ -402,6 +406,10 @@ func (h *Handler) SecurityPage(c echo.Context) error {
 }
 
 func (h *Handler) SecurityPasskeyDelete(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
 	credentialID, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
 	if err != nil || credentialID <= 0 {
 		h.setFlash(c, "error", "Invalid passkey ID")
@@ -432,6 +440,12 @@ func (h *Handler) SecuritySessionLogout(c echo.Context) error {
 	}
 
 	currentSessionID, _ := h.auth.CurrentSessionID(c)
+	if sessionID != currentSessionID {
+		if err := h.requireRecentReauth(c); err != nil {
+			return err
+		}
+	}
+
 	if err := h.auth.LogoutSessionByID(c, sessionID); err != nil {
 		h.setFlash(c, "error", "Failed to sign out session")
 		return c.Redirect(http.StatusSeeOther, "/admin/security")
@@ -448,6 +462,10 @@ func (h *Handler) SecuritySessionLogout(c echo.Context) error {
 }
 
 func (h *Handler) SecuritySessionsLogoutOthers(c echo.Context) error {
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+
 	removed, err := h.auth.LogoutOtherSessions(c)
 	if err != nil {
 		h.setFlash(c, "error", "Failed to sign out other sessions")
@@ -604,6 +622,12 @@ func (h *Handler) ClientCreate(c echo.Context) error {
 		})
 	}
 
+	if form.Confidential {
+		if err := h.requireRecentReauth(c); err != nil {
+			return err
+		}
+	}
+
 	grantTypes := parseDelimitedList(form.GrantTypesRaw)
 	responseTypes := parseDelimitedList(form.ResponseTypesRaw)
 	scopes := parseDelimitedList(form.ScopesRaw)
@@ -629,6 +653,9 @@ func (h *Handler) ClientCreate(c echo.Context) error {
 		})
 	}
 	details = clientAuditDetails(client)
+	if form.Confidential {
+		details["recent_reauth"] = true
+	}
 	details["initial_secret_label"] = strings.TrimSpace(form.InitialSecretLabel)
 
 	if err := h.store.CreateOIDCClient(client, secrets); err != nil {
@@ -684,13 +711,14 @@ func (h *Handler) ClientEdit(c echo.Context) error {
 	}
 
 	return h.render(c, http.StatusOK, "client_edit.html", clientEditPageData{
-		layoutData:    h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-		ClientID:      client.ID,
-		Confidential:  client.Confidential,
-		Form:          form,
-		CreatedAt:     client.CreatedAt,
-		UpdatedAt:     client.UpdatedAt,
-		RedirectCount: len(client.RedirectURIs),
+		layoutData:      h.newLayoutData(c, adminUser, "Edit OIDC Client"),
+		ClientID:        client.ID,
+		Confidential:    client.Confidential,
+		OriginalEnabled: client.Enabled,
+		Form:            form,
+		CreatedAt:       client.CreatedAt,
+		UpdatedAt:       client.UpdatedAt,
+		RedirectCount:   len(client.RedirectURIs),
 	})
 }
 
@@ -725,19 +753,26 @@ func (h *Handler) ClientUpdate(c echo.Context) error {
 	}
 
 	form := readClientEditForm(c, current)
+	if current.Enabled && !form.Enabled {
+		if err := h.requireRecentReauth(c); err != nil {
+			return err
+		}
+	}
+
 	validationError := validateClientEditForm(form)
 	if validationError != "" {
 		opErr = errors.New(validationError)
 		details["error"] = "validation_failed"
 		return h.render(c, http.StatusBadRequest, "client_edit.html", clientEditPageData{
-			layoutData:    h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-			ClientID:      clientID,
-			Confidential:  current.Confidential,
-			Form:          form,
-			CreatedAt:     current.CreatedAt,
-			UpdatedAt:     current.UpdatedAt,
-			RedirectCount: len(current.RedirectURIs),
-			Error:         validationError,
+			layoutData:      h.newLayoutData(c, adminUser, "Edit OIDC Client"),
+			ClientID:        clientID,
+			Confidential:    current.Confidential,
+			OriginalEnabled: current.Enabled,
+			Form:            form,
+			CreatedAt:       current.CreatedAt,
+			UpdatedAt:       current.UpdatedAt,
+			RedirectCount:   len(current.RedirectURIs),
+			Error:           validationError,
 		})
 	}
 
@@ -754,20 +789,24 @@ func (h *Handler) ClientUpdate(c echo.Context) error {
 		RedirectURIs:  append([]string(nil), current.RedirectURIs...),
 	}
 	details = clientAuditDetails(updated)
+	if current.Enabled && !form.Enabled {
+		details["recent_reauth"] = true
+	}
 
 	if err := h.store.UpdateOIDCClient(updated); err != nil {
 		opErr = err
 		details["error"] = auditErrorCode(err)
 		status, message := mapStoreError(err)
 		return h.render(c, status, "client_edit.html", clientEditPageData{
-			layoutData:    h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-			ClientID:      clientID,
-			Confidential:  current.Confidential,
-			Form:          form,
-			CreatedAt:     current.CreatedAt,
-			UpdatedAt:     current.UpdatedAt,
-			RedirectCount: len(current.RedirectURIs),
-			Error:         message,
+			layoutData:      h.newLayoutData(c, adminUser, "Edit OIDC Client"),
+			ClientID:        clientID,
+			Confidential:    current.Confidential,
+			OriginalEnabled: current.Enabled,
+			Form:            form,
+			CreatedAt:       current.CreatedAt,
+			UpdatedAt:       current.UpdatedAt,
+			RedirectCount:   len(current.RedirectURIs),
+			Error:           message,
 		})
 	}
 
@@ -775,14 +814,15 @@ func (h *Handler) ClientUpdate(c echo.Context) error {
 		opErr = err
 		details["error"] = "runtime_reload_failed"
 		return h.render(c, http.StatusInternalServerError, "client_edit.html", clientEditPageData{
-			layoutData:    h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-			ClientID:      clientID,
-			Confidential:  current.Confidential,
-			Form:          form,
-			CreatedAt:     current.CreatedAt,
-			UpdatedAt:     current.UpdatedAt,
-			RedirectCount: len(current.RedirectURIs),
-			Error:         "Client updated in storage but runtime reload failed",
+			layoutData:      h.newLayoutData(c, adminUser, "Edit OIDC Client"),
+			ClientID:        clientID,
+			Confidential:    current.Confidential,
+			OriginalEnabled: current.Enabled,
+			Form:            form,
+			CreatedAt:       current.CreatedAt,
+			UpdatedAt:       current.UpdatedAt,
+			RedirectCount:   len(current.RedirectURIs),
+			Error:           "Client updated in storage but runtime reload failed",
 		})
 	}
 
@@ -943,6 +983,11 @@ func (h *Handler) ClientSecretAdd(c echo.Context) error {
 	}
 	activeBefore, _ := secretCounts(secretsBefore)
 
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+	details["recent_reauth"] = true
+
 	label := strings.TrimSpace(c.FormValue("label"))
 	plainSecret := strings.TrimSpace(c.FormValue("secret"))
 	generate := parseCheckboxValue(c.FormValue("generate"))
@@ -1085,6 +1130,11 @@ func (h *Handler) ClientSecretRevoke(c echo.Context) error {
 	details := map[string]any{}
 	success := false
 	var opErr error
+	if err := h.requireRecentReauth(c); err != nil {
+		return err
+	}
+	details["recent_reauth"] = true
+
 	secretID, parseErr := strconv.ParseInt(secretIDRaw, 10, 64)
 	if parseErr != nil || secretID <= 0 {
 		opErr = errors.New("invalid secret id")
@@ -1148,6 +1198,36 @@ func (h *Handler) currentAdmin(c echo.Context) *store.AdminUser {
 	return adminUser
 }
 
+func (h *Handler) recentReauthMaxAge() time.Duration {
+	maxAge := h.auth.ReauthMaxAge()
+	if maxAge <= 0 {
+		return 5 * time.Minute
+	}
+	return maxAge
+}
+
+func (h *Handler) requireRecentReauth(c echo.Context) error {
+	maxAge := h.recentReauthMaxAge()
+	if h.auth.HasRecentReauth(c, maxAge) {
+		return nil
+	}
+	if err := h.reauthRequiredResponse(c); err != nil {
+		return err
+	}
+	return echo.ErrForbidden
+}
+
+func (h *Handler) reauthRequiredResponse(c echo.Context) error {
+	payload := map[string]string{
+		"message": "recent admin re-auth required",
+		"code":    "admin_reauth_required",
+	}
+	if requestWantsJSON(c) {
+		return c.JSON(http.StatusForbidden, payload)
+	}
+	return c.String(http.StatusForbidden, payload["message"])
+}
+
 func (h *Handler) newLayoutData(c echo.Context, adminUser *store.AdminUser, title string) layoutData {
 	if adminUser == nil {
 		adminUser = h.currentAdmin(c)
@@ -1162,10 +1242,11 @@ func (h *Handler) newLayoutData(c echo.Context, adminUser *store.AdminUser, titl
 		}
 	}
 	return layoutData{
-		Title:     strings.TrimSpace(title),
-		Admin:     adminUser,
-		Flash:     h.popFlash(c),
-		CSRFToken: csrfToken,
+		Title:            strings.TrimSpace(title),
+		Admin:            adminUser,
+		Flash:            h.popFlash(c),
+		CSRFToken:        csrfToken,
+		ReauthTTLSeconds: int(h.recentReauthMaxAge().Seconds()),
 	}
 }
 
@@ -1690,6 +1771,21 @@ func requestID(c echo.Context) string {
 		return rid
 	}
 	return strings.TrimSpace(c.Request().Header.Get(echo.HeaderXRequestID))
+}
+
+func requestWantsJSON(c echo.Context) bool {
+	accept := strings.ToLower(strings.TrimSpace(c.Request().Header.Get(echo.HeaderAccept)))
+	if strings.Contains(accept, "application/json") {
+		return true
+	}
+	if strings.TrimSpace(c.Request().Header.Get("X-Requested-With")) == "XMLHttpRequest" {
+		return true
+	}
+	if strings.TrimSpace(c.Request().Header.Get("X-Admin-Reauth-Flow")) == "1" {
+		return true
+	}
+	contentType := strings.ToLower(strings.TrimSpace(c.Request().Header.Get(echo.HeaderContentType)))
+	return strings.Contains(contentType, "application/json")
 }
 
 func buildAuditDetailsJSON(details map[string]any, secretID int64, opErr error) json.RawMessage {

@@ -242,6 +242,8 @@ Admin auth endpoints (`/admin/auth`):
 - `POST /admin/auth/register/finish`
 - `POST /admin/auth/login/begin`
 - `POST /admin/auth/login/finish`
+- `POST /admin/auth/reauth/begin`
+- `POST /admin/auth/reauth/finish`
 - `POST /admin/auth/passkeys/register/begin` (logged-in admin adds extra passkey)
 - `POST /admin/auth/passkeys/register/finish` (logged-in admin adds extra passkey)
 - `POST /admin/auth/logout`
@@ -304,6 +306,16 @@ Security behavior:
   - admin can add a second passkey while already logged in (`/admin/auth/passkeys/register/*`)
   - last remaining admin passkey cannot be deleted
   - admin can sign out one session or all other sessions
+- sensitive admin actions require recent passkey re-authentication (`/admin/auth/reauth/*`)
+  - recent re-auth timestamp is kept in admin session (`recent_auth_at_utc`)
+  - TTL is controlled by `ADMIN_REAUTH_TTL_MINUTES` (default `5`)
+  - sensitive actions include:
+    - create confidential OIDC client
+    - disable OIDC client
+    - add/revoke OIDC secret
+    - delete admin passkey
+    - logout other admin sessions
+  - missing/expired recent re-auth returns `403` with message `recent admin re-auth required` (JSON code `admin_reauth_required`)
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
 - admin requests include `X-Request-ID`

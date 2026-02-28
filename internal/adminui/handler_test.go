@@ -360,6 +360,224 @@ func TestSecuritySessionLogoutAndLogoutOthersWithCSRF(t *testing.T) {
 	}
 }
 
+func TestSensitiveActionRequiresRecentReauth(t *testing.T) {
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		sessions: []store.AdminSessionInfo{
+			{
+				SessionID:  "ok",
+				CreatedAt:  time.Now().UTC().Add(-1 * time.Hour),
+				LastSeenAt: time.Now().UTC().Add(-1 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(20 * time.Minute),
+				Current:    true,
+			},
+			{
+				SessionID:  "other",
+				CreatedAt:  time.Now().UTC().Add(-40 * time.Minute),
+				LastSeenAt: time.Now().UTC().Add(-3 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(18 * time.Minute),
+				Current:    false,
+			},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/logout-others", withCSRF(nil, csrfToken), cookies)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "recent admin re-auth required") {
+		t.Fatalf("expected recent reauth required message, got %s", rec.Body.String())
+	}
+}
+
+func TestSensitiveActionReauthRequiredJSONResponse(t *testing.T) {
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		sessions: []store.AdminSessionInfo{
+			{SessionID: "ok", CreatedAt: time.Now().UTC().Add(-1 * time.Hour), LastSeenAt: time.Now().UTC().Add(-1 * time.Minute), ExpiresAt: time.Now().UTC().Add(20 * time.Minute), Current: true},
+			{SessionID: "other", CreatedAt: time.Now().UTC().Add(-40 * time.Minute), LastSeenAt: time.Now().UTC().Add(-3 * time.Minute), ExpiresAt: time.Now().UTC().Add(18 * time.Minute), Current: false},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	form := withCSRF(nil, csrfToken)
+	req := httptest.NewRequest(http.MethodPost, "/admin/security/sessions/logout-others", bytes.NewReader([]byte(form.Encode())))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationForm)
+	req.Header.Set(echo.HeaderAccept, echo.MIMEApplicationJSON)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 json response without reauth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"admin_reauth_required"`) {
+		t.Fatalf("expected admin_reauth_required code, got %s", rec.Body.String())
+	}
+}
+
+func TestSensitiveActionAfterRecentReauthSucceeds(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		recentReauthAt:          &now,
+		sessions: []store.AdminSessionInfo{
+			{
+				SessionID:  "ok",
+				CreatedAt:  time.Now().UTC().Add(-1 * time.Hour),
+				LastSeenAt: time.Now().UTC().Add(-1 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(20 * time.Minute),
+				Current:    true,
+			},
+			{
+				SessionID:  "other",
+				CreatedAt:  time.Now().UTC().Add(-40 * time.Minute),
+				LastSeenAt: time.Now().UTC().Add(-3 * time.Minute),
+				ExpiresAt:  time.Now().UTC().Add(18 * time.Minute),
+				Current:    false,
+			},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/logout-others", withCSRF(nil, csrfToken), cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(auth.sessions) != 1 || !auth.sessions[0].Current {
+		t.Fatalf("expected other sessions removed after authorized action, sessions=%+v", auth.sessions)
+	}
+}
+
+func TestExpiredRecentReauthBlocksSensitiveActionAgain(t *testing.T) {
+	expired := time.Now().UTC().Add(-11 * time.Minute)
+	auth := &fakeUIAuth{
+		disableAutoRecentReauth: true,
+		recentReauthAt:          &expired,
+		reauthMaxAge:            5 * time.Minute,
+		sessions: []store.AdminSessionInfo{
+			{SessionID: "ok", CreatedAt: time.Now().UTC().Add(-1 * time.Hour), LastSeenAt: time.Now().UTC().Add(-1 * time.Minute), ExpiresAt: time.Now().UTC().Add(20 * time.Minute), Current: true},
+			{SessionID: "other", CreatedAt: time.Now().UTC().Add(-40 * time.Minute), LastSeenAt: time.Now().UTC().Add(-3 * time.Minute), ExpiresAt: time.Now().UTC().Add(18 * time.Minute), Current: false},
+		},
+	}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/security", auth.sessionCookies())
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/security/sessions/logout-others", withCSRF(nil, csrfToken), cookies)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 with expired reauth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateConfidentialClientRequiresRecentReauth(t *testing.T) {
+	auth := &fakeUIAuth{disableAutoRecentReauth: true}
+	fakeStore := newFakeUIStore()
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/new", auth.sessionCookies())
+
+	form := url.Values{}
+	form.Set("id", "secure-client")
+	form.Set("name", "Secure Client")
+	form.Set("confidential", "true")
+	form.Set("auth_method", "basic")
+	form.Set("enabled", "true")
+	form.Set("require_pkce", "true")
+	form.Set("grant_types", "authorization_code")
+	form.Set("response_types", "code")
+	form.Set("scopes", "openid profile")
+	form.Set("redirect_uris", "https://example.com/callback")
+	form.Set("initial_secret", "topsecret")
+	form.Set("initial_secret_label", "initial")
+
+	recNoReauth := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(form, csrfToken), cookies)
+	if recNoReauth.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth for confidential create, got %d body=%s", recNoReauth.Code, recNoReauth.Body.String())
+	}
+	if _, err := fakeStore.GetOIDCClient("secure-client"); !errors.Is(err, store.ErrOIDCClientNotFound) {
+		t.Fatalf("confidential client should not be created before recent reauth, err=%v", err)
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(form, csrfToken), cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth for confidential create, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+}
+
+func TestDisableClientRequiresRecentReauth(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	err := fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "disable-me",
+		Name:          "Disable Me",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.com/callback"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("seed client failed: %v", err)
+	}
+
+	auth := &fakeUIAuth{disableAutoRecentReauth: true}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/disable-me/edit", auth.sessionCookies())
+
+	form := url.Values{}
+	form.Set("name", "Disable Me")
+	form.Set("auth_method", "none")
+	form.Set("require_pkce", "true")
+	form.Set("grant_types", "authorization_code")
+	form.Set("response_types", "code")
+	form.Set("scopes", "openid")
+
+	recNoReauth := doUIRequest(t, e, http.MethodPost, "/admin/clients/disable-me/edit", withCSRF(form, csrfToken), cookies)
+	if recNoReauth.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without recent reauth for disable action, got %d body=%s", recNoReauth.Code, recNoReauth.Body.String())
+	}
+
+	now := time.Now().UTC()
+	auth.recentReauthAt = &now
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/disable-me/edit", withCSRF(form, csrfToken), cookies)
+	if recOK.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with recent reauth for disable action, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+}
+
+func TestNonSensitivePageDoesNotRequireRecentReauth(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	_ = fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "client-a",
+		Name:          "Client A",
+		Enabled:       true,
+		Confidential:  false,
+		RequirePKCE:   true,
+		AuthMethod:    "none",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.com/callback"},
+	}, nil)
+
+	auth := &fakeUIAuth{disableAutoRecentReauth: true}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/clients", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-sensitive page without reauth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCreateClientCSRFMissingTokenRejected(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -891,10 +1109,13 @@ func responseCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
 }
 
 type fakeUIAuth struct {
-	logoutCalled bool
-	user         store.AdminUser
-	passkeys     []store.AdminCredentialInfo
-	sessions     []store.AdminSessionInfo
+	logoutCalled            bool
+	user                    store.AdminUser
+	passkeys                []store.AdminCredentialInfo
+	sessions                []store.AdminSessionInfo
+	recentReauthAt          *time.Time
+	reauthMaxAge            time.Duration
+	disableAutoRecentReauth bool
 }
 
 func (a *fakeUIAuth) SessionUser(c echo.Context) (*store.AdminUser, bool) {
@@ -908,6 +1129,10 @@ func (a *fakeUIAuth) SessionUser(c echo.Context) (*store.AdminUser, bool) {
 	}
 	admin.SetAdminActor(c, "admin_user", user.ID)
 	c.Set("admin_user", &user)
+	if !a.disableAutoRecentReauth && a.recentReauthAt == nil {
+		now := time.Now().UTC()
+		a.recentReauthAt = &now
+	}
 	return &user, true
 }
 
@@ -950,6 +1175,23 @@ func (a *fakeUIAuth) DeletePasskey(c echo.Context, credentialID int64) error {
 	}
 	a.passkeys = append(a.passkeys[:idx], a.passkeys[idx+1:]...)
 	return nil
+}
+
+func (a *fakeUIAuth) ReauthMaxAge() time.Duration {
+	if a.reauthMaxAge <= 0 {
+		return 5 * time.Minute
+	}
+	return a.reauthMaxAge
+}
+
+func (a *fakeUIAuth) HasRecentReauth(c echo.Context, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		maxAge = a.ReauthMaxAge()
+	}
+	if a.recentReauthAt == nil {
+		return false
+	}
+	return time.Since(a.recentReauthAt.UTC()) <= maxAge
 }
 
 func (a *fakeUIAuth) CurrentSessionID(c echo.Context) (string, bool) {

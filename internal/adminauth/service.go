@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	adminSessionCookieName      = "admin_session"
-	adminRegSessionCookieName   = "admin_reg_session_id"
-	adminLoginSessionCookieName = "admin_login_session_id"
-	adminAddPasskeyCookieName   = "admin_passkey_add_session_id"
+	adminSessionCookieName       = "admin_session"
+	adminRegSessionCookieName    = "admin_reg_session_id"
+	adminLoginSessionCookieName  = "admin_login_session_id"
+	adminAddPasskeyCookieName    = "admin_passkey_add_session_id"
+	adminReauthSessionCookieName = "admin_reauth_session_id"
 )
 
 var (
@@ -65,6 +66,7 @@ type Service struct {
 	bootstrapLogin     string
 	sessionIdleTTL     time.Duration
 	sessionAbsoluteTTL time.Duration
+	reauthTTL          time.Duration
 }
 
 type registrationSession struct {
@@ -72,12 +74,19 @@ type registrationSession struct {
 	Session     webauthn.SessionData `json:"session"`
 }
 
+type reauthSession struct {
+	AdminUserID    string               `json:"admin_user_id"`
+	AdminSessionID string               `json:"admin_session_id"`
+	Session        webauthn.SessionData `json:"session"`
+}
+
 type sessionRecord struct {
-	AdminUserID   string `json:"admin_user_id"`
-	CreatedAtUTC  int64  `json:"created_at_utc"`
-	LastSeenAtUTC int64  `json:"last_seen_at_utc"`
-	RemoteIP      string `json:"remote_ip"`
-	UserAgent     string `json:"user_agent"`
+	AdminUserID     string `json:"admin_user_id"`
+	CreatedAtUTC    int64  `json:"created_at_utc"`
+	LastSeenAtUTC   int64  `json:"last_seen_at_utc"`
+	RecentAuthAtUTC int64  `json:"recent_auth_at_utc"`
+	RemoteIP        string `json:"remote_ip"`
+	UserAgent       string `json:"user_agent"`
 }
 
 type adminSessionStateStore interface {
@@ -159,6 +168,11 @@ func New(s *store.Store, r *redis.Client) (*Service, error) {
 	if parsed := parsePositiveInt(strings.TrimSpace(os.Getenv("ADMIN_SESSION_ABSOLUTE_HOURS"))); parsed > 0 {
 		absoluteTTL = time.Duration(parsed) * time.Hour
 	}
+
+	reauthTTL := 5 * time.Minute
+	if parsed := parsePositiveInt(strings.TrimSpace(os.Getenv("ADMIN_REAUTH_TTL_MINUTES"))); parsed > 0 {
+		reauthTTL = time.Duration(parsed) * time.Minute
+	}
 	stateStore, err := newRedisAdminSessionStateStore(r)
 	if err != nil {
 		return nil, err
@@ -171,6 +185,7 @@ func New(s *store.Store, r *redis.Client) (*Service, error) {
 		bootstrapLogin:     strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_BOOTSTRAP_LOGIN"))),
 		sessionIdleTTL:     idleTTL,
 		sessionAbsoluteTTL: absoluteTTL,
+		reauthTTL:          reauthTTL,
 	}, nil
 }
 
@@ -179,6 +194,8 @@ func RegisterRoutes(group *echo.Group, svc *Service) {
 	group.POST("/register/finish", svc.FinishRegistration)
 	group.POST("/login/begin", svc.BeginLogin)
 	group.POST("/login/finish", svc.FinishLogin)
+	group.POST("/reauth/begin", svc.BeginReauth)
+	group.POST("/reauth/finish", svc.FinishReauth)
 	group.POST("/passkeys/register/begin", svc.BeginAddPasskey)
 	group.POST("/passkeys/register/finish", svc.FinishAddPasskey)
 	group.POST("/logout", svc.Logout)
@@ -439,6 +456,133 @@ func (s *Service) FinishLogin(c echo.Context) error {
 	})
 }
 
+func (s *Service) BeginReauth(c echo.Context) error {
+	adminUser, currentSessionID, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "unknown", "", "admin_session", "", map[string]any{"error": "missing_session"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "admin session is required"})
+	}
+
+	options, session, err := s.wa.BeginDiscoverableLogin(webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "begin_reauth_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to begin admin re-auth"})
+	}
+
+	sessionID, err := newRandomID()
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "session_id_generation_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to create re-auth session"})
+	}
+
+	payload, err := json.Marshal(reauthSession{
+		AdminUserID:    adminUser.ID,
+		AdminSessionID: currentSessionID,
+		Session:        *session,
+	})
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "session_encode_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to encode re-auth session"})
+	}
+	if err := s.stateStore.Set(c.Request().Context(), adminReauthRedisKey(sessionID), payload, 5*time.Minute); err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "session_store_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to store re-auth session"})
+	}
+
+	setCookie(c, &http.Cookie{
+		Name:     adminReauthSessionCookieName,
+		Value:    sessionID,
+		Path:     "/admin/auth",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   300,
+	})
+	return c.JSON(http.StatusOK, options)
+}
+
+func (s *Service) FinishReauth(c echo.Context) error {
+	adminUser, currentSessionID, err := s.sessionUser(c)
+	if err != nil || adminUser == nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "unknown", "", "admin_session", "", map[string]any{"error": "missing_session"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "admin session is required"})
+	}
+
+	reauthCookie, err := c.Cookie(adminReauthSessionCookieName)
+	if err != nil || strings.TrimSpace(reauthCookie.Value) == "" {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "missing_reauth_cookie"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "re-auth session is missing"})
+	}
+
+	key := adminReauthRedisKey(strings.TrimSpace(reauthCookie.Value))
+	payload, err := s.stateStore.Get(c.Request().Context(), key)
+	if err != nil {
+		clearCookie(c, adminReauthSessionCookieName, "/admin/auth")
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "reauth_session_expired"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "re-auth session expired"})
+	}
+	_ = s.stateStore.Del(c.Request().Context(), key)
+	clearCookie(c, adminReauthSessionCookieName, "/admin/auth")
+
+	var reauth reauthSession
+	if err := json.Unmarshal(payload, &reauth); err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "reauth_session_invalid"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "re-auth session is invalid"})
+	}
+
+	if strings.TrimSpace(reauth.AdminUserID) != strings.TrimSpace(adminUser.ID) || strings.TrimSpace(reauth.AdminSessionID) != strings.TrimSpace(currentSessionID) {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "session_mismatch"})
+		return c.JSON(http.StatusForbidden, map[string]string{"message": "re-auth session mismatch"})
+	}
+
+	var resolvedAdmin *store.AdminUser
+	credential, err := s.wa.FinishDiscoverableLogin(func(rawID []byte, userHandle []byte) (webauthn.User, error) {
+		var (
+			u   *store.AdminUser
+			err error
+		)
+		if len(userHandle) > 0 {
+			u, err = s.store.GetAdminUser(string(userHandle))
+		} else {
+			u, err = s.store.GetAdminUserByCredentialID(rawID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !u.Enabled {
+			return nil, store.ErrAdminUserDisabled
+		}
+		resolvedAdmin = u
+		return u, nil
+	}, reauth.Session, c.Request())
+	if err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "finish_reauth_failed"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "admin re-auth failed"})
+	}
+
+	if resolvedAdmin == nil || strings.TrimSpace(resolvedAdmin.ID) != strings.TrimSpace(adminUser.ID) {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "resolved_user_mismatch"})
+		return c.JSON(http.StatusForbidden, map[string]string{"message": "admin re-auth failed"})
+	}
+
+	if err := s.store.UpdateAdminCredential(credential); err != nil && !errors.Is(err, store.ErrAdminCredentialNotFound) {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "credential_update_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to update admin credential"})
+	}
+
+	reauthenticatedAt := time.Now().UTC()
+	if err := s.markSessionRecentAuthAt(c.Request().Context(), currentSessionID, reauthenticatedAt); err != nil {
+		s.auditAdminAction(c, "admin.auth.reauth.failure", false, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"error": "session_update_failed"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": "failed to update admin session re-auth state"})
+	}
+
+	s.auditAdminAction(c, "admin.auth.reauth.success", true, "admin_user", adminUser.ID, "admin_session", currentSessionID, map[string]any{"reauth_at_utc": reauthenticatedAt.Unix()})
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":             "ok",
+		"reauthenticated_at": reauthenticatedAt.Format(time.RFC3339),
+	})
+}
+
 func (s *Service) BeginAddPasskey(c echo.Context) error {
 	adminUser, _, err := s.sessionUser(c)
 	if err != nil || adminUser == nil {
@@ -572,6 +716,35 @@ func (s *Service) CurrentSessionID(c echo.Context) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(sessionID), true
+}
+
+func (s *Service) ReauthMaxAge() time.Duration {
+	if s.reauthTTL <= 0 {
+		return 5 * time.Minute
+	}
+	return s.reauthTTL
+}
+
+func (s *Service) HasRecentReauth(c echo.Context, maxAge time.Duration) bool {
+	_, sessionID, err := s.sessionUser(c)
+	if err != nil || strings.TrimSpace(sessionID) == "" {
+		return false
+	}
+	record, _, err := s.loadSessionRecord(c.Request().Context(), sessionID)
+	if err != nil {
+		return false
+	}
+	if record.RecentAuthAtUTC <= 0 {
+		return false
+	}
+	if maxAge <= 0 {
+		maxAge = s.ReauthMaxAge()
+	}
+	if maxAge <= 0 {
+		return false
+	}
+	recentAuthAt := time.Unix(record.RecentAuthAtUTC, 0).UTC()
+	return time.Since(recentAuthAt) <= maxAge
 }
 
 func (s *Service) ListPasskeys(c echo.Context) ([]store.AdminCredentialInfo, error) {
@@ -757,6 +930,9 @@ func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sess
 	if record.LastSeenAtUTC <= 0 {
 		record.LastSeenAtUTC = record.CreatedAtUTC
 	}
+	if record.RecentAuthAtUTC < 0 {
+		record.RecentAuthAtUTC = 0
+	}
 	record.RemoteIP = strings.TrimSpace(record.RemoteIP)
 	record.UserAgent = strings.TrimSpace(record.UserAgent)
 
@@ -792,6 +968,9 @@ func (s *Service) sessionUser(c echo.Context) (*store.AdminUser, string, error) 
 	}
 	if record.LastSeenAtUTC <= 0 {
 		record.LastSeenAtUTC = record.CreatedAtUTC
+	}
+	if record.RecentAuthAtUTC < 0 {
+		record.RecentAuthAtUTC = 0
 	}
 	record.RemoteIP = strings.TrimSpace(record.RemoteIP)
 	record.UserAgent = strings.TrimSpace(record.UserAgent)
@@ -844,11 +1023,12 @@ func (s *Service) setSession(c echo.Context, adminUserID string) (string, error)
 	}
 	now := time.Now().UTC()
 	record := sessionRecord{
-		AdminUserID:   strings.TrimSpace(adminUserID),
-		CreatedAtUTC:  now.Unix(),
-		LastSeenAtUTC: now.Unix(),
-		RemoteIP:      strings.TrimSpace(c.RealIP()),
-		UserAgent:     strings.TrimSpace(c.Request().UserAgent()),
+		AdminUserID:     strings.TrimSpace(adminUserID),
+		CreatedAtUTC:    now.Unix(),
+		LastSeenAtUTC:   now.Unix(),
+		RecentAuthAtUTC: now.Unix(),
+		RemoteIP:        strings.TrimSpace(c.RealIP()),
+		UserAgent:       strings.TrimSpace(c.Request().UserAgent()),
 	}
 	payload, err := json.Marshal(record)
 	if err != nil {
@@ -869,6 +1049,25 @@ func (s *Service) setSession(c echo.Context, adminUserID string) (string, error)
 		MaxAge:   int(s.sessionIdleTTL.Seconds()),
 	})
 	return sessionID, nil
+}
+
+func (s *Service) markSessionRecentAuthAt(ctx context.Context, sessionID string, at time.Time) error {
+	record, ttl, err := s.loadSessionRecord(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	record.RecentAuthAtUTC = at.UTC().Unix()
+
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+
+	ttlToUse := s.sessionIdleTTL
+	if ttl > 0 {
+		ttlToUse = ttl
+	}
+	return s.stateStore.Set(ctx, adminSessionRedisKey(sessionID), payload, ttlToUse)
 }
 
 func (s *Service) ensureBootstrapUser() (*store.AdminUser, error) {
@@ -984,6 +1183,10 @@ func adminRegRedisKey(id string) string {
 
 func adminLoginRedisKey(id string) string {
 	return "admin:login:" + strings.TrimSpace(id)
+}
+
+func adminReauthRedisKey(id string) string {
+	return "admin:reauth:" + strings.TrimSpace(id)
 }
 
 func adminAddPasskeyRedisKey(id string) string {
