@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +26,8 @@ import (
 )
 
 const (
-	flashCookieName = "admin_ui_flash"
+	flashCookieName  = "admin_ui_flash"
+	auditLogPageSize = 25
 )
 
 type OIDCClientStore interface {
@@ -45,6 +47,7 @@ type OIDCClientReloader interface {
 
 type AdminAuditStore interface {
 	CreateAdminAuditEntry(ctx context.Context, entry store.AdminAuditEntry) error
+	ListAdminAuditEntries(ctx context.Context, opts store.AdminAuditListOptions) ([]store.AdminAuditEntry, error)
 }
 
 type SessionAuth interface {
@@ -198,6 +201,31 @@ type secretCreatedPageData struct {
 	BackToClient string
 }
 
+type auditLogItem struct {
+	CreatedAt    time.Time
+	Action       string
+	Success      bool
+	Actor        string
+	ResourceType string
+	ResourceID   string
+	RequestID    string
+	RemoteIP     string
+	Details      string
+	HasDetails   bool
+}
+
+type auditLogPageData struct {
+	layoutData
+	Entries          []auditLogItem
+	FilterAction     string
+	FilterSuccess    string
+	FilterActor      string
+	FilterResourceID string
+	Page             int
+	PrevURL          string
+	NextURL          string
+}
+
 func NewHandler(clientStore OIDCClientStore, reloader OIDCClientReloader, auditStore AdminAuditStore, sessionAuth SessionAuth) (*Handler, error) {
 	if clientStore == nil {
 		return nil, fmt.Errorf("adminui requires oidc client store")
@@ -224,6 +252,7 @@ func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 
 func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
+	group.GET("/audit", handler.AuditLog)
 	group.POST("/logout", handler.Logout)
 	group.GET("/clients", handler.ClientsList)
 	group.GET("/clients/new", handler.ClientNew)
@@ -236,6 +265,72 @@ func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/clients/:id/secrets/new", handler.ClientSecretNew)
 	group.POST("/clients/:id/secrets", handler.ClientSecretAdd)
 	group.POST("/clients/:id/secrets/:secretID/revoke", handler.ClientSecretRevoke)
+}
+
+func (h *Handler) AuditLog(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	page := parseAuditLogPage(c.QueryParam("page"))
+	action := strings.TrimSpace(c.QueryParam("action"))
+	successRaw, successFilter := parseAuditSuccessFilter(c.QueryParam("success"))
+	actor := strings.TrimSpace(c.QueryParam("actor"))
+	resourceID := strings.TrimSpace(c.QueryParam("resource_id"))
+
+	opts := store.AdminAuditListOptions{
+		Limit:      auditLogPageSize + 1,
+		Offset:     (page - 1) * auditLogPageSize,
+		Action:     action,
+		Success:    successFilter,
+		Actor:      actor,
+		ResourceID: resourceID,
+	}
+
+	entries, err := h.auditStore.ListAdminAuditEntries(c.Request().Context(), opts)
+	if err != nil {
+		return h.renderInternalError(c, adminUser, "failed to load audit log")
+	}
+
+	hasNext := len(entries) > auditLogPageSize
+	if hasNext {
+		entries = entries[:auditLogPageSize]
+	}
+
+	items := make([]auditLogItem, 0, len(entries))
+	for _, entry := range entries {
+		details, hasDetails := formatAuditDetailsForDisplay(entry.DetailsJSON)
+		items = append(items, auditLogItem{
+			CreatedAt:    entry.CreatedAt,
+			Action:       strings.TrimSpace(entry.Action),
+			Success:      entry.Success,
+			Actor:        formatAuditActor(entry.ActorType, entry.ActorID),
+			ResourceType: defaultDisplay(strings.TrimSpace(entry.ResourceType)),
+			ResourceID:   defaultDisplay(strings.TrimSpace(entry.ResourceID)),
+			RequestID:    defaultDisplay(strings.TrimSpace(entry.RequestID)),
+			RemoteIP:     defaultDisplay(strings.TrimSpace(entry.RemoteIP)),
+			Details:      details,
+			HasDetails:   hasDetails,
+		})
+	}
+
+	prevURL := ""
+	if page > 1 {
+		prevURL = auditLogURL(page-1, action, successRaw, actor, resourceID)
+	}
+	nextURL := ""
+	if hasNext {
+		nextURL = auditLogURL(page+1, action, successRaw, actor, resourceID)
+	}
+
+	return h.render(c, http.StatusOK, "audit.html", auditLogPageData{
+		layoutData:       h.newLayoutData(c, adminUser, "Admin Audit Log"),
+		Entries:          items,
+		FilterAction:     action,
+		FilterSuccess:    successRaw,
+		FilterActor:      actor,
+		FilterResourceID: resourceID,
+		Page:             page,
+		PrevURL:          prevURL,
+		NextURL:          nextURL,
+	})
 }
 
 func (h *Handler) LoginPage(c echo.Context) error {
@@ -345,7 +440,7 @@ func (h *Handler) ClientDetail(c echo.Context) error {
 
 	return h.render(c, http.StatusOK, "client_detail.html", clientDetailPageData{
 		layoutData: h.newLayoutData(c, adminUser, "Client: "+detail.ID),
-		Client:      detail,
+		Client:     detail,
 	})
 }
 
@@ -441,8 +536,8 @@ func (h *Handler) ClientEdit(c echo.Context) error {
 		status, message := mapStoreError(err)
 		return h.render(c, status, "client_edit.html", clientEditPageData{
 			layoutData: h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-			ClientID:    clientID,
-			Error:       message,
+			ClientID:   clientID,
+			Error:      message,
 		})
 	}
 
@@ -495,8 +590,8 @@ func (h *Handler) ClientUpdate(c echo.Context) error {
 		status, message := mapStoreError(err)
 		return h.render(c, status, "client_edit.html", clientEditPageData{
 			layoutData: h.newLayoutData(c, adminUser, "Edit OIDC Client"),
-			ClientID:    clientID,
-			Error:       message,
+			ClientID:   clientID,
+			Error:      message,
 		})
 	}
 
@@ -889,8 +984,8 @@ func (h *Handler) ClientSecretRevoke(c echo.Context) error {
 		}
 		return h.render(c, status, "client_detail.html", clientDetailPageData{
 			layoutData: h.newLayoutData(c, adminUser, "Client: "+detail.ID),
-			Client:      detail,
-			Error:       message,
+			Client:     detail,
+			Error:      message,
 		})
 	}
 
@@ -906,8 +1001,8 @@ func (h *Handler) ClientSecretRevoke(c echo.Context) error {
 		}
 		return h.render(c, http.StatusInternalServerError, "client_detail.html", clientDetailPageData{
 			layoutData: h.newLayoutData(c, adminUser, "Client: "+detail.ID),
-			Client:      detail,
-			Error:       "Secret revoked in storage but runtime reload failed",
+			Client:     detail,
+			Error:      "Secret revoked in storage but runtime reload failed",
 		})
 	}
 
@@ -1159,6 +1254,127 @@ func parseCheckboxValue(raw string) bool {
 func parseBooleanSelect(raw string) bool {
 	raw = strings.ToLower(strings.TrimSpace(raw))
 	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+func parseAuditLogPage(raw string) int {
+	page, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || page <= 0 {
+		return 1
+	}
+	return page
+}
+
+func parseAuditSuccessFilter(raw string) (string, *bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "success", "true", "1", "yes":
+		value := true
+		return "success", &value
+	case "failure", "false", "0", "no":
+		value := false
+		return "failure", &value
+	default:
+		return "", nil
+	}
+}
+
+func auditLogURL(page int, action string, success string, actor string, resourceID string) string {
+	params := url.Values{}
+	if page > 1 {
+		params.Set("page", strconv.Itoa(page))
+	}
+	if strings.TrimSpace(action) != "" {
+		params.Set("action", strings.TrimSpace(action))
+	}
+	if strings.TrimSpace(success) != "" {
+		params.Set("success", strings.TrimSpace(success))
+	}
+	if strings.TrimSpace(actor) != "" {
+		params.Set("actor", strings.TrimSpace(actor))
+	}
+	if strings.TrimSpace(resourceID) != "" {
+		params.Set("resource_id", strings.TrimSpace(resourceID))
+	}
+	encoded := params.Encode()
+	if encoded == "" {
+		return "/admin/audit"
+	}
+	return "/admin/audit?" + encoded
+}
+
+func formatAuditActor(actorType string, actorID string) string {
+	actorType = strings.TrimSpace(actorType)
+	actorID = strings.TrimSpace(actorID)
+	if actorType == "" && actorID == "" {
+		return "-"
+	}
+	if actorType == "" {
+		return actorID
+	}
+	if actorID == "" {
+		return actorType
+	}
+	return actorType + ":" + actorID
+}
+
+func defaultDisplay(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func formatAuditDetailsForDisplay(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return "", false
+	}
+
+	sanitized := sanitizeAuditDetails(decoded)
+	encoded, err := json.MarshalIndent(sanitized, "", "  ")
+	if err != nil {
+		return "", false
+	}
+
+	trimmed := strings.TrimSpace(string(encoded))
+	if trimmed == "" || trimmed == "{}" || trimmed == "[]" || trimmed == "null" {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func sanitizeAuditDetails(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for key, item := range typed {
+			normalized := strings.ToLower(strings.TrimSpace(key))
+			if normalized == "" || isSensitiveAuditField(normalized) {
+				continue
+			}
+			out[key] = sanitizeAuditDetails(item)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, sanitizeAuditDetails(item))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func isSensitiveAuditField(key string) bool {
+	return strings.Contains(key, "secret") ||
+		strings.Contains(key, "authorization") ||
+		strings.Contains(key, "password") ||
+		strings.Contains(key, "token")
 }
 
 func formatTime(value time.Time) string {

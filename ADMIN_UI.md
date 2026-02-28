@@ -16,6 +16,7 @@ Public:
 
 Protected (admin session required):
 - `GET /admin/`
+- `GET /admin/audit`
 - `POST /admin/logout`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
@@ -51,10 +52,17 @@ All mutating UI actions:
 - call OIDC runtime client reload (`ReloadClients`) after DB commit
 - if reload fails after DB update, action returns error and requires operator attention
 
+Audit viewer (`GET /admin/audit`):
+- read-only table with time/action/result/actor/resource/request/ip
+- filter by `action`, `success`, `actor`, `resource_id`
+- paginated
+- `details_json` can be expanded per row and sensitive keys are redacted before render
+
 ## Templates
 - `web/templates/admin/layout.html`
 - `web/templates/admin/login.html`
 - `web/templates/admin/index.html`
+- `web/templates/admin/audit.html`
 - `web/templates/admin/clients_list.html`
 - `web/templates/admin/client_detail.html`
 - `web/templates/admin/client_new.html`

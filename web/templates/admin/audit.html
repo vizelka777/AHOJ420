@@ -1,0 +1,103 @@
+{{define "content"}}
+<div class="panel">
+  <h1 style="margin-top:0;">Admin Audit Log</h1>
+  <p class="hint">Read-only audit trail for admin auth and admin UI/API actions.</p>
+
+  <form method="get" action="/admin/audit" style="margin-top:14px;">
+    <div class="row">
+      <div>
+        <label for="action">Action</label>
+        <input id="action" type="text" name="action" value="{{.FilterAction}}" placeholder="admin.oidc_client.create">
+      </div>
+      <div>
+        <label for="success">Success</label>
+        <select id="success" name="success">
+          <option value="" {{if eq .FilterSuccess ""}}selected{{end}}>Any</option>
+          <option value="success" {{if eq .FilterSuccess "success"}}selected{{end}}>Success</option>
+          <option value="failure" {{if eq .FilterSuccess "failure"}}selected{{end}}>Failure</option>
+        </select>
+      </div>
+      <div>
+        <label for="actor">Actor</label>
+        <input id="actor" type="text" name="actor" value="{{.FilterActor}}" placeholder="admin_user:...">
+      </div>
+      <div>
+        <label for="resource_id">Resource ID</label>
+        <input id="resource_id" type="text" name="resource_id" value="{{.FilterResourceID}}" placeholder="client-id">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit">Apply filters</button>
+      <a class="btn secondary" href="/admin/audit">Reset</a>
+    </div>
+  </form>
+</div>
+
+<div class="panel table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Action</th>
+        <th>Result</th>
+        <th>Actor</th>
+        <th>Resource Type</th>
+        <th>Resource ID</th>
+        <th>Request ID</th>
+        <th>Remote IP</th>
+        <th>Details</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{if .Entries}}
+        {{range .Entries}}
+          <tr>
+            <td class="mono">{{formatTime .CreatedAt}}</td>
+            <td class="mono">{{.Action}}</td>
+            <td>
+              {{if .Success}}
+                <span class="chip ok">success</span>
+              {{else}}
+                <span class="chip warn">failure</span>
+              {{end}}
+            </td>
+            <td class="mono">{{.Actor}}</td>
+            <td class="mono">{{.ResourceType}}</td>
+            <td class="mono">{{.ResourceID}}</td>
+            <td class="mono">{{.RequestID}}</td>
+            <td class="mono">{{.RemoteIP}}</td>
+            <td>
+              {{if .HasDetails}}
+                <details>
+                  <summary>View</summary>
+                  <pre class="mono" style="white-space:pre-wrap; margin-top:8px;">{{.Details}}</pre>
+                </details>
+              {{else}}
+                <span class="hint">-</span>
+              {{end}}
+            </td>
+          </tr>
+        {{end}}
+      {{else}}
+        <tr>
+          <td colspan="9">No audit entries found.</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+    <div class="hint">Page {{.Page}}</div>
+    <div class="actions" style="margin:0;">
+      {{if .PrevURL}}
+        <a class="btn secondary" href="{{.PrevURL}}">Previous</a>
+      {{end}}
+      {{if .NextURL}}
+        <a class="btn secondary" href="{{.NextURL}}">Next</a>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

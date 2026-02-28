@@ -22,6 +22,16 @@ type AdminAuditEntry struct {
 	DetailsJSON  json.RawMessage
 }
 
+type AdminAuditListOptions struct {
+	Limit        int
+	Offset       int
+	Action       string
+	Success      *bool
+	Actor        string
+	ResourceType string
+	ResourceID   string
+}
+
 func (s *Store) CreateAdminAuditEntry(ctx context.Context, entry AdminAuditEntry) error {
 	normalized, err := normalizeAdminAuditEntry(entry)
 	if err != nil {
@@ -47,24 +57,49 @@ func (s *Store) CreateAdminAuditEntry(ctx context.Context, entry AdminAuditEntry
 	return err
 }
 
-func (s *Store) ListAdminAuditEntries(ctx context.Context, limit int, action string, resourceType string, resourceID string) ([]AdminAuditEntry, error) {
+func (s *Store) ListAdminAuditEntries(ctx context.Context, opts AdminAuditListOptions) ([]AdminAuditEntry, error) {
+	limit := opts.Limit
+	offset := opts.Offset
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
-	action = strings.TrimSpace(action)
-	resourceType = strings.TrimSpace(resourceType)
-	resourceID = strings.TrimSpace(resourceID)
+	action := strings.TrimSpace(opts.Action)
+	resourceType := strings.TrimSpace(opts.ResourceType)
+	resourceID := strings.TrimSpace(opts.ResourceID)
+	actor := strings.TrimSpace(opts.Actor)
+
+	actionPattern := ""
+	if action != "" {
+		actionPattern = "%" + strings.ToLower(action) + "%"
+	}
+	resourceIDPattern := ""
+	if resourceID != "" {
+		resourceIDPattern = "%" + strings.ToLower(resourceID) + "%"
+	}
+	actorPattern := ""
+	if actor != "" {
+		actorPattern = "%" + strings.ToLower(actor) + "%"
+	}
+	var successFilter any
+	if opts.Success != nil {
+		successFilter = *opts.Success
+	}
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, created_at, action, success, actor_type, actor_id, remote_ip, request_id, resource_type, resource_id, details_json
 		FROM admin_audit_log
-		WHERE ($1 = '' OR action = $1)
+		WHERE ($1 = '' OR lower(action) LIKE $1)
 		  AND ($2 = '' OR resource_type = $2)
-		  AND ($3 = '' OR resource_id = $3)
+		  AND ($3 = '' OR lower(resource_id) LIKE $3)
+		  AND ($4 = '' OR lower(actor_type || ':' || actor_id) LIKE $4 OR lower(actor_id) LIKE $4)
+		  AND ($5::boolean IS NULL OR success = $5)
 		ORDER BY id DESC
-		LIMIT $4
-	`, action, resourceType, resourceID, limit)
+		LIMIT $6 OFFSET $7
+	`, actionPattern, resourceType, resourceIDPattern, actorPattern, successFilter, limit, offset)
 	if err != nil {
 		return nil, err
 	}

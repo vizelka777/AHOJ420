@@ -257,6 +257,7 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/login`
 - `POST /admin/logout`
 - `GET /admin/`
+- `GET /admin/audit`
 - `GET /admin/clients`
 - `GET /admin/clients/new`
 - `POST /admin/clients/new`
@@ -292,6 +293,7 @@ Security behavior:
 - secret hashes and plaintext secrets are never returned from list/detail endpoints
 - `plain_secret` is returned one-time only in `POST .../secrets` when `generate=true`
 - generated secret in HTML UI is shown one-time on the immediate success page and never persisted for later reads
+- admin audit viewer (`GET /admin/audit`) is read-only and redacts sensitive keys from rendered `details_json`
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
 - admin requests include `X-Request-ID`

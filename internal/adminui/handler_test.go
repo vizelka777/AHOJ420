@@ -66,6 +66,150 @@ func TestClientsRequireSession(t *testing.T) {
 	}
 }
 
+func TestAuditLogPageRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/audit", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestAuditLogPageFiltersAndHidesSensitiveDetails(t *testing.T) {
+	auth := &fakeUIAuth{}
+	auditStore := &fakeAuditStore{
+		entries: []store.AdminAuditEntry{
+			{
+				ID:           10,
+				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+				Action:       "admin.oidc_client.create",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "alice",
+				ResourceType: "oidc_client",
+				ResourceID:   "client-a",
+				RequestID:    "req-1",
+				RemoteIP:     "10.0.0.1",
+				DetailsJSON:  json.RawMessage(`{"redirect_uri_count":1}`),
+			},
+			{
+				ID:           11,
+				CreatedAt:    time.Now().UTC().Add(-1 * time.Minute),
+				Action:       "admin.oidc_client.create",
+				Success:      false,
+				ActorType:    "admin_user",
+				ActorID:      "alice",
+				ResourceType: "oidc_client",
+				ResourceID:   "client-b",
+				RequestID:    "req-2",
+				RemoteIP:     "10.0.0.2",
+				DetailsJSON:  json.RawMessage(`{"error":"validation_failed","secret":"TOP_SECRET_VALUE","token":"jwt"}`),
+			},
+			{
+				ID:           12,
+				CreatedAt:    time.Now().UTC(),
+				Action:       "admin.auth.login.success",
+				Success:      true,
+				ActorType:    "admin_user",
+				ActorID:      "bob",
+				ResourceType: "admin_user",
+				ResourceID:   "bob",
+				RequestID:    "req-3",
+				RemoteIP:     "10.0.0.3",
+				DetailsJSON:  json.RawMessage(`{"login":"bob"}`),
+			},
+		},
+	}
+
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, auditStore)
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/audit?action=admin.oidc_client.create&success=failure&actor=alice&resource_id=client-b", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Admin Audit Log") {
+		t.Fatalf("expected audit page header")
+	}
+	if !strings.Contains(body, "client-b") || !strings.Contains(body, "req-2") {
+		t.Fatalf("expected filtered entry in response")
+	}
+	if strings.Contains(body, "client-a") || strings.Contains(body, "req-1") || strings.Contains(body, "bob") {
+		t.Fatalf("response contains entries that should have been filtered out: %s", body)
+	}
+	if strings.Contains(body, "TOP_SECRET_VALUE") || strings.Contains(strings.ToLower(body), "\"secret\"") || strings.Contains(strings.ToLower(body), "\"token\"") {
+		t.Fatalf("audit details leaked sensitive values: %s", body)
+	}
+	if !strings.Contains(body, "validation_failed") {
+		t.Fatalf("expected safe details_json fields in response")
+	}
+}
+
+func TestAuditLogPagination(t *testing.T) {
+	auth := &fakeUIAuth{}
+	auditEntries := make([]store.AdminAuditEntry, 0, 30)
+	now := time.Now().UTC()
+	for i := 1; i <= 30; i++ {
+		auditEntries = append(auditEntries, store.AdminAuditEntry{
+			ID:           int64(i),
+			CreatedAt:    now.Add(-time.Duration(i) * time.Second),
+			Action:       fmt.Sprintf("action-%02d", i),
+			Success:      i%2 == 0,
+			ActorType:    "admin_user",
+			ActorID:      "pager",
+			ResourceType: "oidc_client",
+			ResourceID:   fmt.Sprintf("client-%02d", i),
+			RequestID:    fmt.Sprintf("req-%02d", i),
+			RemoteIP:     "127.0.0.1",
+			DetailsJSON:  json.RawMessage(`{"index":1}`),
+		})
+	}
+
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{entries: auditEntries})
+
+	page1 := doUIRequest(t, e, http.MethodGet, "/admin/audit", nil, auth.sessionCookies())
+	if page1.Code != http.StatusOK {
+		t.Fatalf("expected page 1 200, got %d body=%s", page1.Code, page1.Body.String())
+	}
+	body1 := page1.Body.String()
+	if !strings.Contains(body1, "action-30") || !strings.Contains(body1, "action-06") {
+		t.Fatalf("expected newest entries on page 1")
+	}
+	if strings.Contains(body1, "action-05") {
+		t.Fatalf("page 1 should not include second-page entries")
+	}
+	if !strings.Contains(body1, ">Next<") {
+		t.Fatalf("expected next link on page 1")
+	}
+	if strings.Contains(body1, ">Previous<") {
+		t.Fatalf("did not expect previous link on page 1")
+	}
+
+	page2 := doUIRequest(t, e, http.MethodGet, "/admin/audit?page=2", nil, auth.sessionCookies())
+	if page2.Code != http.StatusOK {
+		t.Fatalf("expected page 2 200, got %d body=%s", page2.Code, page2.Body.String())
+	}
+	body2 := page2.Body.String()
+	if !strings.Contains(body2, "Page 2") {
+		t.Fatalf("expected page marker for page 2")
+	}
+	if !strings.Contains(body2, "action-05") || !strings.Contains(body2, "action-01") {
+		t.Fatalf("expected second page entries")
+	}
+	if strings.Contains(body2, "action-30") {
+		t.Fatalf("page 2 should not include first-page entries")
+	}
+	if !strings.Contains(body2, ">Previous<") {
+		t.Fatalf("expected previous link on page 2")
+	}
+	if strings.Contains(body2, ">Next<") {
+		t.Fatalf("did not expect next link on last page")
+	}
+}
+
 func TestCreateClientCSRFMissingTokenRejected(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -668,6 +812,60 @@ func (a *fakeAuditStore) CreateAdminAuditEntry(ctx context.Context, entry store.
 	return nil
 }
 
+func (a *fakeAuditStore) ListAdminAuditEntries(ctx context.Context, opts store.AdminAuditListOptions) ([]store.AdminAuditEntry, error) {
+	limit := opts.Limit
+	offset := opts.Offset
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	action := strings.TrimSpace(opts.Action)
+	resourceType := strings.TrimSpace(opts.ResourceType)
+	resourceID := strings.TrimSpace(opts.ResourceID)
+	actor := strings.ToLower(strings.TrimSpace(opts.Actor))
+
+	filtered := make([]store.AdminAuditEntry, 0, len(a.entries))
+	for _, entry := range a.entries {
+		if action != "" && !strings.Contains(strings.ToLower(strings.TrimSpace(entry.Action)), strings.ToLower(action)) {
+			continue
+		}
+		if resourceType != "" && strings.TrimSpace(entry.ResourceType) != resourceType {
+			continue
+		}
+		if resourceID != "" && !strings.Contains(strings.ToLower(strings.TrimSpace(entry.ResourceID)), strings.ToLower(resourceID)) {
+			continue
+		}
+		if opts.Success != nil && entry.Success != *opts.Success {
+			continue
+		}
+		if actor != "" {
+			combinedActor := strings.ToLower(strings.TrimSpace(entry.ActorType) + ":" + strings.TrimSpace(entry.ActorID))
+			actorID := strings.ToLower(strings.TrimSpace(entry.ActorID))
+			if !strings.Contains(combinedActor, actor) && !strings.Contains(actorID, actor) {
+				continue
+			}
+		}
+
+		item := entry
+		item.DetailsJSON = append([]byte(nil), entry.DetailsJSON...)
+		filtered = append(filtered, item)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID > filtered[j].ID })
+
+	if offset >= len(filtered) {
+		return []store.AdminAuditEntry{}, nil
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return append([]store.AdminAuditEntry(nil), filtered[offset:end]...), nil
+}
+
 type fakeUIStore struct {
 	clients      map[string]store.OIDCClient
 	secrets      map[string][]store.OIDCClientSecret
@@ -909,10 +1107,10 @@ func extractCSRFTokenFromPage(body string) string {
 
 func TestAuditDetailsJSONNeverContainsSecretMaterial(t *testing.T) {
 	details := map[string]any{
-		"label":       "x",
+		"label":        "x",
 		"plain_secret": "hidden",
-		"secret_hash": "hashed",
-		"secret":      "raw",
+		"secret_hash":  "hashed",
+		"secret":       "raw",
 	}
 	payload := buildAuditDetailsJSON(details, 5, nil)
 	if strings.Contains(string(payload), "hidden") || strings.Contains(string(payload), "hashed") || strings.Contains(string(payload), "raw") {
