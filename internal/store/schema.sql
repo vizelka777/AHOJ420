@@ -187,6 +187,31 @@ CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx
 CREATE INDEX IF NOT EXISTS admin_audit_log_resource_idx
     ON admin_audit_log (resource_type, resource_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS user_security_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_type TEXT NOT NULL,
+    category TEXT NOT NULL,
+    success BOOLEAN,
+    actor_type TEXT NOT NULL DEFAULT 'user',
+    actor_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    credential_id TEXT NOT NULL DEFAULT '',
+    client_id TEXT NOT NULL DEFAULT '',
+    remote_ip TEXT NOT NULL DEFAULT '',
+    details_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS user_security_events_user_created_idx
+    ON user_security_events (user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_security_events_user_category_created_idx
+    ON user_security_events (user_id, category, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_security_events_type_created_idx
+    ON user_security_events (event_type, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS user_oidc_clients (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     client_id TEXT NOT NULL,

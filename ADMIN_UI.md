@@ -180,12 +180,9 @@ Protected (admin session required):
   - summary (id, created_at, profile contacts + verification, avatar presence)
   - recent security events timeline (read-only, user-scoped):
     - latest security/auth/support events with time, label, status, actor, safe details
-    - category filter via query param: `?events=all|auth|recovery|passkeys|sessions|admin`
-    - current MVP data sources:
-      - admin support actions from `admin_audit_log` (`admin.user.*`)
-      - user passkey metadata (`created_at`, `last_used_at`)
-      - active user session metadata (`created_at`, `last_seen_at`)
-      - linked OIDC client activity (`first_seen_at`, `last_seen_at`)
+    - category filter via query param: `?events=all|auth|recovery|passkey|session|admin` (`passkeys/sessions` aliases are accepted)
+    - primary source of truth: `user_security_events` (structured events)
+    - fallback source (only when no structured events exist): linked OIDC client activity (`first_seen_at`, `last_seen_at`)
   - passkeys list (credential id, label, created_at, last_used_at)
   - active sessions list (session id, created_at, last_seen_at, expires_at, ip, user-agent)
   - linked OIDC clients list (client id, first_seen_at, last_seen_at)
@@ -201,7 +198,24 @@ Protected (admin session required):
 - security posture:
   - all mutating routes are CSRF-protected by existing admin UI CSRF middleware
   - section is mostly read-only (no profile editing, no user deletion, no impersonation)
-  - timeline details are sanitized (secret/token/password/authorization fields are removed)
+  - timeline details are sanitized in storage + render path (secret/token/password/authorization/challenge/assertion fields are removed)
+
+## Structured user security events
+- PostgreSQL table: `user_security_events`
+- key columns:
+  - `user_id`, `created_at`, `event_type`, `category`, `success`
+  - `actor_type`, `actor_id`
+  - `session_id`, `credential_id`, `client_id`, `remote_ip`
+  - `details_json` (safe metadata only)
+- events currently written from real flows:
+  - auth: `login_success`, `login_failure`
+  - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
+  - session: `session_created`, `session_revoked`, `session_logout_all`
+  - passkey: `passkey_added`, `passkey_revoked`
+- admin support actions are mirrored into user timeline events (in addition to `admin_audit_log`):
+  - logout one session
+  - logout all sessions
+  - revoke user passkey
 
 ## One-time secret reveal
 When creating a secret with `Generate secret automatically`:

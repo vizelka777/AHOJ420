@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -25,15 +26,20 @@ import (
 )
 
 type Service struct {
-	wa         *webauthn.WebAuthn
-	store      *store.Store
-	redis      *redis.Client
-	provider   *mp.Provider
-	sessionTTL time.Duration
-	avatarCfg  avatarConfig
-	mailer     emailSender
-	smsSender  smsSender
-	devMode    bool
+	wa                 *webauthn.WebAuthn
+	store              *store.Store
+	userSecurityEvents userSecurityEventStore
+	redis              *redis.Client
+	provider           *mp.Provider
+	sessionTTL         time.Duration
+	avatarCfg          avatarConfig
+	mailer             emailSender
+	smsSender          smsSender
+	devMode            bool
+}
+
+type userSecurityEventStore interface {
+	CreateUserSecurityEvent(ctx context.Context, entry store.UserSecurityEvent) error
 }
 
 type avatarConfig struct {
@@ -110,14 +116,15 @@ func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
 		}
 	}
 	return &Service{
-		wa:         w,
-		store:      s,
-		redis:      r,
-		provider:   p,
-		sessionTTL: time.Duration(ttlMinutes) * time.Minute,
-		mailer:     mailer,
-		smsSender:  smsSender,
-		devMode:    devMode,
+		wa:                 w,
+		store:              s,
+		userSecurityEvents: s,
+		redis:              r,
+		provider:           p,
+		sessionTTL:         time.Duration(ttlMinutes) * time.Minute,
+		mailer:             mailer,
+		smsSender:          smsSender,
+		devMode:            devMode,
 		avatarCfg: avatarConfig{
 			publicBase: strings.TrimSpace(os.Getenv("AVATAR_PUBLIC_BASE")),
 			endpoint:   strings.TrimSpace(defaultString(os.Getenv("BUNNY_STORAGE_ENDPOINT"), "storage.bunnycdn.com")),
@@ -173,6 +180,17 @@ func (s *Service) setUserSessionWithCredentialID(c echo.Context, userID, credent
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(s.sessionTTL.Seconds()),
+	})
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:       userID,
+		EventType:    store.UserSecurityEventSessionCreated,
+		Category:     store.UserSecurityCategorySession,
+		Success:      boolPointer(true),
+		ActorType:    "user",
+		ActorID:      userID,
+		SessionID:    userSessionID,
+		CredentialID: strings.TrimSpace(credentialID),
+		DetailsJSON:  userSecurityDetailsJSON(map[string]any{"source": "auth_session"}),
 	})
 	return userSessionID, nil
 }
@@ -339,6 +357,18 @@ func (s *Service) FinishRegistration(c echo.Context) error {
 		return c.String(http.StatusInternalServerError, "Failed to save credential")
 	}
 
+	credentialID := encodeCredentialID(credential.ID)
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:       user.ID,
+		EventType:    store.UserSecurityEventPasskeyAdded,
+		Category:     store.UserSecurityCategoryPasskey,
+		Success:      boolPointer(true),
+		ActorType:    "user",
+		ActorID:      user.ID,
+		CredentialID: credentialID,
+		DetailsJSON:  userSecurityDetailsJSON(map[string]any{"source": "registration"}),
+	})
+
 	if recoveryMode {
 		s.clearRecoveryMode(c, recoverySessionID)
 	} else if sessionID, ok := s.sessionID(c); ok {
@@ -420,6 +450,17 @@ func (s *Service) BeginLogin(c echo.Context) error {
 		options, session, err = s.wa.BeginLogin(user, opts...)
 	}
 	if err != nil {
+		if user != nil {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      user.ID,
+				EventType:   store.UserSecurityEventLoginFailure,
+				Category:    store.UserSecurityCategoryAuth,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     user.ID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "begin_login_failed"}),
+			})
+		}
 		return c.String(http.StatusInternalServerError, err.Error())
 	}
 
@@ -466,6 +507,7 @@ func (s *Service) FinishLogin(c echo.Context) error {
 	if err := json.Unmarshal(sessionJSON, &session); err != nil {
 		return c.String(http.StatusInternalServerError, "Session invalid")
 	}
+	attemptedUserID := strings.TrimSpace(string(session.UserID))
 
 	// 3. Verify Assertion (discoverable vs non-discoverable)
 	var user *store.User
@@ -494,12 +536,38 @@ func (s *Service) FinishLogin(c echo.Context) error {
 		// Non-discoverable flow: session has user ID
 		user, err = s.store.GetUser(string(session.UserID))
 		if err != nil {
+			if attemptedUserID != "" {
+				s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+					UserID:      attemptedUserID,
+					EventType:   store.UserSecurityEventLoginFailure,
+					Category:    store.UserSecurityCategoryAuth,
+					Success:     boolPointer(false),
+					ActorType:   "user",
+					ActorID:     attemptedUserID,
+					DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "user_not_found"}),
+				})
+			}
 			return c.String(http.StatusInternalServerError, "User not found")
 		}
 		credential, err = s.wa.FinishLogin(user, session, c.Request())
 	}
 
 	if err != nil {
+		eventUserID := attemptedUserID
+		if eventUserID == "" && user != nil {
+			eventUserID = strings.TrimSpace(user.ID)
+		}
+		if eventUserID != "" {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      eventUserID,
+				EventType:   store.UserSecurityEventLoginFailure,
+				Category:    store.UserSecurityCategoryAuth,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     eventUserID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "assertion_failed"}),
+			})
+		}
 		return c.String(http.StatusBadRequest, fmt.Sprintf("Login failed: %v", err))
 	}
 	if user == nil {
@@ -509,6 +577,16 @@ func (s *Service) FinishLogin(c echo.Context) error {
 	// 5. Update Counters
 	if credential.Authenticator.CloneWarning {
 		fmt.Println("CLONE WARNING for user", user.LoginID)
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:       user.ID,
+			EventType:    store.UserSecurityEventLoginFailure,
+			Category:     store.UserSecurityCategoryAuth,
+			Success:      boolPointer(false),
+			ActorType:    "user",
+			ActorID:      user.ID,
+			CredentialID: encodeCredentialID(credential.ID),
+			DetailsJSON:  userSecurityDetailsJSON(map[string]any{"reason": "clone_warning"}),
+		})
 		return c.String(http.StatusForbidden, "Security Alert: Possible credential clone")
 	}
 
@@ -516,9 +594,21 @@ func (s *Service) FinishLogin(c echo.Context) error {
 		fmt.Printf("Failed to update credential stats: %v\n", err)
 	}
 
-	if _, err := s.setUserSessionWithCredentialID(c, user.ID, encodeCredentialID(credential.ID)); err != nil {
+	userSessionID, err := s.setUserSessionWithCredentialID(c, user.ID, encodeCredentialID(credential.ID))
+	if err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to create session")
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:       user.ID,
+		EventType:    store.UserSecurityEventLoginSuccess,
+		Category:     store.UserSecurityCategoryAuth,
+		Success:      boolPointer(true),
+		ActorType:    "user",
+		ActorID:      user.ID,
+		SessionID:    userSessionID,
+		CredentialID: encodeCredentialID(credential.ID),
+		DetailsJSON:  userSecurityDetailsJSON(map[string]any{"source": "login_finish"}),
+	})
 
 	authReqID := c.QueryParam("auth_request_id")
 	if authReqID == "" {
@@ -566,9 +656,29 @@ func (s *Service) LogoutRedirect(c echo.Context) error {
 }
 
 func (s *Service) clearUserSession(c echo.Context) {
+	sessionID := ""
+	userID := ""
 	if cookie, err := c.Cookie("user_session"); err == nil && cookie.Value != "" {
-		_ = s.redis.Del(c.Request().Context(), "sess:"+cookie.Value).Err()
-		_ = s.redis.Del(c.Request().Context(), "recovery:"+cookie.Value).Err()
+		sessionID = strings.TrimSpace(cookie.Value)
+		if sessionID != "" {
+			if ownerID, ownerErr := s.redis.Get(c.Request().Context(), "sess:"+sessionID).Result(); ownerErr == nil {
+				userID = strings.TrimSpace(ownerID)
+			}
+			_ = s.redis.Del(c.Request().Context(), "sess:"+sessionID).Err()
+			_ = s.redis.Del(c.Request().Context(), "recovery:"+sessionID).Err()
+		}
+	}
+	if userID != "" && sessionID != "" {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventSessionRevoked,
+			Category:    store.UserSecurityCategorySession,
+			Success:     boolPointer(true),
+			ActorType:   "user",
+			ActorID:     userID,
+			SessionID:   sessionID,
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "logout"}),
+		})
 	}
 	c.SetCookie(&http.Cookie{
 		Name:     "user_session",

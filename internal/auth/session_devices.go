@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 )
@@ -295,6 +296,7 @@ func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string
 	if userID == "" || len(credentialID) == 0 {
 		return false, nil
 	}
+	credentialDisplayID := encodeCredentialID(credentialID)
 
 	allKey := deviceSessionAllKey(userID)
 	sessionIDs, err := s.redis.ZRange(ctx, allKey, 0, -1).Result()
@@ -391,6 +393,17 @@ func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string
 		if cleanupErr := s.cleanupSessionArtifacts(ctx, userID, sessionID, meta); cleanupErr != nil {
 			return false, cleanupErr
 		}
+		s.writeUserSecurityEvent(ctx, store.UserSecurityEvent{
+			UserID:       userID,
+			EventType:    store.UserSecurityEventSessionRevoked,
+			Category:     store.UserSecurityCategorySession,
+			Success:      boolPointer(true),
+			ActorType:    "user",
+			ActorID:      userID,
+			SessionID:    sessionID,
+			CredentialID: credentialDisplayID,
+			DetailsJSON:  userSecurityDetailsJSON(map[string]any{"reason": "passkey_revoked"}),
+		})
 		if sessionID == currentSessionID {
 			removedCurrent = true
 		}
@@ -712,6 +725,16 @@ func (s *Service) LogoutDeviceSession(c echo.Context) error {
 			MaxAge:   -1,
 		})
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventSessionRevoked,
+		Category:    store.UserSecurityCategorySession,
+		Success:     boolPointer(true),
+		ActorType:   "user",
+		ActorID:     userID,
+		SessionID:   sessionID,
+		DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "logout_device", "current_logged_out": currentLoggedOut}),
+	})
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":             "ok",
@@ -827,6 +850,16 @@ func (s *Service) RemoveDeviceSession(c echo.Context) error {
 			MaxAge:   -1,
 		})
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventSessionRevoked,
+		Category:    store.UserSecurityCategorySession,
+		Success:     boolPointer(true),
+		ActorType:   "user",
+		ActorID:     userID,
+		SessionID:   sessionID,
+		DetailsJSON: userSecurityDetailsJSON(map[string]any{"reason": "remove_device", "current_removed": removedCurrent}),
+	})
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":             "removed",

@@ -145,3 +145,40 @@
 Проверки:
 - `go test ./internal/adminui` (dockerized Go) — `ok`.
 - `go test ./...` (dockerized Go) — `ok`.
+
+### Structured User Auth/Recovery Events + Timeline Integration
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Добавлен structured store `user_security_events`:
+  - схема в `internal/store/schema.sql`
+  - индексы: `(user_id, created_at desc)`, `(user_id, category, created_at desc)`, `(event_type, created_at desc)`
+- Добавлен store layer: `internal/store/user_security_events.go`:
+  - `CreateUserSecurityEvent(...)`
+  - `ListUserSecurityEvents(...)`
+  - фильтры/лимиты + sanitization `details_json` (без `secret/token/password/authorization/challenge/assertion/public_key`)
+- В user auth/recovery flow начата запись structured events:
+  - login: `login_success`, `login_failure`
+  - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
+  - sessions: `session_created`, `session_revoked`
+  - passkeys: `passkey_added`, `passkey_revoked`
+- Admin support actions из `/admin/users/:id` теперь зеркалятся в `user_security_events` (кроме `admin_audit_log`):
+  - logout one session
+  - logout all sessions
+  - revoke user passkey
+- User detail timeline (`GET /admin/users/:id`) переведён на structured events как primary source:
+  - фильтр: `all|auth|recovery|passkey|session|admin` (+ aliases `passkeys/sessions`)
+  - fallback на linked-client activity остаётся только если structured stream пуст
+  - добавлен человекочитаемый label mapping (`Login succeeded`, `Recovery requested`, `Admin revoked user passkey`, и т.д.)
+
+Тесты:
+- обновлены и расширены `internal/adminui/handler_test.go`:
+  - timeline рендерит structured events
+  - category filters работают для structured categories
+  - timeline предпочитает structured stream (без лишнего inferred fallback)
+  - sensitive fields не отображаются
+  - support actions создают audit + mirrored user security events
+- auth/store пакетные проверки:
+  - `go test ./internal/adminui ./internal/auth` (dockerized Go) — `ok`
+  - `go test ./internal/store` (dockerized Go) — `ok`

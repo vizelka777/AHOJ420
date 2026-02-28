@@ -553,27 +553,41 @@ func TestUserDetailRendersSummaryPasskeysSessionsAndClients(t *testing.T) {
 func TestUserDetailTimelineRendersEvents(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	user := fakeStore.seedSupportUser("user-timeline", "timeline@login.local", "timeline@example.com", "+421")
-	lastUsed := time.Now().UTC().Add(-25 * time.Minute)
-	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
-		{
-			ID:         []byte{0x10, 0x20, 0x30},
-			DeviceName: "Phone",
-			CreatedAt:  time.Now().UTC().Add(-4 * time.Hour),
-			LastUsedAt: &lastUsed,
-		},
-	}
+	success := true
+	failure := false
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      user.ID,
+		EventType:   store.UserSecurityEventLoginFailure,
+		Category:    store.UserSecurityCategoryAuth,
+		Success:     &failure,
+		ActorType:   "user",
+		ActorID:     user.ID,
+		DetailsJSON: json.RawMessage(`{"reason":"assertion_failed"}`),
+		CreatedAt:   time.Now().UTC().Add(-3 * time.Minute),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      user.ID,
+		EventType:   store.UserSecurityEventLoginSuccess,
+		Category:    store.UserSecurityCategoryAuth,
+		Success:     &success,
+		ActorType:   "user",
+		ActorID:     user.ID,
+		SessionID:   "timeline-session",
+		DetailsJSON: json.RawMessage(`{"source":"login_finish"}`),
+		CreatedAt:   time.Now().UTC().Add(-2 * time.Minute),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      user.ID,
+		EventType:   store.UserSecurityEventRecoveryReq,
+		Category:    store.UserSecurityCategoryRecovery,
+		Success:     &success,
+		ActorType:   "user",
+		ActorID:     user.ID,
+		DetailsJSON: json.RawMessage(`{"channel":"email"}`),
+		CreatedAt:   time.Now().UTC().Add(-1 * time.Minute),
+	})
 
-	auth := &fakeUIAuth{
-		userSessions: map[string][]store.UserSessionInfo{
-			user.ID: {
-				{
-					SessionID:  "timeline-session",
-					CreatedAt:  time.Now().UTC().Add(-2 * time.Hour),
-					LastSeenAt: time.Now().UTC().Add(-10 * time.Minute),
-				},
-			},
-		},
-	}
+	auth := &fakeUIAuth{}
 	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
 
 	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
@@ -583,9 +597,9 @@ func TestUserDetailTimelineRendersEvents(t *testing.T) {
 	body := rec.Body.String()
 	for _, expected := range []string{
 		"Recent security events",
-		"Passkey registered",
-		"Passkey used for authentication",
-		"Session started",
+		"Login failed",
+		"Login succeeded",
+		"Recovery requested",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("expected %q in timeline output, body=%s", expected, body)
@@ -611,12 +625,28 @@ func TestUserDetailTimelineEmptyFallback(t *testing.T) {
 func TestUserDetailTimelineCategoryFilter(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	user := fakeStore.seedSupportUser("user-filter-events", "filter@login.local", "filter@example.com", "+900")
-	fakeStore.userCredentials[user.ID] = []store.CredentialRecord{
-		{ID: []byte{0x21, 0x22, 0x23}, CreatedAt: time.Now().UTC().Add(-4 * time.Hour)},
-	}
-	fakeStore.userLinkedClients[user.ID] = []store.UserOIDCClient{
-		{ClientID: "client-filter", FirstSeenAt: time.Now().UTC().Add(-3 * time.Hour), LastSeenAt: time.Now().UTC().Add(-40 * time.Minute)},
-	}
+	success := true
+	failure := false
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:       user.ID,
+		EventType:    store.UserSecurityEventPasskeyAdded,
+		Category:     store.UserSecurityCategoryPasskey,
+		Success:      &success,
+		ActorType:    "user",
+		ActorID:      user.ID,
+		CredentialID: "cred-filter",
+		CreatedAt:    time.Now().UTC().Add(-4 * time.Hour),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      user.ID,
+		EventType:   store.UserSecurityEventLoginFailure,
+		Category:    store.UserSecurityCategoryAuth,
+		Success:     &failure,
+		ActorType:   "user",
+		ActorID:     user.ID,
+		DetailsJSON: json.RawMessage(`{"reason":"assertion_failed"}`),
+		CreatedAt:   time.Now().UTC().Add(-2 * time.Hour),
+	})
 	auth := &fakeUIAuth{}
 	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
 
@@ -625,10 +655,10 @@ func TestUserDetailTimelineCategoryFilter(t *testing.T) {
 		t.Fatalf("expected 200 for passkeys filter, got %d body=%s", recPasskeys.Code, recPasskeys.Body.String())
 	}
 	bodyPasskeys := recPasskeys.Body.String()
-	if !strings.Contains(bodyPasskeys, "Passkey registered") {
+	if !strings.Contains(bodyPasskeys, "Passkey added") {
 		t.Fatalf("expected passkey event in passkeys filter, body=%s", bodyPasskeys)
 	}
-	if strings.Contains(bodyPasskeys, "OIDC client linked to user") {
+	if strings.Contains(bodyPasskeys, "Login failed") {
 		t.Fatalf("did not expect auth event in passkeys filter, body=%s", bodyPasskeys)
 	}
 
@@ -637,34 +667,66 @@ func TestUserDetailTimelineCategoryFilter(t *testing.T) {
 		t.Fatalf("expected 200 for auth filter, got %d body=%s", recAuth.Code, recAuth.Body.String())
 	}
 	bodyAuth := recAuth.Body.String()
-	if !strings.Contains(bodyAuth, "OIDC client linked to user") {
+	if !strings.Contains(bodyAuth, "Login failed") {
 		t.Fatalf("expected auth event in auth filter, body=%s", bodyAuth)
 	}
-	if strings.Contains(bodyAuth, "Passkey registered") {
+	if strings.Contains(bodyAuth, "Passkey added") {
 		t.Fatalf("did not expect passkey-created event in auth filter, body=%s", bodyAuth)
+	}
+}
+
+func TestUserDetailTimelinePrefersStructuredEvents(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	user := fakeStore.seedSupportUser("user-structured", "structured@login.local", "structured@example.com", "+904")
+	success := true
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:       user.ID,
+		EventType:    store.UserSecurityEventPasskeyAdded,
+		Category:     store.UserSecurityCategoryPasskey,
+		Success:      &success,
+		ActorType:    "user",
+		ActorID:      user.ID,
+		CredentialID: "cred-structured",
+		CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+	})
+	// Inferred metadata exists but should not be used when structured events are present.
+	fakeStore.userLinkedClients[user.ID] = []store.UserOIDCClient{
+		{ClientID: "client-inferred", FirstSeenAt: time.Now().UTC().Add(-5 * time.Minute), LastSeenAt: time.Now().UTC().Add(-4 * time.Minute)},
+	}
+
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for structured timeline, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Passkey added") {
+		t.Fatalf("expected structured passkey event on timeline, body=%s", body)
+	}
+	if strings.Contains(body, "OIDC client linked to user") {
+		t.Fatalf("did not expect inferred fallback events when structured events exist, body=%s", body)
 	}
 }
 
 func TestUserDetailTimelineHidesSensitiveFields(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	user := fakeStore.seedSupportUser("user-sensitive", "sensitive@login.local", "sensitive@example.com", "+901")
+	success := false
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:       user.ID,
+		EventType:    store.UserSecurityEventPasskeyRevoked,
+		Category:     store.UserSecurityCategoryAdmin,
+		Success:      &success,
+		ActorType:    "admin_user",
+		ActorID:      "admin-1",
+		CredentialID: "deadbeef",
+		DetailsJSON:  json.RawMessage(`{"error":"operation_failed","token":"TOP_TOKEN","secret":"TOP_SECRET","authorization":"Bearer leaked"}`),
+		CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
+	})
 	auth := &fakeUIAuth{}
-	auditStore := &fakeAuditStore{
-		entries: []store.AdminAuditEntry{
-			{
-				ID:           9001,
-				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
-				Action:       "admin.user.passkey.revoke.failure",
-				Success:      false,
-				ActorType:    "admin_user",
-				ActorID:      "admin-1",
-				ResourceType: "user_credential",
-				ResourceID:   "deadbeef",
-				DetailsJSON:  json.RawMessage(`{"user_id":"user-sensitive","error":"operation_failed","token":"TOP_TOKEN","secret":"TOP_SECRET","authorization":"Bearer leaked"}`),
-			},
-		},
-	}
-	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
 
 	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+user.ID, nil, auth.sessionCookies())
 	if rec.Code != http.StatusOK {
@@ -683,56 +745,52 @@ func TestUserDetailTimelineIncludesAdminSupportActions(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	target := fakeStore.seedSupportUser("user-admin-events", "admin.events@login.local", "admin.events@example.com", "+902")
 	_ = fakeStore.seedSupportUser("user-other-events", "other@login.local", "other@example.com", "+903")
+	success := true
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      target.ID,
+		EventType:   store.UserSecurityEventSessionRevoked,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     &success,
+		ActorType:   "admin_user",
+		ActorID:     "admin-1",
+		SessionID:   "sess-1",
+		DetailsJSON: json.RawMessage(`{"action":"admin.user.session.logout"}`),
+		CreatedAt:   time.Now().UTC().Add(-1 * time.Minute),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      target.ID,
+		EventType:   store.UserSecurityEventSessionLogoutAll,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     &success,
+		ActorType:   "admin_user",
+		ActorID:     "admin-1",
+		DetailsJSON: json.RawMessage(`{"removed_count":2}`),
+		CreatedAt:   time.Now().UTC().Add(-2 * time.Minute),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:       target.ID,
+		EventType:    store.UserSecurityEventPasskeyRevoked,
+		Category:     store.UserSecurityCategoryAdmin,
+		Success:      &success,
+		ActorType:    "admin_user",
+		ActorID:      "admin-1",
+		CredentialID: "cred-1",
+		DetailsJSON:  json.RawMessage(`{"action":"admin.user.passkey.revoke"}`),
+		CreatedAt:    time.Now().UTC().Add(-3 * time.Minute),
+	})
+	_ = fakeStore.CreateUserSecurityEvent(context.Background(), store.UserSecurityEvent{
+		UserID:      "user-other-events",
+		EventType:   store.UserSecurityEventSessionRevoked,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     &success,
+		ActorType:   "admin_user",
+		ActorID:     "admin-1",
+		SessionID:   "sess-foreign",
+		DetailsJSON: json.RawMessage(`{"action":"admin.user.session.logout"}`),
+		CreatedAt:   time.Now().UTC().Add(-4 * time.Minute),
+	})
 	auth := &fakeUIAuth{}
-	auditStore := &fakeAuditStore{
-		entries: []store.AdminAuditEntry{
-			{
-				ID:           1,
-				CreatedAt:    time.Now().UTC().Add(-1 * time.Minute),
-				Action:       "admin.user.session.logout.success",
-				Success:      true,
-				ActorType:    "admin_user",
-				ActorID:      "admin-1",
-				ResourceType: "user_session",
-				ResourceID:   "sess-1",
-				DetailsJSON:  json.RawMessage(`{"user_id":"user-admin-events"}`),
-			},
-			{
-				ID:           2,
-				CreatedAt:    time.Now().UTC().Add(-2 * time.Minute),
-				Action:       "admin.user.session.logout_all.success",
-				Success:      true,
-				ActorType:    "admin_user",
-				ActorID:      "admin-1",
-				ResourceType: "user",
-				ResourceID:   "user-admin-events",
-				DetailsJSON:  json.RawMessage(`{"removed_count":2}`),
-			},
-			{
-				ID:           3,
-				CreatedAt:    time.Now().UTC().Add(-3 * time.Minute),
-				Action:       "admin.user.passkey.revoke.success",
-				Success:      true,
-				ActorType:    "admin_user",
-				ActorID:      "admin-1",
-				ResourceType: "user_credential",
-				ResourceID:   "cred-1",
-				DetailsJSON:  json.RawMessage(`{"user_id":"user-admin-events"}`),
-			},
-			{
-				ID:           4,
-				CreatedAt:    time.Now().UTC().Add(-4 * time.Minute),
-				Action:       "admin.user.session.logout.success",
-				Success:      true,
-				ActorType:    "admin_user",
-				ActorID:      "admin-1",
-				ResourceType: "user_session",
-				ResourceID:   "sess-foreign",
-				DetailsJSON:  json.RawMessage(`{"user_id":"user-other-events"}`),
-			},
-		},
-	}
-	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
 
 	rec := doUIRequest(t, e, http.MethodGet, "/admin/users/"+target.ID+"?events=admin", nil, auth.sessionCookies())
 	if rec.Code != http.StatusOK {
@@ -740,7 +798,7 @@ func TestUserDetailTimelineIncludesAdminSupportActions(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, expected := range []string{
-		"Admin logged out user session",
+		"Admin revoked user session",
 		"Admin logged out all user sessions",
 		"Admin revoked user passkey",
 	} {
@@ -778,6 +836,9 @@ func TestUserSessionLogoutActionWritesAudit(t *testing.T) {
 	if !hasAuditAction(auditStore.entries, "admin.user.session.logout.success", true) {
 		t.Fatalf("expected admin.user.session.logout.success audit entry")
 	}
+	if !hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventSessionRevoked, true) {
+		t.Fatalf("expected mirrored user security event session_revoked success")
+	}
 }
 
 func TestUserLogoutAllSessionsRequiresRecentReauth(t *testing.T) {
@@ -813,6 +874,9 @@ func TestUserLogoutAllSessionsRequiresRecentReauth(t *testing.T) {
 	if !hasAuditAction(auditStore.entries, "admin.user.session.logout_all.success", true) {
 		t.Fatalf("expected admin.user.session.logout_all.success audit entry")
 	}
+	if !hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventSessionLogoutAll, true) {
+		t.Fatalf("expected mirrored user security event session_logout_all success")
+	}
 }
 
 func TestUserPasskeyRevokeRequiresRecentReauthAndWritesAudit(t *testing.T) {
@@ -844,6 +908,9 @@ func TestUserPasskeyRevokeRequiresRecentReauthAndWritesAudit(t *testing.T) {
 	}
 	if !hasAuditAction(auditStore.entries, "admin.user.passkey.revoke.success", true) {
 		t.Fatalf("expected admin.user.passkey.revoke.success audit entry")
+	}
+	if !hasUserSecurityEvent(fakeStore.userSecurityEvents, user.ID, store.UserSecurityEventPasskeyRevoked, true) {
+		t.Fatalf("expected mirrored user security event passkey_revoked success")
 	}
 }
 
@@ -2424,6 +2491,8 @@ type fakeUIStore struct {
 	users                map[string]store.AdminUserProfile
 	userCredentials      map[string][]store.CredentialRecord
 	userLinkedClients    map[string][]store.UserOIDCClient
+	userSecurityEvents   []store.UserSecurityEvent
+	nextUserSecurityID   int64
 }
 
 func newFakeUIStore() *fakeUIStore {
@@ -2450,6 +2519,8 @@ func newFakeUIStore() *fakeUIStore {
 		users:                map[string]store.AdminUserProfile{},
 		userCredentials:      map[string][]store.CredentialRecord{},
 		userLinkedClients:    map[string][]store.UserOIDCClient{},
+		userSecurityEvents:   []store.UserSecurityEvent{},
+		nextUserSecurityID:   1,
 	}
 }
 
@@ -3108,6 +3179,84 @@ func (s *fakeUIStore) ListUserOIDCClients(userID string) ([]store.UserOIDCClient
 	return out, nil
 }
 
+func (s *fakeUIStore) CreateUserSecurityEvent(ctx context.Context, entry store.UserSecurityEvent) error {
+	entry.UserID = strings.TrimSpace(entry.UserID)
+	entry.EventType = strings.TrimSpace(entry.EventType)
+	entry.Category = store.NormalizeUserSecurityCategory(entry.Category)
+	entry.ActorType = strings.TrimSpace(entry.ActorType)
+	entry.ActorID = strings.TrimSpace(entry.ActorID)
+	entry.SessionID = strings.TrimSpace(entry.SessionID)
+	entry.CredentialID = strings.TrimSpace(entry.CredentialID)
+	entry.ClientID = strings.TrimSpace(entry.ClientID)
+	entry.RemoteIP = strings.TrimSpace(entry.RemoteIP)
+	if entry.UserID == "" || entry.EventType == "" {
+		return errors.New("invalid user security event")
+	}
+	if entry.Category == "" || entry.Category == store.UserSecurityCategoryAll {
+		entry.Category = store.UserSecurityCategoryAuth
+	}
+	if entry.ActorType == "" {
+		entry.ActorType = "user"
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+	entry.ID = s.nextUserSecurityID
+	s.nextUserSecurityID++
+	entry.DetailsJSON = append([]byte(nil), entry.DetailsJSON...)
+	s.userSecurityEvents = append(s.userSecurityEvents, entry)
+	return nil
+}
+
+func (s *fakeUIStore) ListUserSecurityEvents(ctx context.Context, userID string, filter store.UserSecurityEventFilter) ([]store.UserSecurityEvent, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []store.UserSecurityEvent{}, nil
+	}
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	category := store.NormalizeUserSecurityFilterCategory(filter.Category)
+
+	items := make([]store.UserSecurityEvent, 0, len(s.userSecurityEvents))
+	for _, event := range s.userSecurityEvents {
+		if strings.TrimSpace(event.UserID) != userID {
+			continue
+		}
+		if category != "" && store.NormalizeUserSecurityCategory(event.Category) != category {
+			continue
+		}
+		item := event
+		item.DetailsJSON = append([]byte(nil), event.DetailsJSON...)
+		if event.Success != nil {
+			success := *event.Success
+			item.Success = &success
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ID == items[j].ID {
+			return items[i].CreatedAt.After(items[j].CreatedAt)
+		}
+		return items[i].ID > items[j].ID
+	})
+	if offset >= len(items) {
+		return []store.UserSecurityEvent{}, nil
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	out := make([]store.UserSecurityEvent, 0, end-offset)
+	out = append(out, items[offset:end]...)
+	return out, nil
+}
+
 func extractSecretFromPage(body string) string {
 	startMarker := "<textarea readonly style=\"min-height:80px; font-size:16px;\">"
 	endMarker := "</textarea>"
@@ -3166,6 +3315,22 @@ func hasAuditAction(entries []store.AdminAuditEntry, action string, success bool
 		if strings.TrimSpace(entry.Action) == strings.TrimSpace(action) && entry.Success == success {
 			return true
 		}
+	}
+	return false
+}
+
+func hasUserSecurityEvent(entries []store.UserSecurityEvent, userID string, eventType string, success bool) bool {
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.UserID) != strings.TrimSpace(userID) {
+			continue
+		}
+		if strings.TrimSpace(entry.EventType) != strings.TrimSpace(eventType) {
+			continue
+		}
+		if entry.Success == nil || *entry.Success != success {
+			continue
+		}
+		return true
 	}
 	return false
 }

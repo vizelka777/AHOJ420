@@ -70,32 +70,53 @@ func (s *Service) DeletePasskey(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
 	}
+	userID = strings.TrimSpace(userID)
+	credentialHex := ""
+
+	recordFailure := func(reason string) {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:       userID,
+			EventType:    store.UserSecurityEventPasskeyRevoked,
+			Category:     store.UserSecurityCategoryPasskey,
+			Success:      boolPointer(false),
+			ActorType:    "user",
+			ActorID:      userID,
+			CredentialID: credentialHex,
+			DetailsJSON:  userSecurityDetailsJSON(map[string]any{"reason": strings.TrimSpace(reason)}),
+		})
+	}
 
 	var body passkeyDeletePayload
 	_ = c.Bind(&body)
-	credentialHex := strings.TrimSpace(body.CredentialID)
+	credentialHex = strings.TrimSpace(body.CredentialID)
 	if credentialHex == "" {
 		credentialHex = strings.TrimSpace(c.FormValue("credential_id"))
 	}
 	if credentialHex == "" {
+		recordFailure("missing_credential_id")
 		return c.String(http.StatusBadRequest, "credential_id is required")
 	}
 	if len(credentialHex) > 1024 {
+		recordFailure("credential_id_too_long")
 		return c.String(http.StatusBadRequest, "invalid credential_id")
 	}
 
 	credID, err := hex.DecodeString(credentialHex)
 	if err != nil || len(credID) == 0 {
+		recordFailure("credential_id_decode_failed")
 		return c.String(http.StatusBadRequest, "invalid credential_id")
 	}
 
 	if err := s.store.DeleteCredentialByUserAndID(userID, credID); err != nil {
 		if errors.Is(err, store.ErrCredentialNotFound) {
+			recordFailure("credential_not_found")
 			return c.String(http.StatusNotFound, "Passkey not found")
 		}
 		if errors.Is(err, store.ErrCannotDeleteLastCredential) {
+			recordFailure("last_credential_blocked")
 			return c.String(http.StatusConflict, "Нельзя удалить последний passkey. Используйте восстановление или удаление аккаунта.")
 		}
+		recordFailure("credential_delete_failed")
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
@@ -116,10 +137,20 @@ func (s *Service) DeletePasskey(c echo.Context) error {
 			MaxAge:   -1,
 		})
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:       userID,
+		EventType:    store.UserSecurityEventPasskeyRevoked,
+		Category:     store.UserSecurityCategoryPasskey,
+		Success:      boolPointer(true),
+		ActorType:    "user",
+		ActorID:      userID,
+		CredentialID: credentialHex,
+		SessionID:    currentSessionID,
+		DetailsJSON:  userSecurityDetailsJSON(map[string]any{"current_logged_out": currentLoggedOut}),
+	})
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":             "deleted",
 		"current_logged_out": currentLoggedOut,
 	})
 }
-

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 )
@@ -80,14 +81,41 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 
 		magicLink, tokenKey, err := s.createRecoveryToken(ctx, user.ID)
 		if err != nil {
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      user.ID,
+				EventType:   store.UserSecurityEventRecoveryFailure,
+				Category:    store.UserSecurityCategoryRecovery,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     user.ID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email", "reason": "token_create_failed"}),
+			})
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
 
 		if err := s.sendRecoveryLink(email, magicLink); err != nil {
 			_ = s.redis.Del(ctx, tokenKey).Err()
+			s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+				UserID:      user.ID,
+				EventType:   store.UserSecurityEventRecoveryFailure,
+				Category:    store.UserSecurityCategoryRecovery,
+				Success:     boolPointer(false),
+				ActorType:   "user",
+				ActorID:     user.ID,
+				DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email", "reason": "delivery_failed"}),
+			})
 			log.Printf("Recovery mail send failed for %s: %v", email, err)
 			return c.String(http.StatusInternalServerError, "Internal error")
 		}
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      user.ID,
+			EventType:   store.UserSecurityEventRecoveryReq,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(true),
+			ActorType:   "user",
+			ActorID:     user.ID,
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email"}),
+		})
 
 		return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 	}
@@ -130,14 +158,41 @@ func (s *Service) RequestRecovery(c echo.Context) error {
 
 	codeKey := recoveryPhoneCodeKey(phone)
 	if err := s.redis.Set(ctx, codeKey, tokenPayload, recoveryPhoneCodeTTL).Err(); err != nil {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      user.ID,
+			EventType:   store.UserSecurityEventRecoveryFailure,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(false),
+			ActorType:   "user",
+			ActorID:     user.ID,
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "token_store_failed"}),
+		})
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
 
 	if err := s.sendRecoverySMSCode(ctx, phone, code); err != nil {
 		_ = s.redis.Del(ctx, codeKey).Err()
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      user.ID,
+			EventType:   store.UserSecurityEventRecoveryFailure,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(false),
+			ActorType:   "user",
+			ActorID:     user.ID,
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "delivery_failed"}),
+		})
 		log.Printf("Recovery SMS code send failed for %s: %v", phone, err)
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:      user.ID,
+		EventType:   store.UserSecurityEventRecoveryReq,
+		Category:    store.UserSecurityCategoryRecovery,
+		Success:     boolPointer(true),
+		ActorType:   "user",
+		ActorID:     user.ID,
+		DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone"}),
+	})
 
 	return c.JSON(http.StatusOK, map[string]string{"message": recoveryGenericMessage})
 }
@@ -246,8 +301,26 @@ func (s *Service) VerifyRecovery(c echo.Context) error {
 	}
 
 	if err := s.startRecoveryMode(c, userID); err != nil {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventRecoveryFailure,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(false),
+			ActorType:   "user",
+			ActorID:     userID,
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email", "reason": "start_recovery_mode_failed"}),
+		})
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventRecoverySuccess,
+		Category:    store.UserSecurityCategoryRecovery,
+		Success:     boolPointer(true),
+		ActorType:   "user",
+		ActorID:     userID,
+		DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "email"}),
+	})
 	return c.Redirect(http.StatusTemporaryRedirect, "/?mode=recovery")
 }
 
@@ -299,6 +372,15 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 	inputHash := hashPhoneVerifyCode(code)
 	match := subtle.ConstantTimeCompare([]byte(inputHash), []byte(token.CodeHash)) == 1
 	if !match {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      strings.TrimSpace(token.UserID),
+			EventType:   store.UserSecurityEventRecoveryFailure,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(false),
+			ActorType:   "user",
+			ActorID:     strings.TrimSpace(token.UserID),
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "invalid_code"}),
+		})
 		_, decErr := decrementTokenAttemptsAtomic(ctx, s.redis, codeKey, recoveryPhoneCodeTTL, time.Now())
 		if decErr != nil {
 			if errors.Is(decErr, errVerifyTokenMissing) || errors.Is(decErr, errVerifyAttemptsExhausted) {
@@ -315,8 +397,26 @@ func (s *Service) VerifyRecoveryCode(c echo.Context) error {
 
 	_ = s.redis.Del(ctx, codeKey).Err()
 	if err := s.startRecoveryMode(c, token.UserID); err != nil {
+		s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+			UserID:      strings.TrimSpace(token.UserID),
+			EventType:   store.UserSecurityEventRecoveryFailure,
+			Category:    store.UserSecurityCategoryRecovery,
+			Success:     boolPointer(false),
+			ActorType:   "user",
+			ActorID:     strings.TrimSpace(token.UserID),
+			DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone", "reason": "start_recovery_mode_failed"}),
+		})
 		return c.String(http.StatusInternalServerError, "Internal error")
 	}
+	s.writeUserSecurityEventFromRequest(c, store.UserSecurityEvent{
+		UserID:      strings.TrimSpace(token.UserID),
+		EventType:   store.UserSecurityEventRecoverySuccess,
+		Category:    store.UserSecurityCategoryRecovery,
+		Success:     boolPointer(true),
+		ActorType:   "user",
+		ActorID:     strings.TrimSpace(token.UserID),
+		DetailsJSON: userSecurityDetailsJSON(map[string]any{"channel": "phone"}),
+	})
 	return c.JSON(http.StatusOK, map[string]string{
 		"message":  "Recovery verified",
 		"redirect": "/?mode=recovery",

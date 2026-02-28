@@ -71,6 +71,8 @@ type OIDCClientStore interface {
 	ListCredentialRecords(userID string) ([]store.CredentialRecord, error)
 	DeleteCredentialByUserAndID(userID string, credID []byte) error
 	ListUserOIDCClients(userID string) ([]store.UserOIDCClient, error)
+	CreateUserSecurityEvent(ctx context.Context, entry store.UserSecurityEvent) error
+	ListUserSecurityEvents(ctx context.Context, userID string, filter store.UserSecurityEventFilter) ([]store.UserSecurityEvent, error)
 }
 
 type OIDCClientReloader interface {
@@ -914,12 +916,28 @@ func (h *Handler) UserSessionLogout(c echo.Context) error {
 		h.auditAdminAction(c, "admin.user.session.logout.failure", false, "user_session", sessionID, err, map[string]any{
 			"user_id": userID,
 		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventSessionRevoked,
+			Category:    store.UserSecurityCategoryAdmin,
+			Success:     boolPtr(false),
+			SessionID:   sessionID,
+			DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.session.logout", "reason": "logout_failed"}),
+		})
 		h.setFlash(c, "error", "Failed to sign out user session")
 		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
 	}
 
 	h.auditAdminAction(c, "admin.user.session.logout.success", true, "user_session", sessionID, nil, map[string]any{
 		"user_id": userID,
+	})
+	h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventSessionRevoked,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     boolPtr(true),
+		SessionID:   sessionID,
+		DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.session.logout"}),
 	})
 	h.setFlash(c, "success", "User session signed out")
 	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
@@ -941,6 +959,13 @@ func (h *Handler) UserSessionsLogoutAll(c echo.Context) error {
 		h.auditAdminAction(c, "admin.user.session.logout_all.failure", false, "user", userID, err, map[string]any{
 			"recent_reauth": true,
 		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:      userID,
+			EventType:   store.UserSecurityEventSessionLogoutAll,
+			Category:    store.UserSecurityCategoryAdmin,
+			Success:     boolPtr(false),
+			DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.session.logout_all", "reason": "logout_all_failed"}),
+		})
 		h.setFlash(c, "error", "Failed to sign out all user sessions")
 		return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
 	}
@@ -948,6 +973,13 @@ func (h *Handler) UserSessionsLogoutAll(c echo.Context) error {
 	h.auditAdminAction(c, "admin.user.session.logout_all.success", true, "user", userID, nil, map[string]any{
 		"recent_reauth": true,
 		"removed_count": removed,
+	})
+	h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+		UserID:      userID,
+		EventType:   store.UserSecurityEventSessionLogoutAll,
+		Category:    store.UserSecurityCategoryAdmin,
+		Success:     boolPtr(true),
+		DetailsJSON: userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.session.logout_all", "removed_count": removed}),
 	})
 	if removed == 0 {
 		h.setFlash(c, "success", "No active user sessions to sign out")
@@ -983,6 +1015,14 @@ func (h *Handler) UserPasskeyRevoke(c echo.Context) error {
 			"user_id":       userID,
 			"recent_reauth": true,
 		})
+		h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+			UserID:       userID,
+			EventType:    store.UserSecurityEventPasskeyRevoked,
+			Category:     store.UserSecurityCategoryAdmin,
+			Success:      boolPtr(false),
+			CredentialID: credentialID,
+			DetailsJSON:  userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.passkey.revoke", "reason": "revoke_failed"}),
+		})
 		switch {
 		case errors.Is(err, store.ErrCredentialNotFound):
 			h.setFlash(c, "error", "Passkey not found")
@@ -997,6 +1037,14 @@ func (h *Handler) UserPasskeyRevoke(c echo.Context) error {
 	h.auditAdminAction(c, "admin.user.passkey.revoke.success", true, "user_credential", credentialID, nil, map[string]any{
 		"user_id":       userID,
 		"recent_reauth": true,
+	})
+	h.recordUserSecurityEvent(c, store.UserSecurityEvent{
+		UserID:       userID,
+		EventType:    store.UserSecurityEventPasskeyRevoked,
+		Category:     store.UserSecurityCategoryAdmin,
+		Success:      boolPtr(true),
+		CredentialID: credentialID,
+		DetailsJSON:  userSecurityEventDetailsJSON(map[string]any{"action": "admin.user.passkey.revoke"}),
 	})
 	h.setFlash(c, "success", "User passkey revoked")
 	return c.Redirect(http.StatusSeeOther, "/admin/users/"+userID)
@@ -1014,29 +1062,20 @@ func (h *Handler) listUserSecurityEvents(ctx context.Context, userID string, cat
 	if limit > userTimelineMaxSize {
 		limit = userTimelineMaxSize
 	}
-
-	auditLimit := limit * 5
-	if auditLimit < 100 {
-		auditLimit = 100
-	}
-	if auditLimit > 200 {
-		auditLimit = 200
-	}
-	adminAuditEntries, err := h.auditStore.ListAdminAuditEntries(ctx, store.AdminAuditListOptions{
-		Limit:  auditLimit,
-		Offset: 0,
-		Action: "admin.user.",
+	structuredEvents, err := h.store.ListUserSecurityEvents(ctx, userID, store.UserSecurityEventFilter{
+		Limit:    limit,
+		Offset:   0,
+		Category: category,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	events := make([]userSecurityEvent, 0, len(adminAuditEntries)+len(passkeys)*2+len(sessions)*2+len(linkedClients)*2)
-	events = append(events, buildUserSecurityEventsFromAdminAudit(adminAuditEntries, userID)...)
-	events = append(events, buildUserSecurityEventsFromPasskeys(userID, passkeys)...)
-	events = append(events, buildUserSecurityEventsFromSessions(userID, sessions)...)
-	events = append(events, buildUserSecurityEventsFromLinkedClients(userID, linkedClients)...)
-	events = filterUserSecurityEventsByCategory(events, category)
+	events := buildUserSecurityEventsFromStructured(structuredEvents)
+	if len(events) == 0 {
+		events = append(events, buildUserSecurityEventsFromLinkedClients(userID, linkedClients)...)
+		events = filterUserSecurityEventsByCategory(events, category)
+	}
 
 	sort.Slice(events, func(i, j int) bool {
 		left := events[i]
@@ -1065,130 +1104,121 @@ func (h *Handler) listUserSecurityEvents(ctx context.Context, userID string, cat
 	return out, nil
 }
 
-func buildUserSecurityEventsFromAdminAudit(entries []store.AdminAuditEntry, userID string) []userSecurityEvent {
+func buildUserSecurityEventsFromStructured(entries []store.UserSecurityEvent) []userSecurityEvent {
 	out := make([]userSecurityEvent, 0, len(entries))
 	for _, entry := range entries {
-		details := decodeUserSecurityAuditDetails(entry.DetailsJSON)
-		if !adminAuditEntryBelongsToUser(entry, userID, details) {
-			continue
-		}
-
-		action := strings.TrimSpace(entry.Action)
-		var (
-			eventType   string
-			description string
-		)
-		switch action {
-		case "admin.user.session.logout.success", "admin.user.session.logout.failure":
-			eventType = "admin_session_logout"
-			description = "Admin logged out user session"
-		case "admin.user.session.logout_all.success", "admin.user.session.logout_all.failure":
-			eventType = "admin_session_logout_all"
-			description = "Admin logged out all user sessions"
-		case "admin.user.passkey.revoke.success", "admin.user.passkey.revoke.failure":
-			eventType = "admin_passkey_revoke"
-			description = "Admin revoked user passkey"
-		default:
-			if !strings.HasPrefix(action, "admin.user.") {
-				continue
-			}
-			eventType = strings.ReplaceAll(strings.TrimPrefix(action, "admin."), ".", "_")
-			description = "Admin support action"
-		}
-
-		success := entry.Success
-		out = append(out, userSecurityEvent{
+		details := decodeUserSecurityEventDetails(entry.DetailsJSON)
+		event := userSecurityEvent{
 			Time:        entry.CreatedAt,
-			Type:        eventType,
-			Category:    "admin",
-			Success:     &success,
+			Type:        strings.TrimSpace(entry.EventType),
+			Category:    strings.TrimSpace(entry.Category),
+			Success:     entry.Success,
 			ActorType:   strings.TrimSpace(entry.ActorType),
 			ActorID:     strings.TrimSpace(entry.ActorID),
-			Description: description,
-			ResourceID:  strings.TrimSpace(entry.ResourceID),
+			Description: userSecurityEventLabel(entry),
+			ResourceID:  "",
 			Details:     normalizeUserSecurityEventDetails(details),
-		})
+		}
+		if event.Category == "" {
+			event.Category = store.NormalizeUserSecurityCategory(entry.Category)
+		}
+		if sessionID := strings.TrimSpace(entry.SessionID); sessionID != "" {
+			event.ResourceID = sessionID
+			event.Details["session"] = shortDisplay(sessionID, 10, 8)
+		}
+		if credentialID := strings.TrimSpace(entry.CredentialID); credentialID != "" {
+			if event.ResourceID == "" {
+				event.ResourceID = credentialID
+			}
+			event.Details["credential"] = shortDisplay(credentialID, 12, 8)
+		}
+		if clientID := strings.TrimSpace(entry.ClientID); clientID != "" {
+			if event.ResourceID == "" {
+				event.ResourceID = clientID
+			}
+			event.Details["client_id"] = clientID
+		}
+		if remoteIP := strings.TrimSpace(entry.RemoteIP); remoteIP != "" {
+			event.Details["remote_ip"] = remoteIP
+		}
+		out = append(out, event)
 	}
 	return out
 }
 
-func buildUserSecurityEventsFromPasskeys(userID string, passkeys []store.CredentialRecord) []userSecurityEvent {
-	out := make([]userSecurityEvent, 0, len(passkeys)*2)
-	for _, item := range passkeys {
-		credentialID := hex.EncodeToString(item.ID)
-		credentialTag := shortDisplay(credentialID, 12, 8)
-		out = append(out, userSecurityEvent{
-			Time:        item.CreatedAt,
-			Type:        "passkey_added",
-			Category:    "passkeys",
-			Success:     boolPtr(true),
-			ActorType:   "user",
-			ActorID:     userID,
-			Description: "Passkey registered",
-			ResourceID:  credentialID,
-			Details: map[string]any{
-				"credential": credentialTag,
-			},
-		})
-		if item.LastUsedAt != nil && !item.LastUsedAt.IsZero() {
-			out = append(out, userSecurityEvent{
-				Time:        item.LastUsedAt.UTC(),
-				Type:        "passkey_used",
-				Category:    "auth",
-				Success:     boolPtr(true),
-				ActorType:   "user",
-				ActorID:     userID,
-				Description: "Passkey used for authentication",
-				ResourceID:  credentialID,
-				Details: map[string]any{
-					"credential": credentialTag,
-				},
-			})
-		}
+func decodeUserSecurityEventDetails(raw json.RawMessage) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
 	}
-	return out
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return map[string]any{}
+	}
+	sanitized := sanitizeAuditDetails(decoded)
+	asMap, ok := sanitized.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return asMap
 }
 
-func buildUserSecurityEventsFromSessions(userID string, sessions []store.UserSessionInfo) []userSecurityEvent {
-	out := make([]userSecurityEvent, 0, len(sessions)*2)
-	for _, item := range sessions {
-		sessionID := strings.TrimSpace(item.SessionID)
-		sessionTag := shortDisplay(sessionID, 10, 8)
-		details := map[string]any{
-			"session": sessionTag,
+func userSecurityEventLabel(entry store.UserSecurityEvent) string {
+	eventType := strings.TrimSpace(entry.EventType)
+	actorType := strings.TrimSpace(strings.ToLower(entry.ActorType))
+	switch eventType {
+	case store.UserSecurityEventLoginSuccess:
+		return "Login succeeded"
+	case store.UserSecurityEventLoginFailure:
+		return "Login failed"
+	case store.UserSecurityEventRecoveryReq:
+		return "Recovery requested"
+	case store.UserSecurityEventRecoverySuccess:
+		return "Recovery succeeded"
+	case store.UserSecurityEventRecoveryFailure:
+		return "Recovery failed"
+	case store.UserSecurityEventSessionCreated:
+		return "Session created"
+	case store.UserSecurityEventSessionRevoked:
+		if actorType == "admin" || actorType == "admin_user" {
+			return "Admin revoked user session"
 		}
-		if strings.TrimSpace(item.RemoteIP) != "" {
-			details["remote_ip"] = strings.TrimSpace(item.RemoteIP)
+		return "Session revoked"
+	case store.UserSecurityEventSessionLogoutAll:
+		if actorType == "admin" || actorType == "admin_user" {
+			return "Admin logged out all user sessions"
 		}
-
-		if !item.CreatedAt.IsZero() {
-			out = append(out, userSecurityEvent{
-				Time:        item.CreatedAt,
-				Type:        "session_started",
-				Category:    "sessions",
-				Success:     boolPtr(true),
-				ActorType:   "user",
-				ActorID:     userID,
-				Description: "Session started",
-				ResourceID:  sessionID,
-				Details:     details,
-			})
+		return "All sessions logged out"
+	case store.UserSecurityEventPasskeyAdded:
+		return "Passkey added"
+	case store.UserSecurityEventPasskeyRevoked:
+		if actorType == "admin" || actorType == "admin_user" {
+			return "Admin revoked user passkey"
 		}
-		if !item.LastSeenAt.IsZero() && !item.LastSeenAt.Equal(item.CreatedAt) {
-			out = append(out, userSecurityEvent{
-				Time:        item.LastSeenAt,
-				Type:        "session_activity",
-				Category:    "sessions",
-				Success:     nil,
-				ActorType:   "user",
-				ActorID:     userID,
-				Description: "Session activity observed",
-				ResourceID:  sessionID,
-				Details:     details,
-			})
+		return "Passkey revoked"
+	default:
+		if humanized := humanizeSecurityEventType(eventType); humanized != "" {
+			return humanized
 		}
+		return "Security event"
 	}
-	return out
+}
+
+func humanizeSecurityEventType(eventType string) string {
+	eventType = strings.TrimSpace(strings.ToLower(eventType))
+	if eventType == "" {
+		return ""
+	}
+	parts := strings.Fields(strings.ReplaceAll(eventType, "_", " "))
+	if len(parts) == 0 {
+		return ""
+	}
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 func buildUserSecurityEventsFromLinkedClients(userID string, linkedClients []store.UserOIDCClient) []userSecurityEvent {
@@ -1232,36 +1262,6 @@ func buildUserSecurityEventsFromLinkedClients(userID string, linkedClients []sto
 		}
 	}
 	return out
-}
-
-func decodeUserSecurityAuditDetails(raw json.RawMessage) map[string]any {
-	if len(raw) == 0 {
-		return map[string]any{}
-	}
-	var decoded any
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return map[string]any{}
-	}
-	sanitized := sanitizeAuditDetails(decoded)
-	asMap, ok := sanitized.(map[string]any)
-	if !ok {
-		return map[string]any{}
-	}
-	return asMap
-}
-
-func adminAuditEntryBelongsToUser(entry store.AdminAuditEntry, userID string, details map[string]any) bool {
-	userID = strings.TrimSpace(userID)
-	if userID == "" {
-		return false
-	}
-	if strings.TrimSpace(entry.ResourceID) == userID {
-		return true
-	}
-	if detailUserID := strings.TrimSpace(anyString(details["user_id"])); detailUserID == userID {
-		return true
-	}
-	return false
 }
 
 func normalizeUserSecurityEventDetails(details map[string]any) map[string]any {
@@ -1313,6 +1313,11 @@ func formatUserSecurityActor(event userSecurityEvent, userID string) string {
 			return "user"
 		}
 		return "user:" + actorID
+	case "admin", "admin_user":
+		if actorID == "" {
+			return "admin"
+		}
+		return "admin:" + actorID
 	case "system":
 		if actorID == "" {
 			return "system"
@@ -1362,6 +1367,53 @@ func anyString(value any) string {
 func boolPtr(value bool) *bool {
 	item := value
 	return &item
+}
+
+func userSecurityEventDetailsJSON(details map[string]any) json.RawMessage {
+	if len(details) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	sanitized := sanitizeAuditDetails(details)
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return encoded
+}
+
+func (h *Handler) recordUserSecurityEvent(c echo.Context, entry store.UserSecurityEvent) {
+	entry.UserID = strings.TrimSpace(entry.UserID)
+	if entry.UserID == "" {
+		return
+	}
+
+	if strings.TrimSpace(entry.ActorType) == "" || strings.TrimSpace(entry.ActorID) == "" {
+		actorType, actorID := admin.AdminActorFromContext(c)
+		actorType = strings.TrimSpace(actorType)
+		actorID = strings.TrimSpace(actorID)
+		if actorType == "" || actorID == "" {
+			if current := h.currentAdmin(c); current != nil {
+				if actorType == "" {
+					actorType = "admin_user"
+				}
+				if actorID == "" {
+					actorID = strings.TrimSpace(current.ID)
+				}
+			}
+		}
+		entry.ActorType = strings.TrimSpace(actorType)
+		entry.ActorID = strings.TrimSpace(actorID)
+	}
+	if strings.TrimSpace(entry.ActorType) == "" {
+		entry.ActorType = "admin"
+	}
+	if strings.TrimSpace(entry.RemoteIP) == "" {
+		entry.RemoteIP = strings.TrimSpace(c.RealIP())
+	}
+
+	if err := h.store.CreateUserSecurityEvent(c.Request().Context(), entry); err != nil {
+		log.Printf("adminui user security event write failed user_id=%s event_type=%s error=%v", strings.TrimSpace(entry.UserID), strings.TrimSpace(entry.EventType), err)
+	}
 }
 
 func (h *Handler) InviteAcceptPage(c echo.Context) error {
@@ -3012,19 +3064,19 @@ func parseListPage(raw string) int {
 }
 
 func parseUserEventsFilter(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "auth":
-		return "auth"
-	case "recovery":
-		return "recovery"
-	case "passkeys":
-		return "passkeys"
-	case "sessions":
-		return "sessions"
-	case "admin":
-		return "admin"
+	switch store.NormalizeUserSecurityCategory(raw) {
+	case store.UserSecurityCategoryAuth:
+		return store.UserSecurityCategoryAuth
+	case store.UserSecurityCategoryRecovery:
+		return store.UserSecurityCategoryRecovery
+	case store.UserSecurityCategoryPasskey:
+		return store.UserSecurityCategoryPasskey
+	case store.UserSecurityCategorySession:
+		return store.UserSecurityCategorySession
+	case store.UserSecurityCategoryAdmin:
+		return store.UserSecurityCategoryAdmin
 	default:
-		return "all"
+		return store.UserSecurityCategoryAll
 	}
 }
 
@@ -3097,12 +3149,12 @@ func buildUserTimelineFilterLinks(userID string, selected string) []userTimeline
 		Value string
 		Label string
 	}{
-		{Value: "all", Label: "All"},
-		{Value: "auth", Label: "Auth"},
-		{Value: "recovery", Label: "Recovery"},
-		{Value: "passkeys", Label: "Passkeys"},
-		{Value: "sessions", Label: "Sessions"},
-		{Value: "admin", Label: "Admin actions"},
+		{Value: store.UserSecurityCategoryAll, Label: "All"},
+		{Value: store.UserSecurityCategoryAuth, Label: "Auth"},
+		{Value: store.UserSecurityCategoryRecovery, Label: "Recovery"},
+		{Value: store.UserSecurityCategoryPasskey, Label: "Passkeys"},
+		{Value: store.UserSecurityCategorySession, Label: "Sessions"},
+		{Value: store.UserSecurityCategoryAdmin, Label: "Admin actions"},
 	}
 
 	out := make([]userTimelineFilterLink, 0, len(options))

@@ -340,13 +340,10 @@ Security behavior:
   - no profile editing, no user deletion, no impersonation
   - user detail now includes a read-only `Recent security events` timeline
     - compact user-scoped timeline with event time, label, status, actor, and safe details
-    - category filter: `all|auth|recovery|passkeys|sessions|admin` (`?events=...`)
-    - timeline sources in MVP:
-      - admin support actions from `admin_audit_log` (`admin.user.*`)
-      - user passkey metadata (`created_at`, `last_used_at`)
-      - user session metadata (`created_at`, `last_seen_at`)
-      - linked client activity (`first_seen_at`, `last_seen_at`)
-    - sensitive fields are stripped from rendered details (token/secret/password/authorization)
+    - category filter: `all|auth|recovery|passkey|session|admin` (`?events=...`; `passkeys/sessions` aliases also accepted)
+    - primary source: structured `user_security_events`
+    - fallback source (when structured stream is empty): linked client activity (`first_seen_at`, `last_seen_at`)
+    - sensitive fields are stripped in storage and render path (`token/secret/password/authorization/challenge/assertion`)
   - safe support mutations:
     - logout one user session (`POST /admin/users/:id/sessions/:sessionID/logout`)
     - logout all user sessions (`POST /admin/users/:id/sessions/logout-all`)
@@ -355,6 +352,7 @@ Security behavior:
     - `admin.user.session.logout.success|failure`
     - `admin.user.session.logout_all.success|failure`
     - `admin.user.passkey.revoke.success|failure`
+  - support mutations are also mirrored into `user_security_events` for user-scoped timeline continuity
 - multi-admin model:
   - admins are separate users in `admin_users`
   - roles: `owner`, `admin` (stored in `admin_users.role`)
@@ -387,6 +385,15 @@ Security behavior:
 - successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
 - if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
 - admin requests include `X-Request-ID`
+
+Structured user security event store:
+- table: `user_security_events`
+- key fields: `user_id`, `created_at`, `event_type`, `category`, `success`, `actor_type`, `actor_id`, `session_id`, `credential_id`, `client_id`, `remote_ip`, `details_json`
+- currently written event types:
+  - auth: `login_success`, `login_failure`
+  - recovery: `recovery_requested`, `recovery_success`, `recovery_failure`
+  - session: `session_created`, `session_revoked`, `session_logout_all`
+  - passkey: `passkey_added`, `passkey_revoked`
 
 Audit:
 - mutating admin actions are persisted in PostgreSQL `admin_audit_log` and app logs
