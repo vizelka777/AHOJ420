@@ -74,10 +74,15 @@ Optional for key rotation:
 - `OIDC_PREV_KEY_ID=key-prev`
 - `OIDC_CLIENT_MUSHROOM_BFF_SECRET=<secret>` (bootstrap compatibility fallback for `mushroom-bff` when JSON has no `secrets`)
 
-Admin API:
-- `ADMIN_API_TOKEN=<long-random-shared-secret>`
-- `ADMIN_API_HOST=admin.ahoj420.eu`
-- if either is unset, `/admin/api/*` returns `503` ("admin api disabled")
+Admin API + Admin Auth:
+- `ADMIN_API_HOST=admin.ahoj420.eu` (required; if unset, `/admin/*` returns `503`)
+- `ADMIN_BOOTSTRAP_LOGIN=<login>` (required for first admin passkey bootstrap, e.g. `owner`)
+- `ADMIN_RP_ORIGINS=https://admin.ahoj420.eu,https://ahoj420.eu` (optional; explicit WebAuthn origins for admin auth)
+- `ADMIN_SESSION_IDLE_MINUTES=30` (optional, default `30`)
+- `ADMIN_SESSION_ABSOLUTE_HOURS=12` (optional, default `12`)
+- token fallback (optional emergency mode, disabled by default):
+  - `ADMIN_API_TOKEN_ENABLED=true|false` (default `false`)
+  - `ADMIN_API_TOKEN=<long-random-shared-secret>` (required only when token fallback is enabled)
 
 Avatar storage:
 - `AVATAR_PUBLIC_BASE=https://avatar.ahoj420.eu/` (required in `prod` to emit `picture` claim)
@@ -227,17 +232,17 @@ By requested scopes:
 
 The `?v=` value is added to force cache refresh after avatar updates.
 
-## Admin OIDC Clients API (MVP)
-Internal-only API for owner/admin usage. Not a public self-service API.
+## Admin Auth + Admin OIDC API (MVP)
+Internal-only admin surface. Not a public self-service API.
 
-Base path:
-- `/admin/api/oidc/clients`
+Admin auth endpoints (`/admin/auth`):
+- `POST /admin/auth/register/begin`
+- `POST /admin/auth/register/finish`
+- `POST /admin/auth/login/begin`
+- `POST /admin/auth/login/finish`
+- `POST /admin/auth/logout`
 
-Auth:
-- host guard: requests must come to `ADMIN_API_HOST` (wrong host returns `404`)
-- `Authorization: Bearer <ADMIN_API_TOKEN>`
-
-Routes:
+Admin OIDC client endpoints (`/admin/api/oidc/clients`):
 - `GET /admin/api/oidc/clients`
 - `GET /admin/api/oidc/clients/:id`
 - `POST /admin/api/oidc/clients`
@@ -246,15 +251,28 @@ Routes:
 - `POST /admin/api/oidc/clients/:id/secrets`
 - `POST /admin/api/oidc/clients/:id/secrets/:secretID/revoke`
 
-Security behavior:
-- admin API is enabled only when both `ADMIN_API_TOKEN` and `ADMIN_API_HOST` are set
-- wrong host is rejected in-app (does not rely only on reverse proxy routing)
-- secret hashes and plaintext secrets are never returned from list/detail endpoints
-- `plain_secret` is returned only one-time in `POST .../secrets` when `generate=true`
-- create endpoint expects explicit `initial_secret` for confidential clients and does not echo it back
-- successful mutating admin operations trigger OIDC runtime client reload immediately (no process restart required)
-- if DB mutation succeeds but runtime reload fails, endpoint returns `500` and operator action is required
-- `/admin/api/*` has dedicated IP-based rate limiting (`429` on exceed)
-- admin requests include `X-Request-ID` response header
+Authentication and protection:
+- primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
+- session auth is passkey-only (`/admin/auth/login/*`), separate from regular user sessions
+- host guard: admin routes are served only on `ADMIN_API_HOST` (wrong host returns `404`)
+- dedicated rate limit on admin routes (`429` on exceed)
+- legacy bearer token fallback is optional and controlled by `ADMIN_API_TOKEN_ENABLED`
 
-Mutating admin actions are persisted in PostgreSQL `admin_audit_log` and also written to app logs.
+Bootstrap first admin:
+1. Set `ADMIN_BOOTSTRAP_LOGIN`.
+2. When there are no admin users/credentials, call `POST /admin/auth/register/begin`.
+3. Complete passkey attestation via `POST /admin/auth/register/finish`.
+4. Bootstrap closes automatically after first admin credential exists.
+
+Security behavior:
+- secret hashes and plaintext secrets are never returned from list/detail endpoints
+- `plain_secret` is returned one-time only in `POST .../secrets` when `generate=true`
+- successful mutating admin operations trigger OIDC runtime client reload immediately (no restart required)
+- if DB mutation succeeds but runtime reload fails, endpoint returns `500` and requires operator action
+- admin requests include `X-Request-ID`
+
+Audit:
+- mutating admin actions are persisted in PostgreSQL `admin_audit_log` and app logs
+- actor identity is explicit:
+  - `actor_type=admin_user`, `actor_id=<admin_user_id>` for session-based admin actions
+  - `actor_type=token`, `actor_id=admin_api_token` for optional token fallback

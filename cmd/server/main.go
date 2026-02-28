@@ -10,10 +10,12 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/houbamydar/AHOJ420/internal/admin"
+	"github.com/houbamydar/AHOJ420/internal/adminauth"
 	"github.com/houbamydar/AHOJ420/internal/auth"
 	mp "github.com/houbamydar/AHOJ420/internal/oidc"
 	"github.com/houbamydar/AHOJ420/internal/store"
@@ -58,6 +60,15 @@ func main() {
 	}
 	adminToken := strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN"))
 	adminHost := strings.TrimSpace(os.Getenv("ADMIN_API_HOST"))
+	adminTokenEnabled := false
+	if parsed, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN_ENABLED"))); err == nil {
+		adminTokenEnabled = parsed
+	}
+
+	adminAuthService, err := adminauth.New(userStore, rdb)
+	if err != nil {
+		log.Fatalf("Failed to init admin auth: %v", err)
+	}
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -140,11 +151,20 @@ func main() {
 	} else {
 		log.Printf("OIDC storage does not implement admin runtime reload interface")
 	}
+
+	adminAuthGroup := e.Group("/admin/auth")
+	adminAuthGroup.Use(admin.AdminRequestIDMiddleware())
+	adminAuthGroup.Use(admin.AdminHostGuardMiddleware(adminHost))
+	adminAuthGroup.Use(admin.AdminRateLimitMiddleware(admin.DefaultAdminRateLimitConfig))
+	adminauth.RegisterRoutes(adminAuthGroup, adminAuthService)
+
 	adminHandler := admin.NewOIDCClientHandler(userStore, oidcReloader, userStore)
 	adminGroup := e.Group("/admin/api")
 	adminGroup.Use(admin.AdminRequestIDMiddleware())
-	adminGroup.Use(admin.AdminAPIMiddleware(adminToken, adminHost))
+	adminGroup.Use(admin.AdminHostGuardMiddleware(adminHost))
 	adminGroup.Use(admin.AdminRateLimitMiddleware(admin.DefaultAdminRateLimitConfig))
+	adminGroup.Use(adminAuthService.AttachSessionActorMiddleware())
+	adminGroup.Use(admin.AdminRequireActorMiddleware(adminToken, adminTokenEnabled))
 	admin.RegisterOIDCClientRoutes(adminGroup, adminHandler)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))

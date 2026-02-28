@@ -728,11 +728,18 @@ func (h *OIDCClientHandler) reloadRuntime(ctx context.Context) error {
 func (h *OIDCClientHandler) logAndAudit(c echo.Context, action string, clientID string, secretID int64, success bool, opErr error, details map[string]any) {
 	requestID := requestIDFromContext(c)
 	realIP := strings.TrimSpace(c.RealIP())
+	actorType, actorID := AdminActorFromContext(c)
+	if actorType == "" {
+		actorType = "unknown"
+	}
+	if actorID == "" {
+		actorID = "unknown"
+	}
 
 	if success {
-		log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s request_id=%s success=true", action, clientID, secretID, realIP, requestID)
+		log.Printf("admin action=%s actor_type=%s actor_id=%s client_id=%s secret_id=%d ip=%s request_id=%s success=true", action, actorType, actorID, clientID, secretID, realIP, requestID)
 	} else {
-		log.Printf("admin action=%s client_id=%s secret_id=%d ip=%s request_id=%s success=false error=%v", action, clientID, secretID, realIP, requestID, opErr)
+		log.Printf("admin action=%s actor_type=%s actor_id=%s client_id=%s secret_id=%d ip=%s request_id=%s success=false error=%v", action, actorType, actorID, clientID, secretID, realIP, requestID, opErr)
 	}
 
 	if h.auditStore == nil {
@@ -742,8 +749,8 @@ func (h *OIDCClientHandler) logAndAudit(c echo.Context, action string, clientID 
 	entry := store.AdminAuditEntry{
 		Action:       strings.TrimSpace(action),
 		Success:      success,
-		ActorType:    "token",
-		ActorID:      "admin_api_token",
+		ActorType:    actorType,
+		ActorID:      actorID,
 		RemoteIP:     realIP,
 		RequestID:    requestID,
 		ResourceType: "oidc_client",

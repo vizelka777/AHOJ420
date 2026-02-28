@@ -35,10 +35,9 @@ func AdminRequestIDMiddleware() echo.MiddlewareFunc {
 	})
 }
 
-func AdminAPIMiddleware(token string, allowedHost string) echo.MiddlewareFunc {
-	configuredToken := strings.TrimSpace(token)
+func AdminHostGuardMiddleware(allowedHost string) echo.MiddlewareFunc {
 	configuredHost := normalizeHost(allowedHost)
-	disabledMessage := disabledAdminMessage(configuredToken, configuredHost)
+	disabledMessage := disabledAdminHostMessage(configuredHost)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -50,6 +49,29 @@ func AdminAPIMiddleware(token string, allowedHost string) echo.MiddlewareFunc {
 
 			if normalizeHost(c.Request().Host) != configuredHost {
 				return c.NoContent(http.StatusNotFound)
+			}
+
+			return next(c)
+		}
+	}
+}
+
+func AdminRequireActorMiddleware(token string, tokenEnabled bool) echo.MiddlewareFunc {
+	configuredToken := strings.TrimSpace(token)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if actorType, actorID := AdminActorFromContext(c); actorType != "" && actorID != "" {
+				return next(c)
+			}
+
+			if !tokenEnabled {
+				return c.JSON(http.StatusUnauthorized, map[string]string{"message": "unauthorized"})
+			}
+			if configuredToken == "" {
+				return c.JSON(http.StatusServiceUnavailable, map[string]string{
+					"message": "admin api token fallback enabled but ADMIN_API_TOKEN is not set",
+				})
 			}
 
 			authHeader := strings.TrimSpace(c.Request().Header.Get(echo.HeaderAuthorization))
@@ -65,9 +87,18 @@ func AdminAPIMiddleware(token string, allowedHost string) echo.MiddlewareFunc {
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(configuredToken)) != 1 {
 				return c.JSON(http.StatusUnauthorized, map[string]string{"message": "unauthorized"})
 			}
-
+			SetAdminActor(c, "token", "admin_api_token")
 			return next(c)
 		}
+	}
+}
+
+// AdminAPIMiddleware is kept as compatibility wrapper for legacy token-only setup.
+func AdminAPIMiddleware(token string, allowedHost string) echo.MiddlewareFunc {
+	hostMW := AdminHostGuardMiddleware(allowedHost)
+	authMW := AdminRequireActorMiddleware(token, true)
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return hostMW(authMW(next))
 	}
 }
 
@@ -119,18 +150,11 @@ func requestIDFromContext(c echo.Context) string {
 	return strings.TrimSpace(c.Request().Header.Get(echo.HeaderXRequestID))
 }
 
-func disabledAdminMessage(token string, host string) string {
-	missing := make([]string, 0, 2)
-	if strings.TrimSpace(token) == "" {
-		missing = append(missing, "ADMIN_API_TOKEN")
-	}
+func disabledAdminHostMessage(host string) string {
 	if strings.TrimSpace(host) == "" {
-		missing = append(missing, "ADMIN_API_HOST")
+		return "admin api disabled: ADMIN_API_HOST is not set"
 	}
-	if len(missing) == 0 {
-		return ""
-	}
-	return "admin api disabled: " + strings.Join(missing, " and ") + " is not set"
+	return ""
 }
 
 func normalizeHost(raw string) string {

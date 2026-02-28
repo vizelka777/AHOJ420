@@ -2,7 +2,7 @@ ahoj420.eu, www.ahoj420.eu {
     @www host www.ahoj420.eu
     redir @www https://ahoj420.eu{uri} 301
 
-    @admin path /admin/api/*
+    @admin path /admin/api/* /admin/auth/*
     respond @admin 404
 
     reverse_proxy backend:8080
@@ -14,7 +14,8 @@ ahoj420.eu, www.ahoj420.eu {
 }
 
 admin.ahoj420.eu {
-    handle /admin/api/* {
+    @admin_paths path /admin/api/* /admin/auth/*
+    handle @admin_paths {
         reverse_proxy backend:8080
     }
 

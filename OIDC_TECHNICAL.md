@@ -10,6 +10,7 @@
 - JWKS (compat alias): `/jwks`
 - UserInfo: `/userinfo`
 - SSO logout: `/logout` (and `/end_session`)
+- Admin auth (internal): `/admin/auth/*`
 - Admin API (internal): `/admin/api/oidc/clients`
 
 ## Runtime Modes
@@ -195,17 +196,40 @@ Now:
 
 Secret for `mushroom-bff` is read from `OIDC_CLIENT_MUSHROOM_BFF_SECRET` during bootstrap when `secrets` is not present in client config.
 
-## Admin API (MVP, Internal)
-This API is intended only for owner/internal admin usage.
+## Admin Auth + Admin API (MVP, Internal)
+This surface is intended only for owner/internal admin usage.
 
-Authentication:
-- shared bearer token from env: `ADMIN_API_TOKEN`
-- admin host guard from env: `ADMIN_API_HOST`
-- requests must include `Authorization: Bearer <token>`
-- requests must target the configured admin host (`ADMIN_API_HOST`); wrong host gets `404`
-- if either `ADMIN_API_TOKEN` or `ADMIN_API_HOST` is not set, admin API middleware returns `503` for all admin routes
+Admin auth data model:
+- `admin_users` table: separate admin identities (`login`, `enabled`, metadata)
+- `admin_credentials` table: separate admin WebAuthn credentials
+- `admin_session` is stored in Redis namespace `admin:sess:*` (separate from user session keys)
 
-Routes:
+Configuration:
+- `ADMIN_API_HOST` is mandatory for serving `/admin/*` (if empty, admin routes return `503`)
+- bootstrap first admin login via `ADMIN_BOOTSTRAP_LOGIN`
+- optional explicit admin WebAuthn origins via `ADMIN_RP_ORIGINS` (comma-separated)
+- admin session TTL:
+  - `ADMIN_SESSION_IDLE_MINUTES` (default `30`)
+  - `ADMIN_SESSION_ABSOLUTE_HOURS` (default `12`)
+- optional legacy token fallback:
+  - `ADMIN_API_TOKEN_ENABLED=true|false` (default `false`)
+  - `ADMIN_API_TOKEN` (required only when token fallback is enabled)
+
+Authentication and perimeter:
+- primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
+- admin login is passkey-only via `/admin/auth/login/*`
+- host guard enforces `ADMIN_API_HOST` (`404` on wrong host)
+- dedicated rate limit for `/admin/auth/*` and `/admin/api/*`
+- token fallback is optional; when enabled it is accepted only if no valid admin session actor is present
+
+Bootstrap and login routes:
+- `POST /admin/auth/register/begin` (bootstrap only)
+- `POST /admin/auth/register/finish` (bootstrap only)
+- `POST /admin/auth/login/begin`
+- `POST /admin/auth/login/finish`
+- `POST /admin/auth/logout`
+
+OIDC client admin routes:
 - `GET /admin/api/oidc/clients`
 - `GET /admin/api/oidc/clients/:id`
 - `POST /admin/api/oidc/clients`
@@ -222,16 +246,21 @@ Behavior notes:
 - successful mutating operations reload OIDC runtime clients immediately from DB (no restart required)
 - reload is all-or-nothing: if reload fails, previous runtime snapshot remains active
 - when DB mutation succeeds but reload fails, endpoint returns `500` with explicit runtime reload failure message
-- admin API applies dedicated IP-based rate limiting on `/admin/api/*` (`429` on exceed)
 - admin requests get `X-Request-ID`; this id is included in audit records
 
 Audit logging:
-- mutating routes write log events and persist audit records in PostgreSQL table `admin_audit_log`
-- actions:
+- mutating OIDC routes persist audit records in PostgreSQL table `admin_audit_log`
+- auth events are also audited:
+  - `admin.auth.register.success|failure`
+  - `admin.auth.login.success|failure`
+  - `admin.auth.logout`
+- actor identity:
+  - session-based admin actions -> `actor_type=admin_user`, `actor_id=<admin_user_id>`
+  - token fallback actions -> `actor_type=token`, `actor_id=admin_api_token`
+- OIDC mutation actions:
   - `admin.oidc_client.create`
   - `admin.oidc_client.update`
   - `admin.oidc_client.redirect_uris.replace`
   - `admin.oidc_client.secret.add`
   - `admin.oidc_client.secret.revoke`
-- each audit entry stores: `action`, `success`, `remote_ip`, `request_id`, `resource_type`, `resource_id`, `details_json`
 - `details_json` is safe metadata only (no plaintext secret, no `secret_hash`, no auth header).

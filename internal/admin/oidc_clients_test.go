@@ -779,6 +779,90 @@ func TestAuditInsertOnFailure(t *testing.T) {
 	}
 }
 
+func TestAuditActorFromAdminSessionContext(t *testing.T) {
+	auditStore := &fakeAdminAuditStore{}
+	api := setupTestAdminAPIWithActorAndTokenConfig(
+		newFakeOIDCClientStore(),
+		"",
+		false,
+		testAdminHost,
+		"admin_user",
+		"admin-42",
+		&fakeOIDCClientReloader{},
+		auditStore,
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	rec := doJSONRequestWithHost(t, api, http.MethodPost, "/admin/api/oidc/clients", "", map[string]any{
+		"id":             "actor-session-client",
+		"name":           "Actor Session Client",
+		"enabled":        true,
+		"confidential":   false,
+		"require_pkce":   true,
+		"auth_method":    "none",
+		"grant_types":    []string{"authorization_code"},
+		"response_types": []string{"code"},
+		"scopes":         []string{"openid"},
+		"redirect_uris":  []string{"https://example.com/callback"},
+	}, testAdminHost)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if len(auditStore.entries) == 0 {
+		t.Fatalf("expected audit entry")
+	}
+	entry := auditStore.entries[len(auditStore.entries)-1]
+	if entry.ActorType != "admin_user" {
+		t.Fatalf("expected actor_type=admin_user, got %q", entry.ActorType)
+	}
+	if entry.ActorID != "admin-42" {
+		t.Fatalf("expected actor_id=admin-42, got %q", entry.ActorID)
+	}
+}
+
+func TestAuditActorFromTokenFallback(t *testing.T) {
+	auditStore := &fakeAdminAuditStore{}
+	api := setupTestAdminAPIWithActorAndTokenConfig(
+		newFakeOIDCClientStore(),
+		testAdminToken,
+		true,
+		testAdminHost,
+		"",
+		"",
+		&fakeOIDCClientReloader{},
+		auditStore,
+		AdminRateLimitConfig{Rate: rate.Limit(1000), Burst: 1000, ExpiresIn: time.Minute},
+	)
+
+	rec := doJSONRequestWithHost(t, api, http.MethodPost, "/admin/api/oidc/clients", testAdminToken, map[string]any{
+		"id":             "actor-token-client",
+		"name":           "Actor Token Client",
+		"enabled":        true,
+		"confidential":   false,
+		"require_pkce":   true,
+		"auth_method":    "none",
+		"grant_types":    []string{"authorization_code"},
+		"response_types": []string{"code"},
+		"scopes":         []string{"openid"},
+		"redirect_uris":  []string{"https://example.com/callback"},
+	}, testAdminHost)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if len(auditStore.entries) == 0 {
+		t.Fatalf("expected audit entry")
+	}
+	entry := auditStore.entries[len(auditStore.entries)-1]
+	if entry.ActorType != "token" {
+		t.Fatalf("expected actor_type=token, got %q", entry.ActorType)
+	}
+	if entry.ActorID != "admin_api_token" {
+		t.Fatalf("expected actor_id=admin_api_token, got %q", entry.ActorID)
+	}
+}
+
 func TestRequestIDAddedAndStoredInAudit(t *testing.T) {
 	auditStore := &fakeAdminAuditStore{}
 	api := setupTestAdminAPIWithConfig(
@@ -878,6 +962,37 @@ func setupTestAdminAPIWithConfig(
 	group.Use(AdminRequestIDMiddleware())
 	group.Use(AdminAPIMiddleware(token, host))
 	group.Use(AdminRateLimitMiddleware(limiterConfig))
+	RegisterOIDCClientRoutes(group, NewOIDCClientHandler(fakeStore, reloader, auditStore))
+	return e
+}
+
+func setupTestAdminAPIWithActorAndTokenConfig(
+	fakeStore *fakeOIDCClientStore,
+	token string,
+	tokenEnabled bool,
+	host string,
+	actorType string,
+	actorID string,
+	reloader *fakeOIDCClientReloader,
+	auditStore *fakeAdminAuditStore,
+	limiterConfig AdminRateLimitConfig,
+) *echo.Echo {
+	e := echo.New()
+	group := e.Group("/admin/api")
+	group.Use(AdminRequestIDMiddleware())
+	group.Use(AdminHostGuardMiddleware(host))
+	group.Use(AdminRateLimitMiddleware(limiterConfig))
+	if strings.TrimSpace(actorType) != "" && strings.TrimSpace(actorID) != "" {
+		actorTypeValue := strings.TrimSpace(actorType)
+		actorIDValue := strings.TrimSpace(actorID)
+		group.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error {
+				SetAdminActor(c, actorTypeValue, actorIDValue)
+				return next(c)
+			}
+		})
+	}
+	group.Use(AdminRequireActorMiddleware(token, tokenEnabled))
 	RegisterOIDCClientRoutes(group, NewOIDCClientHandler(fakeStore, reloader, auditStore))
 	return e
 }
