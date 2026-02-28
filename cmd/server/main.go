@@ -266,16 +266,16 @@ func isCleanupRetentionMode(args []string, mode string) bool {
 	return strings.EqualFold(strings.TrimSpace(args[1]), "cleanup-retention")
 }
 
-func runRetentionCleanupCommand(args []string) error {
-	fs := flag.NewFlagSet("cleanup-retention", flag.ContinueOnError)
-	dryRun := fs.Bool("dry-run", false, "report eligible rows without deleting")
-	batchSizeFlag := fs.Int("batch-size", 0, "delete batch size override")
+type retentionCleanupCLIOptions struct {
+	DryRun                    bool
+	BatchSizeOverride         int
+	IncludeAdminAudit         bool
+	IncludeUserSecurityEvents bool
+}
 
-	parsedArgs := args
-	if len(parsedArgs) > 0 && strings.EqualFold(strings.TrimSpace(parsedArgs[0]), "cleanup-retention") {
-		parsedArgs = parsedArgs[1:]
-	}
-	if err := fs.Parse(parsedArgs); err != nil {
+func runRetentionCleanupCommand(args []string) error {
+	options, err := parseRetentionCleanupCLIOptions(args, os.Getenv)
+	if err != nil {
 		return err
 	}
 
@@ -293,43 +293,85 @@ func runRetentionCleanupCommand(args []string) error {
 		return fmt.Errorf("ping db: %w", err)
 	}
 
-	schema, err := os.ReadFile("internal/store/schema.sql")
-	if err == nil {
-		if _, execErr := db.Exec(string(schema)); execErr != nil {
-			log.Printf("Schema init error (might be already existing): %v", execErr)
-		}
-	}
-
 	cfg := maintenance.RetentionConfig{
 		AdminAuditRetentionDays:         retentionDaysFromEnv("ADMIN_AUDIT_RETENTION_DAYS", maintenance.DefaultRetentionDays),
 		UserSecurityEventsRetentionDays: retentionDaysFromEnv("USER_SECURITY_EVENTS_RETENTION_DAYS", maintenance.DefaultRetentionDays),
 		DeleteBatchSize:                 retentionBatchSizeFromEnv("RETENTION_DELETE_BATCH_SIZE", maintenance.DefaultDeleteBatchSize),
+		IncludeAdminAudit:               options.IncludeAdminAudit,
+		IncludeUserSecurityEvents:       options.IncludeUserSecurityEvents,
+		SelectionExplicit:               true,
 	}
-	if *batchSizeFlag != 0 {
-		cfg.DeleteBatchSize = *batchSizeFlag
+	if options.BatchSizeOverride != 0 {
+		cfg.DeleteBatchSize = options.BatchSizeOverride
 	}
 
-	result, err := maintenance.RunRetentionCleanup(context.Background(), store.New(db), cfg, *dryRun)
+	result, err := maintenance.RunRetentionCleanup(context.Background(), store.New(db), cfg, options.DryRun)
 	if err != nil {
 		return err
 	}
 
 	for _, tableResult := range result.Results {
-		if !tableResult.Enabled {
-			log.Printf("retention.cleanup.summary table=%s enabled=false", tableResult.Table)
-			continue
+		cutoff := "-"
+		if !tableResult.Cutoff.IsZero() {
+			cutoff = tableResult.Cutoff.UTC().Format(time.RFC3339)
 		}
 		log.Printf(
-			"retention.cleanup.summary table=%s cutoff=%s dry_run=%t eligible=%d deleted=%d batches=%d",
+			"retention.cleanup.summary table=%s retention_days=%d cutoff=%s eligible_count=%d deleted_count=%d batches=%d dry_run=%t skipped=%t",
 			tableResult.Table,
-			tableResult.Cutoff.UTC().Format(time.RFC3339),
-			result.DryRun,
+			tableResult.RetentionDays,
+			cutoff,
 			tableResult.EligibleCount,
 			tableResult.DeletedCount,
 			tableResult.Batches,
+			result.DryRun,
+			tableResult.Skipped,
 		)
 	}
+	log.Printf(
+		"retention.cleanup.summary_total tables_processed=%d tables_skipped=%d eligible_total=%d deleted_total=%d dry_run=%t",
+		result.TablesProcessed,
+		result.TablesSkipped,
+		result.TotalEligible,
+		result.TotalDeleted,
+		result.DryRun,
+	)
 	return nil
+}
+
+func parseRetentionCleanupCLIOptions(args []string, getenv func(string) string) (retentionCleanupCLIOptions, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+
+	fs := flag.NewFlagSet("cleanup-retention", flag.ContinueOnError)
+	dryRunFlag := fs.Bool("dry-run", false, "report eligible rows without deleting")
+	batchSizeFlag := fs.Int("batch-size", 0, "delete batch size override")
+	adminAuditOnlyFlag := fs.Bool("admin-audit-only", false, "process only admin_audit_log")
+	userSecurityOnlyFlag := fs.Bool("user-security-only", false, "process only user_security_events")
+
+	parsedArgs := args
+	if len(parsedArgs) > 0 && strings.EqualFold(strings.TrimSpace(parsedArgs[0]), "cleanup-retention") {
+		parsedArgs = parsedArgs[1:]
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
+		return retentionCleanupCLIOptions{}, err
+	}
+
+	includeAdminAudit := true
+	includeUserSecurity := true
+	if *adminAuditOnlyFlag && !*userSecurityOnlyFlag {
+		includeUserSecurity = false
+	}
+	if *userSecurityOnlyFlag && !*adminAuditOnlyFlag {
+		includeAdminAudit = false
+	}
+
+	return retentionCleanupCLIOptions{
+		DryRun:                    *dryRunFlag || boolFromEnv(getenv("DRY_RUN")),
+		BatchSizeOverride:         *batchSizeFlag,
+		IncludeAdminAudit:         includeAdminAudit,
+		IncludeUserSecurityEvents: includeUserSecurity,
+	}, nil
 }
 
 func retentionDaysFromEnv(key string, defaultDays int) int {
@@ -362,6 +404,15 @@ func retentionBatchSizeFromEnv(key string, defaultBatchSize int) int {
 		return defaultBatchSize
 	}
 	return parsed
+}
+
+func boolFromEnv(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	parsed, err := strconv.ParseBool(raw)
+	return err == nil && parsed
 }
 
 func rewriteOIDCPath(provider http.Handler, path string) echo.HandlerFunc {

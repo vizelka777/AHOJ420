@@ -71,6 +71,9 @@ func TestRunRetentionCleanupDryRunDoesNotDelete(t *testing.T) {
 			t.Fatalf("dry-run table %s deleted=%d batches=%d want 0/0", table.Table, table.DeletedCount, table.Batches)
 		}
 	}
+	if result.TotalDeleted != 0 {
+		t.Fatalf("dry-run total deleted=%d want 0", result.TotalDeleted)
+	}
 }
 
 func TestRunRetentionCleanupBatchedDelete(t *testing.T) {
@@ -130,9 +133,15 @@ func TestRunRetentionCleanupDisabledRetentionSkipsTable(t *testing.T) {
 		if table.Enabled {
 			t.Fatalf("table %s expected disabled", table.Table)
 		}
+		if !table.Skipped {
+			t.Fatalf("table %s expected skipped=true", table.Table)
+		}
 		if table.EligibleCount != 0 || table.DeletedCount != 0 {
 			t.Fatalf("disabled table %s should have 0 counts got eligible=%d deleted=%d", table.Table, table.EligibleCount, table.DeletedCount)
 		}
+	}
+	if result.TablesProcessed != 2 || result.TablesSkipped != 2 {
+		t.Fatalf("summary mismatch processed=%d skipped=%d want 2/2", result.TablesProcessed, result.TablesSkipped)
 	}
 }
 
@@ -235,6 +244,117 @@ func TestRunRetentionCleanupLogsLifecycle(t *testing.T) {
 	}
 }
 
+func TestRunRetentionCleanupAdminAuditOnly(t *testing.T) {
+	now := time.Date(2026, time.February, 28, 12, 0, 0, 0, time.UTC)
+	store := &fakeRetentionStore{
+		adminRows: seededRows(now, 2, 60),
+		userRows:  seededRows(now, 2, 60),
+	}
+
+	result, err := RunRetentionCleanup(context.Background(), store, RetentionConfig{
+		AdminAuditRetentionDays:         30,
+		UserSecurityEventsRetentionDays: 30,
+		SelectionExplicit:               true,
+		IncludeAdminAudit:               true,
+		IncludeUserSecurityEvents:       false,
+		Now:                             func() time.Time { return now },
+	}, false)
+	if err != nil {
+		t.Fatalf("RunRetentionCleanup failed: %v", err)
+	}
+	if len(result.Results) != 1 {
+		t.Fatalf("results=%d want 1", len(result.Results))
+	}
+	if result.Results[0].Table != "admin_audit_log" {
+		t.Fatalf("unexpected table %s", result.Results[0].Table)
+	}
+	if store.userCountCalls != 0 || store.userDeleteCalls != 0 {
+		t.Fatalf("user table should not be touched; count_calls=%d delete_calls=%d", store.userCountCalls, store.userDeleteCalls)
+	}
+}
+
+func TestRunRetentionCleanupUserSecurityOnly(t *testing.T) {
+	now := time.Date(2026, time.February, 28, 12, 0, 0, 0, time.UTC)
+	store := &fakeRetentionStore{
+		adminRows: seededRows(now, 2, 60),
+		userRows:  seededRows(now, 2, 60),
+	}
+
+	result, err := RunRetentionCleanup(context.Background(), store, RetentionConfig{
+		AdminAuditRetentionDays:         30,
+		UserSecurityEventsRetentionDays: 30,
+		SelectionExplicit:               true,
+		IncludeAdminAudit:               false,
+		IncludeUserSecurityEvents:       true,
+		Now:                             func() time.Time { return now },
+	}, false)
+	if err != nil {
+		t.Fatalf("RunRetentionCleanup failed: %v", err)
+	}
+	if len(result.Results) != 1 {
+		t.Fatalf("results=%d want 1", len(result.Results))
+	}
+	if result.Results[0].Table != "user_security_events" {
+		t.Fatalf("unexpected table %s", result.Results[0].Table)
+	}
+	if store.adminCountCalls != 0 || store.adminDeleteCalls != 0 {
+		t.Fatalf("admin table should not be touched; count_calls=%d delete_calls=%d", store.adminCountCalls, store.adminDeleteCalls)
+	}
+}
+
+func TestRunRetentionCleanupDryRunWithSelectiveFlagShowsOnlySelectedTable(t *testing.T) {
+	now := time.Date(2026, time.February, 28, 12, 0, 0, 0, time.UTC)
+	store := &fakeRetentionStore{
+		adminRows: seededRows(now, 2, 60),
+		userRows:  seededRows(now, 2, 60),
+	}
+
+	result, err := RunRetentionCleanup(context.Background(), store, RetentionConfig{
+		AdminAuditRetentionDays:         30,
+		UserSecurityEventsRetentionDays: 30,
+		SelectionExplicit:               true,
+		IncludeAdminAudit:               false,
+		IncludeUserSecurityEvents:       true,
+		Now:                             func() time.Time { return now },
+	}, true)
+	if err != nil {
+		t.Fatalf("RunRetentionCleanup failed: %v", err)
+	}
+	if len(result.Results) != 1 || result.Results[0].Table != "user_security_events" {
+		t.Fatalf("dry-run selective should keep only user table, results=%v", result.Results)
+	}
+	if store.userDeleteCalls != 0 {
+		t.Fatalf("dry-run should not delete rows, delete_calls=%d", store.userDeleteCalls)
+	}
+}
+
+func TestRunRetentionCleanupSummaryTotals(t *testing.T) {
+	now := time.Date(2026, time.February, 28, 12, 0, 0, 0, time.UTC)
+	store := &fakeRetentionStore{
+		adminRows: seededRows(now, 3, 60),
+		userRows:  seededRows(now, 2, 60),
+	}
+
+	result, err := RunRetentionCleanup(context.Background(), store, RetentionConfig{
+		AdminAuditRetentionDays:         30,
+		UserSecurityEventsRetentionDays: 0,
+		DeleteBatchSize:                 2,
+		Now:                             func() time.Time { return now },
+	}, false)
+	if err != nil {
+		t.Fatalf("RunRetentionCleanup failed: %v", err)
+	}
+	if result.TablesProcessed != 2 || result.TablesSkipped != 1 {
+		t.Fatalf("processed/skipped mismatch got %d/%d want 2/1", result.TablesProcessed, result.TablesSkipped)
+	}
+	if result.TotalEligible != 3 {
+		t.Fatalf("eligible total=%d want 3", result.TotalEligible)
+	}
+	if result.TotalDeleted != 3 {
+		t.Fatalf("deleted total=%d want 3", result.TotalDeleted)
+	}
+}
+
 func TestRunRetentionCleanupReturnsErrorOnStoreFailure(t *testing.T) {
 	now := time.Date(2026, time.February, 28, 12, 0, 0, 0, time.UTC)
 	store := &fakeRetentionStore{countAdminErr: errors.New("boom")}
@@ -278,11 +398,16 @@ type fakeRetentionStore struct {
 
 	adminDeleteLimits []int
 	userDeleteLimits  []int
+	adminCountCalls   int
+	userCountCalls    int
+	adminDeleteCalls  int
+	userDeleteCalls   int
 
 	countAdminErr error
 }
 
 func (f *fakeRetentionStore) CountAdminAuditEntriesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	f.adminCountCalls++
 	if f.countAdminErr != nil {
 		return 0, f.countAdminErr
 	}
@@ -290,6 +415,7 @@ func (f *fakeRetentionStore) CountAdminAuditEntriesOlderThan(ctx context.Context
 }
 
 func (f *fakeRetentionStore) DeleteAdminAuditEntriesOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	f.adminDeleteCalls++
 	f.adminDeleteLimits = append(f.adminDeleteLimits, limit)
 	deleted := int64(0)
 	filtered := make([]time.Time, 0, len(f.adminRows))
@@ -305,10 +431,12 @@ func (f *fakeRetentionStore) DeleteAdminAuditEntriesOlderThan(ctx context.Contex
 }
 
 func (f *fakeRetentionStore) CountUserSecurityEventsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	f.userCountCalls++
 	return countOlderThan(f.userRows, cutoff), nil
 }
 
 func (f *fakeRetentionStore) DeleteUserSecurityEventsOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	f.userDeleteCalls++
 	f.userDeleteLimits = append(f.userDeleteLimits, limit)
 	deleted := int64(0)
 	filtered := make([]time.Time, 0, len(f.userRows))

@@ -407,10 +407,25 @@ Retention cleanup for event tables:
 - cleanup is batched (`DELETE ... LIMIT N`) to avoid giant table locks/transactions
 - per-table retention can be disabled independently by setting retention days to `<=0`
 - dry-run mode computes eligible rows and logs summary without deleting
-- command:
+- selective cleanup:
+  - `--admin-audit-only` processes only `admin_audit_log`
+  - `--user-security-only` processes only `user_security_events`
+  - if both flags are provided, both tables are processed
+- command examples:
   - dry-run: `./server cleanup-retention --dry-run`
-  - real cleanup: `./server cleanup-retention`
-  - optional override: `./server cleanup-retention --batch-size 500`
+  - env-driven dry-run mode: `MODE=cleanup-retention DRY_RUN=1 ./server`
+  - only audit: `./server cleanup-retention --admin-audit-only`
+  - only user security events: `./server cleanup-retention --user-security-only --dry-run`
+  - optional batch override: `./server cleanup-retention --batch-size 500`
+- Docker/Compose one-shot example:
+  - `docker compose --env-file .env exec -T backend /usr/local/bin/ahoj420 cleanup-retention --dry-run`
+- cron example:
+  - `15 3 * * * cd /home/sss/AHOJ420 && docker compose --env-file .env exec -T backend /usr/local/bin/ahoj420 cleanup-retention >> /var/log/ahoj420-retention.log 2>&1`
+- systemd timer note:
+  - run `cleanup-retention` as a periodic one-shot service (daily/weekly) with logs routed to journald
+- operational note:
+  - batched `DELETE` reduces lock pressure, but PostgreSQL still needs normal `VACUUM/autovacuum` work after large cleanup runs
+  - application does not execute `VACUUM` automatically; keep this in regular DB operations
 
 Audit:
 - mutating admin actions are persisted in PostgreSQL `admin_audit_log` and app logs

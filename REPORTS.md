@@ -4,6 +4,42 @@
 
 ## 2026-02-28
 
+### Retention Cleanup Hardening Follow-up
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- Убран schema init side-effect из cleanup path:
+  - `cleanup-retention` больше не читает и не исполняет `internal/store/schema.sql`
+  - команда теперь только подключается к БД и запускает retention cleanup
+- Добавлены selective flags:
+  - `--admin-audit-only`
+  - `--user-security-only`
+  - оба флага одновременно => чистятся обе таблицы
+- Добавлен env-driven dry-run для mode path:
+  - `MODE=cleanup-retention DRY_RUN=1 ./server`
+- Улучшен summary output:
+  - per-table: `table`, `retention_days`, `cutoff`, `eligible_count`, `deleted_count`, `batches`, `dry_run`, `skipped`
+  - final total: `tables_processed`, `tables_skipped`, `eligible_total`, `deleted_total`, `dry_run`
+- Обновлён maintenance runner (`internal/maintenance/retention.go`):
+  - селективная обработка таблиц
+  - агрегированные totals в результате выполнения
+  - явный `skipped` для отключённых retention table
+- Обновлена документация (`README.md`):
+  - примеры запуска dry-run/selective
+  - docker compose one-shot пример
+  - cron/systemd note
+  - operational note про VACUUM/autovacuum после крупных cleanup-run
+
+Тесты:
+- `go test ./internal/maintenance ./cmd/server ./internal/store` — `ok`
+- Добавлены/обновлены проверки:
+  - selective cleanup (admin-only / user-only)
+  - dry-run + selective (без delete и только выбранная таблица)
+  - summary totals (processed/skipped/eligible/deleted)
+  - regression check: cleanup command source не содержит schema init references
+  - CLI options parse tests (flags + `DRY_RUN`)
+
 ### Retention / Cleanup Policy for Event Tables
 - Ветка: `админ`
 - Статус: `implemented`, `tests_passed`

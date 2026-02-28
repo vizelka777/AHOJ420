@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 func TestIsSafeReturnTo(t *testing.T) {
 	tests := []struct {
@@ -43,5 +47,88 @@ func TestIsSafeAuthRequestID(t *testing.T) {
 		if got := isSafeAuthRequestID(tc.id); got != tc.ok {
 			t.Fatalf("isSafeAuthRequestID(%q) = %v, want %v", tc.id, got, tc.ok)
 		}
+	}
+}
+
+func TestParseRetentionCleanupCLIOptionsDefaultsToBothTables(t *testing.T) {
+	options, err := parseRetentionCleanupCLIOptions([]string{"cleanup-retention"}, func(key string) string {
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("parseRetentionCleanupCLIOptions failed: %v", err)
+	}
+	if !options.IncludeAdminAudit || !options.IncludeUserSecurityEvents {
+		t.Fatalf("default selection should include both tables: %+v", options)
+	}
+	if options.DryRun {
+		t.Fatalf("dry-run should be false by default")
+	}
+}
+
+func TestParseRetentionCleanupCLIOptionsAdminAuditOnly(t *testing.T) {
+	options, err := parseRetentionCleanupCLIOptions([]string{"cleanup-retention", "--admin-audit-only"}, func(key string) string {
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("parseRetentionCleanupCLIOptions failed: %v", err)
+	}
+	if !options.IncludeAdminAudit || options.IncludeUserSecurityEvents {
+		t.Fatalf("admin-only selection mismatch: %+v", options)
+	}
+}
+
+func TestParseRetentionCleanupCLIOptionsUserSecurityOnlyWithDryRunEnv(t *testing.T) {
+	options, err := parseRetentionCleanupCLIOptions([]string{"cleanup-retention", "--user-security-only"}, func(key string) string {
+		if key == "DRY_RUN" {
+			return "1"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("parseRetentionCleanupCLIOptions failed: %v", err)
+	}
+	if options.IncludeAdminAudit || !options.IncludeUserSecurityEvents {
+		t.Fatalf("user-security-only selection mismatch: %+v", options)
+	}
+	if !options.DryRun {
+		t.Fatalf("expected dry-run from DRY_RUN env")
+	}
+}
+
+func TestParseRetentionCleanupCLIOptionsBothFlagsMeansBothTables(t *testing.T) {
+	options, err := parseRetentionCleanupCLIOptions([]string{"cleanup-retention", "--admin-audit-only", "--user-security-only"}, func(key string) string {
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("parseRetentionCleanupCLIOptions failed: %v", err)
+	}
+	if !options.IncludeAdminAudit || !options.IncludeUserSecurityEvents {
+		t.Fatalf("both flags should mean both tables: %+v", options)
+	}
+}
+
+func TestCleanupCommandPathNoSchemaInitReference(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	source := string(data)
+
+	fnStart := strings.Index(source, "func runRetentionCleanupCommand(args []string) error {")
+	if fnStart < 0 {
+		t.Fatalf("runRetentionCleanupCommand function not found")
+	}
+	rest := source[fnStart:]
+	nextFn := strings.Index(rest, "\nfunc ")
+	fnSource := rest
+	if nextFn > 0 {
+		fnSource = rest[:nextFn]
+	}
+
+	if strings.Contains(fnSource, "schema.sql") {
+		t.Fatalf("cleanup command should not reference schema.sql")
+	}
+	if strings.Contains(fnSource, "Schema init error") {
+		t.Fatalf("cleanup command should not execute schema init")
 	}
 }
