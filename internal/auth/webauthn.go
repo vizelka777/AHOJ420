@@ -29,6 +29,8 @@ type Service struct {
 	wa                 *webauthn.WebAuthn
 	store              *store.Store
 	userBlockedChecker func(ctx context.Context, userID string) (bool, error)
+	deleteUserFunc     func(userID string) error
+	revokeAllSessions  func(ctx context.Context, userID string) error
 	userSecurityEvents userSecurityEventStore
 	redis              *redis.Client
 	provider           *mp.Provider
@@ -68,6 +70,18 @@ type deleteImpactClientPayload struct {
 type registrationSession struct {
 	UserID  string               `json:"user_id"`
 	Session webauthn.SessionData `json:"session"`
+}
+
+const (
+	deleteAccountReauthSessionCookieName = "delete_account_reauth_session_id"
+	deleteAccountReauthTTL               = 5 * time.Minute
+	deleteAccountReauthConfirmTTL        = 2 * time.Minute
+)
+
+type deleteAccountReauthSession struct {
+	UserID        string               `json:"user_id"`
+	UserSessionID string               `json:"user_session_id"`
+	Session       webauthn.SessionData `json:"session"`
 }
 
 func New(s *store.Store, r *redis.Client, p *mp.Provider) (*Service, error) {
@@ -756,6 +770,172 @@ func safePostLogoutRedirect(raw string) string {
 	return defaultRedirect
 }
 
+func deleteAccountReauthSessionKey(id string) string {
+	return "delete_account_reauth:" + strings.TrimSpace(id)
+}
+
+func deleteAccountReauthConfirmedKey(sessionID string) string {
+	return "delete_account_confirmed:" + strings.TrimSpace(sessionID)
+}
+
+func clearDeleteAccountReauthCookie(c echo.Context) {
+	c.SetCookie(&http.Cookie{
+		Name:     deleteAccountReauthSessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+func (s *Service) BeginDeleteAccountReauth(c echo.Context) error {
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
+
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+	userID = strings.TrimSpace(userID)
+
+	currentSessionID, ok := s.sessionID(c)
+	if !ok || strings.TrimSpace(currentSessionID) == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+	currentSessionID = strings.TrimSpace(currentSessionID)
+
+	user, err := s.store.GetUser(userID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "User not found")
+	}
+
+	options, session, err := s.wa.BeginLogin(user, webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to start passkey confirmation")
+	}
+
+	reauthID := "delete_reauth_" + strings.TrimSpace(session.Challenge)
+	payload, err := json.Marshal(deleteAccountReauthSession{
+		UserID:        userID,
+		UserSessionID: currentSessionID,
+		Session:       *session,
+	})
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to encode passkey confirmation")
+	}
+	if err := s.redis.Set(c.Request().Context(), deleteAccountReauthSessionKey(reauthID), payload, deleteAccountReauthTTL).Err(); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to store passkey confirmation state")
+	}
+
+	c.SetCookie(&http.Cookie{
+		Name:     deleteAccountReauthSessionCookieName,
+		Value:    reauthID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(deleteAccountReauthTTL.Seconds()),
+	})
+	return c.JSON(http.StatusOK, options)
+}
+
+func (s *Service) FinishDeleteAccountReauth(c echo.Context) error {
+	if mode, _ := s.isRecoveryMode(c); mode {
+		return c.JSON(http.StatusForbidden, map[string]any{
+			"message":  "recovery setup required",
+			"redirect": "/?mode=recovery",
+		})
+	}
+
+	userID, ok := s.SessionUserID(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+	userID = strings.TrimSpace(userID)
+
+	currentSessionID, ok := s.sessionID(c)
+	if !ok || strings.TrimSpace(currentSessionID) == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
+	}
+	currentSessionID = strings.TrimSpace(currentSessionID)
+
+	reauthCookie, err := c.Cookie(deleteAccountReauthSessionCookieName)
+	if err != nil || strings.TrimSpace(reauthCookie.Value) == "" {
+		return c.String(http.StatusBadRequest, "Passkey confirmation session missing")
+	}
+	reauthID := strings.TrimSpace(reauthCookie.Value)
+	redisKey := deleteAccountReauthSessionKey(reauthID)
+
+	payload, err := s.redis.Get(c.Request().Context(), redisKey).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			clearDeleteAccountReauthCookie(c)
+			return c.String(http.StatusBadRequest, "Passkey confirmation expired")
+		}
+		return c.String(http.StatusInternalServerError, "Failed to load passkey confirmation")
+	}
+	defer func() {
+		_ = s.redis.Del(c.Request().Context(), redisKey).Err()
+		clearDeleteAccountReauthCookie(c)
+	}()
+
+	var reauth deleteAccountReauthSession
+	if err := json.Unmarshal(payload, &reauth); err != nil {
+		return c.String(http.StatusBadRequest, "Passkey confirmation invalid")
+	}
+	if strings.TrimSpace(reauth.UserID) != userID || strings.TrimSpace(reauth.UserSessionID) != currentSessionID {
+		return c.String(http.StatusForbidden, "Passkey confirmation mismatch")
+	}
+
+	user, err := s.store.GetUser(userID)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, "User not found")
+	}
+
+	credential, err := s.wa.FinishLogin(user, reauth.Session, c.Request())
+	if err != nil {
+		return c.String(http.StatusBadRequest, fmt.Sprintf("Passkey confirmation failed: %v", err))
+	}
+	if credential != nil {
+		if err := s.store.UpdateCredential(credential); err != nil {
+			log.Printf("delete-account reauth credential update failed user_id=%s error=%v", userID, err)
+		}
+	}
+
+	if err := s.redis.Set(c.Request().Context(), deleteAccountReauthConfirmedKey(currentSessionID), strconv.FormatInt(time.Now().UTC().Unix(), 10), deleteAccountReauthConfirmTTL).Err(); err != nil {
+		return c.String(http.StatusInternalServerError, "Failed to finalize passkey confirmation")
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"status":         "ok",
+		"valid_for_secs": int(deleteAccountReauthConfirmTTL.Seconds()),
+	})
+}
+
+func (s *Service) requireDeleteAccountPasskeyConfirmation(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session id is required")
+	}
+	confirmKey := deleteAccountReauthConfirmedKey(sessionID)
+	if _, err := s.redis.Get(ctx, confirmKey).Result(); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return errors.New("passkey confirmation required")
+		}
+		return err
+	}
+	if err := s.redis.Del(ctx, confirmKey).Err(); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	return nil
+}
+
 func (s *Service) DeleteAccountImpact(c echo.Context) error {
 	userID, ok := s.SessionUserID(c)
 	if !ok {
@@ -794,18 +974,56 @@ func (s *Service) DeleteAccount(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]any{"message": "not authenticated"})
 	}
-
-	sessionCookie, _ := c.Cookie("user_session")
-	if err := s.store.DeleteUser(userID); err != nil {
+	currentSessionID := ""
+	if sessionCookie, err := c.Cookie("user_session"); err == nil && sessionCookie != nil {
+		currentSessionID = strings.TrimSpace(sessionCookie.Value)
+	}
+	if err := s.requireDeleteAccountPasskeyConfirmation(c.Request().Context(), currentSessionID); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "required") {
+			return c.JSON(http.StatusForbidden, map[string]any{
+				"message": "passkey confirmation required",
+				"code":    "delete_account_reauth_required",
+			})
+		}
+		return c.String(http.StatusInternalServerError, "Failed to verify passkey confirmation")
+	}
+	if err := s.deleteUserAccount(userID); err != nil {
 		return c.String(http.StatusInternalServerError, "Failed to delete account")
 	}
-
-	if sessionCookie != nil && sessionCookie.Value != "" {
-		_ = s.redis.Del(c.Request().Context(), "sess:"+sessionCookie.Value).Err()
+	if err := s.revokeAllUserSessions(c.Request().Context(), userID); err != nil {
+		clearUserSessionCookie(c)
+		log.Printf("account delete cleanup failed user_id=%s session_id=%s error=%v", strings.TrimSpace(userID), currentSessionID, err)
+		return c.String(http.StatusInternalServerError, "Account deleted but session cleanup failed")
 	}
 	clearUserSessionCookie(c)
+	log.Printf("account delete success user_id=%s session_id=%s", strings.TrimSpace(userID), currentSessionID)
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Service) deleteUserAccount(userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("user id is required")
+	}
+	if s.deleteUserFunc != nil {
+		return s.deleteUserFunc(userID)
+	}
+	if s.store == nil {
+		return errors.New("store is not configured")
+	}
+	return s.store.DeleteUser(userID)
+}
+
+func (s *Service) revokeAllUserSessions(ctx context.Context, userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("user id is required")
+	}
+	if s.revokeAllSessions != nil {
+		return s.revokeAllSessions(ctx, userID)
+	}
+	return s.RevokeAllUserSessions(ctx, userID)
 }
 
 func (s *Service) SessionUserID(c echo.Context) (string, bool) {

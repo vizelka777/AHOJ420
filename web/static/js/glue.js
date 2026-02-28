@@ -65,8 +65,8 @@ async function registerUser() {
     return await finishRes.json();
 }
 
-async function finishLoginWithCredential(credential, authRequestID) {
-    const finishBody = {
+function buildAssertionFinishBody(credential) {
+    return {
         id: credential.id,
         rawId: bufferToBase64URL(credential.rawId),
         type: credential.type,
@@ -77,6 +77,10 @@ async function finishLoginWithCredential(credential, authRequestID) {
             userHandle: credential.response.userHandle ? bufferToBase64URL(credential.response.userHandle) : null,
         },
     };
+}
+
+async function finishLoginWithCredential(credential, authRequestID) {
+    const finishBody = buildAssertionFinishBody(credential);
 
     const finishURL = authRequestID ? `/auth/login/finish?auth_request_id=${encodeURIComponent(authRequestID)}` : `/auth/login/finish`;
     const finishRes = await fetch(finishURL, {
@@ -88,6 +92,32 @@ async function finishLoginWithCredential(credential, authRequestID) {
     });
 
     if (!finishRes.ok) throw new Error("Login failed: " + await finishRes.text());
+    return await finishRes.json();
+}
+
+async function confirmDeleteAccountWithPasskey() {
+    const beginRes = await fetch('/auth/delete-account/reauth/begin', { method: 'POST' });
+    if (!beginRes.ok) throw new Error("Failed to start passkey confirmation: " + await beginRes.text());
+
+    const options = await beginRes.json();
+    options.publicKey.challenge = base64URLToBuffer(options.publicKey.challenge);
+    if (options.publicKey.allowCredentials) {
+        options.publicKey.allowCredentials.forEach(cred => {
+            cred.id = base64URLToBuffer(cred.id);
+        });
+    }
+
+    const credential = await navigator.credentials.get(options);
+    if (!credential) throw new Error("Passkey confirmation cancelled");
+
+    const finishRes = await fetch('/auth/delete-account/reauth/finish', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(buildAssertionFinishBody(credential)),
+    });
+    if (!finishRes.ok) throw new Error("Passkey confirmation failed: " + await finishRes.text());
     return await finishRes.json();
 }
 

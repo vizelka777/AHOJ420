@@ -652,6 +652,10 @@
             const btn = document.getElementById('btn-confirm-delete-account');
             btn.disabled = true;
             try {
+                if (typeof PublicKeyCredential === "undefined" || !navigator.credentials || !navigator.credentials.get) {
+                    throw new Error("Passkey confirmation is not supported in this browser");
+                }
+                await confirmDeleteAccountWithPasskey();
                 const res = await fetch('/auth/delete-account', { method: 'POST' });
                 if (!res.ok) {
                     throw new Error(await res.text());

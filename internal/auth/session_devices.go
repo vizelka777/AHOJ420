@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -288,6 +290,224 @@ func (s *Service) listOwnedSessionIDs(ctx context.Context, userID string) ([]str
 	}
 
 	return out, nil
+}
+
+func addSessionID(sessionIDs map[string]struct{}, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	sessionIDs[value] = struct{}{}
+}
+
+func (s *Service) listIndexedSessionIDs(ctx context.Context, key string) ([]string, error) {
+	items, err := s.redis.ZRange(ctx, strings.TrimSpace(key), 0, -1).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return []string{}, nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		normalized := strings.TrimSpace(item)
+		if normalized == "" {
+			continue
+		}
+		out = append(out, normalized)
+	}
+	return out, nil
+}
+
+func (s *Service) listSessionIDsFromMeta(ctx context.Context, userID string) ([]string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []string{}, nil
+	}
+
+	out := make([]string, 0, 16)
+	var cursor uint64
+	for {
+		keys, nextCursor, err := s.redis.Scan(ctx, cursor, deviceSessionMetaPrefix+"*", 128).Result()
+		if err != nil {
+			return nil, err
+		}
+		cursor = nextCursor
+		if len(keys) == 0 {
+			if cursor == 0 {
+				break
+			}
+			continue
+		}
+
+		pipe := s.redis.Pipeline()
+		metaCmd := make(map[string]*redis.StringCmd, len(keys))
+		for _, key := range keys {
+			metaCmd[key] = pipe.Get(ctx, key)
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+
+		for _, key := range keys {
+			payload, err := metaCmd[key].Bytes()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			meta, err := decodeSessionMeta(payload)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(meta.UserID) != userID {
+				continue
+			}
+
+			sessionID := strings.TrimSpace(meta.SessionID)
+			if sessionID == "" {
+				sessionID = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), deviceSessionMetaPrefix))
+			}
+			if sessionID == "" {
+				continue
+			}
+			out = append(out, sessionID)
+		}
+
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+func (s *Service) listAllUserSessionIDs(ctx context.Context, userID string) ([]string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return []string{}, nil
+	}
+
+	sessionSet := make(map[string]struct{}, 32)
+
+	indexedList, err := s.listIndexedSessionIDs(ctx, deviceSessionListKey(userID))
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range indexedList {
+		addSessionID(sessionSet, item)
+	}
+
+	indexedAll, err := s.listIndexedSessionIDs(ctx, deviceSessionAllKey(userID))
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range indexedAll {
+		addSessionID(sessionSet, item)
+	}
+
+	owned, err := s.listOwnedSessionIDs(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range owned {
+		addSessionID(sessionSet, item)
+	}
+
+	metaOwned, err := s.listSessionIDsFromMeta(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range metaOwned {
+		addSessionID(sessionSet, item)
+	}
+
+	out := make([]string, 0, len(sessionSet))
+	for sessionID := range sessionSet {
+		out = append(out, sessionID)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (s *Service) cleanupUserDeviceMappings(ctx context.Context, userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil
+	}
+
+	var cursor uint64
+	for {
+		keys, nextCursor, err := s.redis.Scan(ctx, cursor, deviceSessionDevicePrefix+userID+":*", 128).Result()
+		if err != nil {
+			return err
+		}
+		cursor = nextCursor
+		if len(keys) > 0 {
+			if err := s.redis.Del(ctx, keys...).Err(); err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+func (s *Service) RevokeAllUserSessions(ctx context.Context, userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("user id is required")
+	}
+
+	sessionIDs, err := s.listAllUserSessionIDs(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	var (
+		firstErr error
+		errCount int
+	)
+	recordError := func(err error) {
+		if err == nil {
+			return
+		}
+		errCount++
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	for _, sessionID := range sessionIDs {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			continue
+		}
+
+		var meta *deviceSessionMeta
+		if payload, err := s.redis.Get(ctx, deviceSessionMetaKey(sessionID)).Bytes(); err == nil {
+			if decoded, decodeErr := decodeSessionMeta(payload); decodeErr == nil {
+				meta = decoded
+			}
+		} else if !errors.Is(err, redis.Nil) {
+			recordError(err)
+		}
+
+		recordError(s.cleanupSessionArtifacts(ctx, userID, sessionID, meta))
+	}
+
+	if err := s.redis.Del(ctx, deviceSessionListKey(userID), deviceSessionAllKey(userID)).Err(); err != nil && !errors.Is(err, redis.Nil) {
+		recordError(err)
+	}
+	recordError(s.cleanupUserDeviceMappings(ctx, userID))
+
+	if errCount > 0 {
+		return fmt.Errorf("user session cleanup failed (%d errors): %w", errCount, firstErr)
+	}
+	return nil
 }
 
 func (s *Service) revokeSessionsForCredential(ctx context.Context, userID string, credentialID []byte, currentSessionID string) (bool, error) {

@@ -316,3 +316,37 @@
 - auth/store пакетные проверки:
   - `go test ./internal/adminui ./internal/auth` (dockerized Go) — `ok`
   - `go test ./internal/store` (dockerized Go) — `ok`
+
+### DeleteAccount Hardening: Full Multi-Device Logout + Redis Cleanup
+- Ветка: `админ`
+- Статус: `implemented`, `tests_passed`
+
+Сделано:
+- `DeleteAccount` переведён на безопасный flow:
+  - сначала проверка свежего passkey-confirmation (step-up),
+  - затем `store.DeleteUser(userID)`,
+  - затем централизованный full cleanup всех user session artifacts в Redis,
+  - затем очистка текущей cookie.
+- Добавлен step-up reauth перед self-delete:
+  - `POST /auth/delete-account/reauth/begin`
+  - `POST /auth/delete-account/reauth/finish`
+  - UI `confirmDeleteAccount()` теперь сначала вызывает WebAuthn reauth, и только потом `POST /auth/delete-account`.
+- Добавлен централизованный helper:
+  - `RevokeAllUserSessions(ctx, userID)` в `internal/auth/session_devices.go`.
+- Cleanup покрывает:
+  - per-session keys: `sess:<sessionID>`, `recovery:<sessionID>`, `sessmeta:<sessionID>`
+  - user indexes: `sesslist:<userID>`, `sessall:<userID>`
+  - device mappings: `sessdev:<userID>:<deviceID>` (включая orphan tails через scan cleanup)
+- Поведение при cross-store неатомарности:
+  - если DB delete failed -> Redis cleanup не запускается;
+  - если DB delete ok, но Redis cleanup failed -> возвращается `500` с явным текстом `"Account deleted but session cleanup failed"` и пишется error log.
+
+Тесты:
+- Новый файл: `internal/auth/delete_account_test.go`
+  - `TestDeleteAccountClearsAllUserSessionsAndArtifacts`
+  - `TestDeleteAccountDoesNotCleanupRedisWhenDBDeleteFails`
+  - `TestRevokeAllUserSessionsCleansMetadataTails`
+  - `TestDeleteAccountSurfacesCleanupFailureAfterDBDelete`
+  - `TestDeleteAccountRequiresPasskeyConfirmation`
+- Проверки:
+  - `go test ./internal/auth ./cmd/server` (dockerized Go) — `ok`
