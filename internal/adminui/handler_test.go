@@ -66,16 +66,203 @@ func TestClientsRequireSession(t *testing.T) {
 	}
 }
 
+func TestCreateClientCSRFMissingTokenRejected(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+
+	form := url.Values{}
+	form.Set("id", "csrf-missing")
+	form.Set("name", "Missing token")
+	form.Set("enabled", "true")
+	form.Set("confidential", "false")
+	form.Set("require_pkce", "true")
+	form.Set("auth_method", "none")
+	form.Set("grant_types", "authorization_code")
+	form.Set("response_types", "code")
+	form.Set("scopes", "openid profile")
+	form.Set("redirect_uris", "https://example.com/callback")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", form, auth.sessionCookies())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without csrf token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "invalid csrf token") {
+		t.Fatalf("expected invalid csrf token message, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateClientCSRFInvalidTokenRejected(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/new", auth.sessionCookies())
+
+	wrongToken, err := newCSRFToken()
+	if err != nil {
+		t.Fatalf("newCSRFToken failed: %v", err)
+	}
+	if wrongToken == csrfToken {
+		t.Fatalf("expected different csrf token values")
+	}
+
+	form := url.Values{}
+	form.Set("id", "csrf-invalid")
+	form.Set("name", "Invalid token")
+	form.Set("enabled", "true")
+	form.Set("confidential", "false")
+	form.Set("require_pkce", "true")
+	form.Set("auth_method", "none")
+	form.Set("grant_types", "authorization_code")
+	form.Set("response_types", "code")
+	form.Set("scopes", "openid profile")
+	form.Set("redirect_uris", "https://example.com/callback")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(form, wrongToken), cookies)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 with invalid csrf token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateClientCSRFCorrectTokenSucceeds(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	reloader := &fakeReloader{}
+	e := setupTestAdminUI(t, fakeStore, auth, reloader, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/new", auth.sessionCookies())
+
+	form := url.Values{}
+	form.Set("id", "csrf-valid")
+	form.Set("name", "Valid token")
+	form.Set("enabled", "true")
+	form.Set("confidential", "false")
+	form.Set("require_pkce", "true")
+	form.Set("auth_method", "none")
+	form.Set("grant_types", "authorization_code")
+	form.Set("response_types", "code")
+	form.Set("scopes", "openid profile")
+	form.Set("redirect_uris", "https://example.com/callback")
+
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(form, csrfToken), cookies)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 with valid csrf token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/clients/csrf-valid" {
+		t.Fatalf("unexpected create redirect location %s", location)
+	}
+	if reloader.calls != 1 {
+		t.Fatalf("expected reload call after create, got %d", reloader.calls)
+	}
+}
+
+func TestLogoutCSRFProtection(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/", auth.sessionCookies())
+
+	recNoToken := doUIRequest(t, e, http.MethodPost, "/admin/logout", nil, cookies)
+	if recNoToken.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on logout without csrf token, got %d body=%s", recNoToken.Code, recNoToken.Body.String())
+	}
+	if auth.logoutCalled {
+		t.Fatalf("logout session should not be called when csrf validation fails")
+	}
+
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/logout", withCSRF(nil, csrfToken), cookies)
+	if recOK.Code != http.StatusFound {
+		t.Fatalf("expected 302 on logout with csrf token, got %d body=%s", recOK.Code, recOK.Body.String())
+	}
+	if location := recOK.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+	if !auth.logoutCalled {
+		t.Fatalf("expected logout session call")
+	}
+	cleared := responseCookie(recOK, adminCSRFCookieName)
+	if cleared == nil || cleared.MaxAge >= 0 {
+		t.Fatalf("expected cleared %s cookie on logout", adminCSRFCookieName)
+	}
+}
+
+func TestCSRFTokenRenderedInClientNewForm(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/clients/new", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	token := extractCSRFTokenFromPage(body)
+	if token == "" {
+		t.Fatalf("expected csrf token in form html")
+	}
+	if !strings.Contains(body, `name="csrf_token" value="`) {
+		t.Fatalf("expected hidden csrf_token input in html")
+	}
+	csrfCookie := responseCookie(rec, adminCSRFCookieName)
+	if csrfCookie == nil {
+		t.Fatalf("expected csrf cookie on page render")
+	}
+	if csrfCookie.Value != token {
+		t.Fatalf("expected form csrf token to match cookie token")
+	}
+}
+
+func TestCSRFTokenRenderedInClientDetailRevokeForms(t *testing.T) {
+	fakeStore := newFakeUIStore()
+	if err := fakeStore.CreateOIDCClient(store.OIDCClient{
+		ID:            "detail-csrf",
+		Name:          "Detail CSRF",
+		Enabled:       true,
+		Confidential:  true,
+		RequirePKCE:   true,
+		AuthMethod:    "basic",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		Scopes:        []string{"openid"},
+		RedirectURIs:  []string{"https://example.com/detail"},
+	}, []store.OIDCClientSecretInput{{PlainSecret: "one", Label: "one"}, {PlainSecret: "two", Label: "two"}}); err != nil {
+		t.Fatalf("seed confidential client failed: %v", err)
+	}
+
+	auth := &fakeUIAuth{}
+	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/clients/detail-csrf", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	token := extractCSRFTokenFromPage(body)
+	if token == "" {
+		t.Fatalf("expected csrf token in detail page html")
+	}
+
+	revokeForms := strings.Count(body, `action="/admin/clients/detail-csrf/secrets/`)
+	if revokeForms < 2 {
+		t.Fatalf("expected at least two revoke forms, got %d", revokeForms)
+	}
+
+	tokenInputs := strings.Count(body, `name="csrf_token" value="`+token+`"`)
+	if tokenInputs < revokeForms+1 {
+		t.Fatalf("expected csrf token in logout + revoke forms, got %d inputs for %d revoke forms", tokenInputs, revokeForms)
+	}
+}
+
 func TestCreateClientValidationAndSuccess(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	reloader := &fakeReloader{}
 	auditStore := &fakeAuditStore{}
 	auth := &fakeUIAuth{}
 	e := setupTestAdminUI(t, fakeStore, auth, reloader, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/new", auth.sessionCookies())
 
 	invalidForm := url.Values{}
 	invalidForm.Set("name", "Missing ID")
-	recInvalid := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", invalidForm, auth.sessionCookies())
+	recInvalid := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(invalidForm, csrfToken), cookies)
 	if recInvalid.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for invalid create, got %d body=%s", recInvalid.Code, recInvalid.Body.String())
 	}
@@ -95,7 +282,7 @@ func TestCreateClientValidationAndSuccess(t *testing.T) {
 	validForm.Set("scopes", "openid profile")
 	validForm.Set("redirect_uris", "https://example.com/callback")
 
-	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", validForm, auth.sessionCookies())
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/new", withCSRF(validForm, csrfToken), cookies)
 	if recOK.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303 for successful create, got %d body=%s", recOK.Code, recOK.Body.String())
 	}
@@ -133,6 +320,7 @@ func TestEditClient(t *testing.T) {
 	auth := &fakeUIAuth{}
 	reloader := &fakeReloader{}
 	e := setupTestAdminUI(t, fakeStore, auth, reloader, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/edit-me/edit", auth.sessionCookies())
 
 	form := url.Values{}
 	form.Set("name", "After")
@@ -143,7 +331,7 @@ func TestEditClient(t *testing.T) {
 	form.Set("response_types", "code")
 	form.Set("scopes", "openid profile")
 
-	rec := doUIRequest(t, e, http.MethodPost, "/admin/clients/edit-me/edit", form, auth.sessionCookies())
+	rec := doUIRequest(t, e, http.MethodPost, "/admin/clients/edit-me/edit", withCSRF(form, csrfToken), cookies)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303 for update, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -175,15 +363,16 @@ func TestReplaceRedirectURIs(t *testing.T) {
 
 	auth := &fakeUIAuth{}
 	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/redir/redirect-uris", auth.sessionCookies())
 
-	recBad := doUIRequest(t, e, http.MethodPost, "/admin/clients/redir/redirect-uris", url.Values{"redirect_uris": []string{" \n \n"}}, auth.sessionCookies())
+	recBad := doUIRequest(t, e, http.MethodPost, "/admin/clients/redir/redirect-uris", withCSRF(url.Values{"redirect_uris": []string{" \n \n"}}, csrfToken), cookies)
 	if recBad.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for empty redirect uris, got %d", recBad.Code)
 	}
 
 	okForm := url.Values{}
 	okForm.Set("redirect_uris", "https://example.com/new1\nhttps://example.com/new2\nhttps://example.com/new2")
-	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/redir/redirect-uris", okForm, auth.sessionCookies())
+	recOK := doUIRequest(t, e, http.MethodPost, "/admin/clients/redir/redirect-uris", withCSRF(okForm, csrfToken), cookies)
 	if recOK.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303 for redirect uri replace, got %d body=%s", recOK.Code, recOK.Body.String())
 	}
@@ -227,11 +416,12 @@ func TestAddSecretAndPublicClientError(t *testing.T) {
 	auth := &fakeUIAuth{}
 	auditStore := &fakeAuditStore{}
 	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, auditStore)
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/conf/secrets/new", auth.sessionCookies())
 
 	genForm := url.Values{}
 	genForm.Set("label", "generated")
 	genForm.Set("generate", "true")
-	recGen := doUIRequest(t, e, http.MethodPost, "/admin/clients/conf/secrets", genForm, auth.sessionCookies())
+	recGen := doUIRequest(t, e, http.MethodPost, "/admin/clients/conf/secrets", withCSRF(genForm, csrfToken), cookies)
 	if recGen.Code != http.StatusOK {
 		t.Fatalf("expected 200 for generated secret page, got %d body=%s", recGen.Code, recGen.Body.String())
 	}
@@ -253,7 +443,7 @@ func TestAddSecretAndPublicClientError(t *testing.T) {
 	pubForm := url.Values{}
 	pubForm.Set("label", "nope")
 	pubForm.Set("secret", "value")
-	recPub := doUIRequest(t, e, http.MethodPost, "/admin/clients/pub/secrets", pubForm, auth.sessionCookies())
+	recPub := doUIRequest(t, e, http.MethodPost, "/admin/clients/pub/secrets", withCSRF(pubForm, csrfToken), cookies)
 	if recPub.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for public client secret add, got %d body=%s", recPub.Code, recPub.Body.String())
 	}
@@ -283,13 +473,14 @@ func TestRevokeSecretAndLastActiveConflict(t *testing.T) {
 
 	auth := &fakeUIAuth{}
 	e := setupTestAdminUI(t, fakeStore, auth, &fakeReloader{}, &fakeAuditStore{})
+	cookies, csrfToken := getCSRFCookiesAndToken(t, e, "/admin/clients/revoke", auth.sessionCookies())
 
-	recOK := doUIRequest(t, e, http.MethodPost, fmt.Sprintf("/admin/clients/revoke/secrets/%d/revoke", secrets[0].ID), nil, auth.sessionCookies())
+	recOK := doUIRequest(t, e, http.MethodPost, fmt.Sprintf("/admin/clients/revoke/secrets/%d/revoke", secrets[0].ID), withCSRF(nil, csrfToken), cookies)
 	if recOK.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303 for first revoke, got %d body=%s", recOK.Code, recOK.Body.String())
 	}
 
-	recConflict := doUIRequest(t, e, http.MethodPost, fmt.Sprintf("/admin/clients/revoke/secrets/%d/revoke", secrets[1].ID), nil, auth.sessionCookies())
+	recConflict := doUIRequest(t, e, http.MethodPost, fmt.Sprintf("/admin/clients/revoke/secrets/%d/revoke", secrets[1].ID), withCSRF(nil, csrfToken), cookies)
 	if recConflict.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for last active revoke, got %d body=%s", recConflict.Code, recConflict.Body.String())
 	}
@@ -312,6 +503,7 @@ func setupTestAdminUI(t *testing.T, fakeStore *fakeUIStore, auth *fakeUIAuth, re
 	protected := group.Group("")
 	protected.Use(auth.AttachSessionActorMiddleware())
 	protected.Use(auth.RequireSessionMiddleware("/admin/login"))
+	protected.Use(h.CSRFMiddleware())
 	RegisterProtectedRoutes(protected, h)
 	return e
 }
@@ -337,6 +529,71 @@ func doUIRequest(t *testing.T, e *echo.Echo, method string, path string, form ur
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 	return rec
+}
+
+func getCSRFCookiesAndToken(t *testing.T, e *echo.Echo, path string, baseCookies []*http.Cookie) ([]*http.Cookie, string) {
+	t.Helper()
+
+	rec := doUIRequest(t, e, http.MethodGet, path, nil, baseCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 while preparing csrf for %s, got %d body=%s", path, rec.Code, rec.Body.String())
+	}
+
+	token := extractCSRFTokenFromPage(rec.Body.String())
+	if token == "" {
+		t.Fatalf("expected csrf token in html for %s", path)
+	}
+
+	csrfCookie := responseCookie(rec, adminCSRFCookieName)
+	if csrfCookie == nil || strings.TrimSpace(csrfCookie.Value) == "" {
+		t.Fatalf("expected %s cookie after GET %s", adminCSRFCookieName, path)
+	}
+
+	return mergeCookies(baseCookies, csrfCookie), token
+}
+
+func withCSRF(form url.Values, token string) url.Values {
+	out := url.Values{}
+	for key, values := range form {
+		out[key] = append([]string(nil), values...)
+	}
+	out.Set(adminCSRFFieldName, strings.TrimSpace(token))
+	return out
+}
+
+func mergeCookies(base []*http.Cookie, updates ...*http.Cookie) []*http.Cookie {
+	out := make([]*http.Cookie, 0, len(base)+len(updates))
+	out = append(out, base...)
+	for _, update := range updates {
+		if update == nil {
+			continue
+		}
+		replaced := false
+		for i, existing := range out {
+			if existing == nil {
+				continue
+			}
+			if existing.Name == update.Name {
+				out[i] = update
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, update)
+		}
+	}
+	return out
+}
+
+func responseCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == name {
+			copyCookie := *cookie
+			return &copyCookie
+		}
+	}
+	return nil
 }
 
 type fakeUIAuth struct {
@@ -630,6 +887,20 @@ func extractSecretFromPage(body string) string {
 	}
 	start += len(startMarker)
 	end := strings.Index(body[start:], endMarker)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(body[start : start+end])
+}
+
+func extractCSRFTokenFromPage(body string) string {
+	marker := `name="csrf_token" value="`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		return ""
+	}
+	start += len(marker)
+	end := strings.Index(body[start:], `"`)
 	if end < 0 {
 		return ""
 	}

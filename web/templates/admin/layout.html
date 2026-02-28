@@ -169,6 +169,7 @@
       <div class="menu">
         <span class="user">{{if .Admin.DisplayName}}{{.Admin.DisplayName}}{{else}}{{.Admin.Login}}{{end}}</span>
         <form method="post" action="/admin/logout" style="margin:0;">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
           <button type="submit" class="secondary">Logout</button>
         </form>
       </div>

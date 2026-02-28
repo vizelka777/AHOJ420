@@ -181,6 +181,7 @@ func main() {
 	adminUIProtected := adminUIGroup.Group("")
 	adminUIProtected.Use(adminAuthService.AttachSessionActorMiddleware())
 	adminUIProtected.Use(adminAuthService.RequireSessionMiddleware("/admin/login"))
+	adminUIProtected.Use(adminUIHandler.CSRFMiddleware())
 	adminui.RegisterProtectedRoutes(adminUIProtected, adminUIHandler)
 
 	e.Any("/.well-known/openid-configuration", discoveryHandler(oidcProvider))

@@ -5,6 +5,7 @@ Internal server-rendered admin panel for OIDC client management.
 ## Scope
 - host-guarded (`ADMIN_API_HOST`)
 - session-only auth (`admin_session` cookie)
+- CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - passkey login via `/admin/auth/login/*`
 - no token fallback for browser UI routes
 - no dynamic registration / no self-service onboarding
@@ -27,6 +28,15 @@ Protected (admin session required):
 - `GET /admin/clients/:id/secrets/new`
 - `POST /admin/clients/:id/secrets`
 - `POST /admin/clients/:id/secrets/:secretID/revoke`
+
+## CSRF protection (HTML UI)
+- applied only to authenticated admin UI routes under `/admin/*` (protected group)
+- not applied to `/admin/auth/*` WebAuthn login/register flows
+- mutating UI routes require valid synchronizer token and fail with `403 invalid csrf token` on mismatch/missing token
+- token generation:
+  - cryptographically random token is generated server-side (`admin_csrf`, Secure, HttpOnly, SameSite=Strict, Path=/admin)
+  - token is injected into templates via shared `layoutData.CSRFToken`
+  - all mutating forms include `<input type="hidden" name="csrf_token" ...>`
 
 ## One-time secret reveal
 When creating a secret with `Generate secret automatically`:

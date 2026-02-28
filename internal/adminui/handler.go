@@ -68,9 +68,10 @@ type flashMessage struct {
 }
 
 type layoutData struct {
-	Title string
-	Admin *store.AdminUser
-	Flash *flashMessage
+	Title     string
+	Admin     *store.AdminUser
+	Flash     *flashMessage
+	CSRFToken string
 }
 
 type dashboardSummary struct {
@@ -250,6 +251,7 @@ func (h *Handler) LoginPage(c echo.Context) error {
 
 func (h *Handler) Logout(c echo.Context) error {
 	_ = h.auth.LogoutSession(c)
+	h.clearCSRFCookie(c)
 	h.setFlash(c, "success", "Signed out")
 	return c.Redirect(http.StatusFound, "/admin/login")
 }
@@ -926,10 +928,20 @@ func (h *Handler) newLayoutData(c echo.Context, adminUser *store.AdminUser, titl
 	if adminUser == nil {
 		adminUser = h.currentAdmin(c)
 	}
+	csrfToken := h.csrfToken(c)
+	if csrfToken == "" {
+		token, err := h.ensureCSRFToken(c)
+		if err != nil {
+			log.Printf("adminui csrf token init in layout failed error=%v", err)
+		} else {
+			csrfToken = token
+		}
+	}
 	return layoutData{
-		Title: strings.TrimSpace(title),
-		Admin: adminUser,
-		Flash: h.popFlash(c),
+		Title:     strings.TrimSpace(title),
+		Admin:     adminUser,
+		Flash:     h.popFlash(c),
+		CSRFToken: csrfToken,
 	}
 }
 

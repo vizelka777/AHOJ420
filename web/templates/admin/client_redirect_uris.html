@@ -12,6 +12,7 @@
   </div>
 
   <form method="post" action="/admin/clients/{{.ClientID}}/redirect-uris">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <label for="redirect_uris">Redirect URIs</label>
     <textarea id="redirect_uris" name="redirect_uris" style="min-height:220px;">{{.RedirectURIsRaw}}</textarea>
 

@@ -273,6 +273,10 @@ Authentication and protection:
 - primary auth for `/admin/api/*` is `admin_session` cookie (HttpOnly, Secure, SameSite=Strict)
 - session auth is passkey-only (`/admin/auth/login/*`), separate from regular user sessions
 - admin HTML UI (`/admin/*`) is session-only and always redirects unauthenticated users to `/admin/login`
+- admin HTML UI mutating routes (`POST /admin/logout`, `POST /admin/clients/*`) require CSRF token validation
+  - server issues `admin_csrf` cookie (Secure, HttpOnly, SameSite=Strict)
+  - server-rendered forms send hidden `csrf_token` and invalid/missing token returns `403 invalid csrf token`
+  - CSRF middleware is scoped to authenticated `/admin/*` UI routes and does not apply to `/admin/auth/*` WebAuthn endpoints
 - host guard: admin routes are served only on `ADMIN_API_HOST` (wrong host returns `404`)
 - dedicated rate limit on admin routes (`429` on exceed)
 - legacy bearer token fallback is optional and controlled by `ADMIN_API_TOKEN_ENABLED`

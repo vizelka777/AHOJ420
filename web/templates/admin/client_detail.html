@@ -82,6 +82,7 @@
               <td>
                 {{if eq .Status "active"}}
                   <form method="post" action="/admin/clients/{{$.Client.ID}}/secrets/{{.ID}}/revoke" style="margin:0;">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
                     <button type="submit" class="warn" onclick="return confirm('Are you sure you want to revoke this secret?');">Revoke</button>
                   </form>
                 {{end}}

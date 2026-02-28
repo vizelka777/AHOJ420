@@ -8,6 +8,7 @@
   {{end}}
 
   <form method="post" action="/admin/clients/new">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <div class="row">
       <div>
         <label for="id">Client ID</label>
