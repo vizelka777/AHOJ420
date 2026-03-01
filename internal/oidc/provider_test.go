@@ -2,6 +2,7 @@ package oidc
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/houbamydar/AHOJ420/internal/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -733,6 +735,132 @@ func TestReloadClientsFailureKeepsPreviousSnapshot(t *testing.T) {
 	}
 	if err := storage.AuthorizeClientIDSecret(context.Background(), "stable-client", "stable-secret"); err != nil {
 		t.Fatalf("old secret must still pass after failed reload: %v", err)
+	}
+}
+
+func TestRefreshTokenRotationGracePeriodAllowsRetryWithoutFamilyRevoke(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	storage := &MemStorage{redis: rdb}
+	ctx := context.Background()
+
+	initialRequest := &RefreshTokenRecord{
+		Subject:  "user-1",
+		ClientID: "client-1",
+		Scopes:   []string{oidc.ScopeOpenID, oidc.ScopeOfflineAccess},
+		Audience: []string{"client-1"},
+		AMR:      []string{"pwd"},
+		AuthTime: time.Now().UTC(),
+	}
+
+	_, firstRefreshToken, _, err := storage.CreateAccessAndRefreshTokens(ctx, initialRequest, "")
+	if err != nil {
+		t.Fatalf("CreateAccessAndRefreshTokens initial failed: %v", err)
+	}
+
+	firstRotateReq, err := storage.TokenRequestByRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("TokenRequestByRefreshToken first rotate failed: %v", err)
+	}
+	_, rotatedRefreshToken, _, err := storage.CreateAccessAndRefreshTokens(ctx, firstRotateReq, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("CreateAccessAndRefreshTokens first rotate failed: %v", err)
+	}
+	if rotatedRefreshToken == "" || rotatedRefreshToken == firstRefreshToken {
+		t.Fatalf("expected rotated refresh token, got old=%q new=%q", firstRefreshToken, rotatedRefreshToken)
+	}
+
+	retryReq, err := storage.TokenRequestByRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("TokenRequestByRefreshToken retry within grace must pass: %v", err)
+	}
+	retryRec, ok := retryReq.(*RefreshTokenRecord)
+	if !ok {
+		t.Fatalf("unexpected refresh request type on retry: %T", retryReq)
+	}
+	if retryRec.TokenID != rotatedRefreshToken {
+		t.Fatalf("retry must resolve to rotated token, got=%q want=%q", retryRec.TokenID, rotatedRefreshToken)
+	}
+
+	_, retryRefreshToken, _, err := storage.CreateAccessAndRefreshTokens(ctx, retryReq, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("CreateAccessAndRefreshTokens retry within grace must pass: %v", err)
+	}
+	if retryRefreshToken != rotatedRefreshToken {
+		t.Fatalf("retry must return existing rotated token, got=%q want=%q", retryRefreshToken, rotatedRefreshToken)
+	}
+
+	firstRec, err := storage.getRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("getRefreshToken(old) failed: %v", err)
+	}
+	if !firstRec.ReuseDetectedAt.IsZero() {
+		t.Fatalf("reuse detection must stay empty for grace retry: %s", firstRec.ReuseDetectedAt)
+	}
+	familyRevoked, err := storage.isRefreshTokenFamilyRevoked(ctx, firstRec.FamilyID)
+	if err != nil {
+		t.Fatalf("isRefreshTokenFamilyRevoked failed: %v", err)
+	}
+	if familyRevoked {
+		t.Fatal("refresh token family must not be revoked for retry inside grace window")
+	}
+}
+
+func TestRefreshTokenRotationReuseOutsideGraceRevokesFamily(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	storage := &MemStorage{redis: rdb}
+	ctx := context.Background()
+
+	initialRequest := &RefreshTokenRecord{
+		Subject:  "user-2",
+		ClientID: "client-2",
+		Scopes:   []string{oidc.ScopeOpenID, oidc.ScopeOfflineAccess},
+		Audience: []string{"client-2"},
+		AMR:      []string{"pwd"},
+		AuthTime: time.Now().UTC(),
+	}
+
+	_, firstRefreshToken, _, err := storage.CreateAccessAndRefreshTokens(ctx, initialRequest, "")
+	if err != nil {
+		t.Fatalf("CreateAccessAndRefreshTokens initial failed: %v", err)
+	}
+
+	firstRotateReq, err := storage.TokenRequestByRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("TokenRequestByRefreshToken first rotate failed: %v", err)
+	}
+	if _, _, _, err = storage.CreateAccessAndRefreshTokens(ctx, firstRotateReq, firstRefreshToken); err != nil {
+		t.Fatalf("CreateAccessAndRefreshTokens first rotate failed: %v", err)
+	}
+
+	oldRec, err := storage.getRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("getRefreshToken(old) failed: %v", err)
+	}
+	oldRec.UsedAt = time.Now().UTC().Add(-refreshTokenReuseGracePeriod - time.Second)
+	if err := storage.saveRefreshToken(ctx, oldRec); err != nil {
+		t.Fatalf("saveRefreshToken(old) failed: %v", err)
+	}
+
+	_, err = storage.TokenRequestByRefreshToken(ctx, firstRefreshToken)
+	if !errors.Is(err, op.ErrInvalidRefreshToken) {
+		t.Fatalf("expected invalid refresh token outside grace, got: %v", err)
+	}
+
+	oldRec, err = storage.getRefreshToken(ctx, firstRefreshToken)
+	if err != nil {
+		t.Fatalf("getRefreshToken(old after reuse) failed: %v", err)
+	}
+	if oldRec.ReuseDetectedAt.IsZero() {
+		t.Fatal("expected reuse detection timestamp outside grace")
+	}
+	familyRevoked, err := storage.isRefreshTokenFamilyRevoked(ctx, oldRec.FamilyID)
+	if err != nil {
+		t.Fatalf("isRefreshTokenFamilyRevoked failed: %v", err)
+	}
+	if !familyRevoked {
+		t.Fatal("refresh token family must be revoked for reuse outside grace window")
 	}
 }
 

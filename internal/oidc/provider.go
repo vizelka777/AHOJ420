@@ -1084,6 +1084,38 @@ func isRefreshTokenUsed(rec *RefreshTokenRecord) bool {
 	return !rec.UsedAt.IsZero() || rec.RotatedToTokenID != ""
 }
 
+func (s *MemStorage) gracePeriodRotatedToken(ctx context.Context, rec *RefreshTokenRecord, now time.Time) (*RefreshTokenRecord, bool, error) {
+	if rec == nil {
+		return nil, false, nil
+	}
+	if rec.UsedAt.IsZero() || strings.TrimSpace(rec.RotatedToTokenID) == "" {
+		return nil, false, nil
+	}
+	elapsed := now.Sub(rec.UsedAt.UTC())
+	if elapsed < 0 || elapsed > refreshTokenReuseGracePeriod {
+		return nil, false, nil
+	}
+
+	rotatedRec, err := s.getRefreshToken(ctx, rec.RotatedToTokenID)
+	if err != nil {
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if rotatedRec.FamilyID != rec.FamilyID || rotatedRec.ClientID != rec.ClientID {
+		return nil, false, nil
+	}
+	if !rotatedRec.RevokedAt.IsZero() || !rotatedRec.ExpiresAt.After(now) {
+		return nil, false, nil
+	}
+	// Allow only an idempotent retry with the immediately rotated token.
+	if isRefreshTokenUsed(rotatedRec) {
+		return nil, false, nil
+	}
+	return rotatedRec, true, nil
+}
+
 func invalidRefreshGrantError() error {
 	return oidc.ErrInvalidGrant().WithParent(op.ErrInvalidRefreshToken)
 }
@@ -1199,6 +1231,13 @@ func (s *MemStorage) CreateAccessAndRefreshTokens(ctx context.Context, request o
 		return "", "", time.Time{}, invalidRefreshGrantError()
 	}
 	if isRefreshTokenUsed(currentRec) {
+		rotatedRec, reusable, graceErr := s.gracePeriodRotatedToken(ctx, currentRec, now)
+		if graceErr != nil {
+			return "", "", time.Time{}, graceErr
+		}
+		if reusable {
+			return accessTokenID, rotatedRec.TokenID, expiration, nil
+		}
 		_ = s.revokeRefreshTokenFamily(ctx, currentRec.FamilyID, currentRec.ExpiresAt)
 		currentRec.ReuseDetectedAt = now
 		_ = s.saveRefreshToken(ctx, currentRec)
@@ -1277,6 +1316,13 @@ func (s *MemStorage) TokenRequestByRefreshToken(ctx context.Context, refreshToke
 		return nil, op.ErrInvalidRefreshToken
 	}
 	if isRefreshTokenUsed(rec) {
+		rotatedRec, reusable, graceErr := s.gracePeriodRotatedToken(ctx, rec, now)
+		if graceErr != nil {
+			return nil, graceErr
+		}
+		if reusable {
+			return rotatedRec, nil
+		}
 		_ = s.revokeRefreshTokenFamily(ctx, rec.FamilyID, rec.ExpiresAt)
 		rec.ReuseDetectedAt = now
 		_ = s.saveRefreshToken(ctx, rec)

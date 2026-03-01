@@ -14,6 +14,7 @@ import (
 
 const (
 	refreshTokenTTL                 = 14 * 24 * time.Hour
+	refreshTokenReuseGracePeriod    = 30 * time.Second
 	refreshTokenKeyPrefix           = "oidc:rt:"
 	refreshTokenFamilyRevokedPrefix = "oidc:rt_family_revoked:"
 )
