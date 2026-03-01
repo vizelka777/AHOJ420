@@ -199,6 +199,169 @@ func TestHealthNonOwnerStillAccessible(t *testing.T) {
 	}
 }
 
+func TestStatsRequiresSession(t *testing.T) {
+	e := setupTestAdminUI(t, newFakeUIStore(), &fakeUIAuth{}, &fakeReloader{}, &fakeAuditStore{})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/stats", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", rec.Code)
+	}
+	if location := rec.Header().Get(echo.HeaderLocation); location != "/admin/login" {
+		t.Fatalf("expected redirect to /admin/login, got %s", location)
+	}
+}
+
+func TestStatsRendersSnapshotAndChartContainers(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e, h := setupTestAdminUIWithHandler(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	h.SetStatsProvider(&fakeStatsProvider{
+		snapshots: map[StatsRange]*StatsSnapshot{
+			StatsRange30d: {
+				Range:       StatsRange30d,
+				Days:        30,
+				GeneratedAt: time.Now().UTC(),
+				StartDate:   "2026-01-01",
+				EndDate:     "2026-01-30",
+				Summary: StatsSummary{
+					NewUsers:                4,
+					LoginSuccesses:          12,
+					LoginFailures:           3,
+					RecoveryRequests:        2,
+					RecoverySuccesses:       1,
+					PasskeysAdded:           5,
+					PasskeysRevoked:         1,
+					ActiveOIDCClientsCount:  2,
+					UniqueUsersWithActivity: 6,
+				},
+				LoginSeries: []StatsLoginSeriesPoint{
+					{Date: "2026-01-01", Success: 2, Failure: 1},
+					{Date: "2026-01-02", Success: 0, Failure: 0},
+					{Date: "2026-01-03", Success: 1, Failure: 0},
+				},
+				RecoverySeries: []StatsRecoverySeriesPoint{
+					{Date: "2026-01-01", Requested: 1, Success: 1, Failure: 0},
+					{Date: "2026-01-02", Requested: 1, Success: 0, Failure: 1},
+					{Date: "2026-01-03", Requested: 0, Success: 0, Failure: 0},
+				},
+				NewUsersSeries: []StatsTimeSeriesPoint{
+					{Date: "2026-01-01", Value: 2},
+					{Date: "2026-01-02", Value: 1},
+					{Date: "2026-01-03", Value: 1},
+				},
+				PasskeySeries: []StatsPasskeySeriesPoint{
+					{Date: "2026-01-01", Added: 1, Revoked: 0},
+					{Date: "2026-01-02", Added: 2, Revoked: 1},
+					{Date: "2026-01-03", Added: 0, Revoked: 0},
+				},
+				TopClients: []StatsTopClientPoint{
+					{ClientID: "mushroom-bff", ActivityCount: 7},
+					{ClientID: "mobile-app", ActivityCount: 3},
+				},
+			},
+		},
+	})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/stats", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		"Statistics",
+		"New users",
+		"Login successes",
+		"Login failures",
+		"Recovery requests",
+		"Recovery successes",
+		"Passkeys added",
+		"Passkeys revoked",
+		"Active OIDC clients",
+		"Unique users with activity",
+		"chart-logins",
+		"chart-recovery",
+		"chart-new-users",
+		"chart-passkeys",
+		"chart-top-clients",
+		"Top OIDC clients by activity",
+		"mushroom-bff",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q on stats page body=%s", expected, body)
+		}
+	}
+}
+
+func TestStatsRangeSelectorWorks(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e, h := setupTestAdminUIWithHandler(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	provider := &fakeStatsProvider{
+		snapshots: map[StatsRange]*StatsSnapshot{
+			StatsRange7d:  NewEmptyStatsSnapshot(StatsRange7d, time.Now().UTC()),
+			StatsRange30d: NewEmptyStatsSnapshot(StatsRange30d, time.Now().UTC()),
+			StatsRange90d: NewEmptyStatsSnapshot(StatsRange90d, time.Now().UTC()),
+		},
+	}
+	h.SetStatsProvider(provider)
+
+	rec7 := doUIRequest(t, e, http.MethodGet, "/admin/stats?range=7d", nil, auth.sessionCookies())
+	if rec7.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 7d, got %d", rec7.Code)
+	}
+	if !strings.Contains(rec7.Body.String(), `data-range="7d" data-active="1"`) {
+		t.Fatalf("expected active 7d selector, body=%s", rec7.Body.String())
+	}
+
+	rec30 := doUIRequest(t, e, http.MethodGet, "/admin/stats?range=30d", nil, auth.sessionCookies())
+	if rec30.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 30d, got %d", rec30.Code)
+	}
+	if !strings.Contains(rec30.Body.String(), `data-range="30d" data-active="1"`) {
+		t.Fatalf("expected active 30d selector, body=%s", rec30.Body.String())
+	}
+
+	rec90 := doUIRequest(t, e, http.MethodGet, "/admin/stats?range=90d", nil, auth.sessionCookies())
+	if rec90.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 90d, got %d", rec90.Code)
+	}
+	if !strings.Contains(rec90.Body.String(), `data-range="90d" data-active="1"`) {
+		t.Fatalf("expected active 90d selector, body=%s", rec90.Body.String())
+	}
+
+	expectedCalls := []StatsRange{StatsRange7d, StatsRange30d, StatsRange90d}
+	if len(provider.calls) != len(expectedCalls) {
+		t.Fatalf("expected %d provider calls, got %d", len(expectedCalls), len(provider.calls))
+	}
+	for idx, expectedRange := range expectedCalls {
+		if provider.calls[idx] != expectedRange {
+			t.Fatalf("expected provider call %d to use range %s, got %s", idx, expectedRange, provider.calls[idx])
+		}
+	}
+}
+
+func TestStatsEmptyStateRenders(t *testing.T) {
+	auth := &fakeUIAuth{}
+	e, h := setupTestAdminUIWithHandler(t, newFakeUIStore(), auth, &fakeReloader{}, &fakeAuditStore{})
+	h.SetStatsProvider(&fakeStatsProvider{
+		snapshots: map[StatsRange]*StatsSnapshot{
+			StatsRange30d: NewEmptyStatsSnapshot(StatsRange30d, time.Now().UTC()),
+		},
+	})
+
+	rec := doUIRequest(t, e, http.MethodGet, "/admin/stats", nil, auth.sessionCookies())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No OIDC client activity for selected period.") {
+		t.Fatalf("expected empty state message, body=%s", body)
+	}
+	for _, expected := range []string{"chart-logins", "chart-recovery", "chart-new-users", "chart-passkeys", "chart-top-clients"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected chart container %q in empty state body=%s", expected, body)
+		}
+	}
+}
+
 func TestOverviewRendersSummaryAndRecentBlocks(t *testing.T) {
 	fakeStore := newFakeUIStore()
 	auth := &fakeUIAuth{}
@@ -2999,6 +3162,27 @@ type fakeHealthProvider struct {
 
 func (f fakeHealthProvider) GetSystemHealthSnapshot(ctx context.Context) (*SystemHealthSnapshot, error) {
 	return f.snapshot, f.err
+}
+
+type fakeStatsProvider struct {
+	snapshots map[StatsRange]*StatsSnapshot
+	err       error
+	calls     []StatsRange
+}
+
+func (f *fakeStatsProvider) GetStatsSnapshot(ctx context.Context, statsRange StatsRange) (*StatsSnapshot, error) {
+	statsRange = ParseStatsRange(string(statsRange))
+	f.calls = append(f.calls, statsRange)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.snapshots == nil {
+		return NewEmptyStatsSnapshot(statsRange, time.Now().UTC()), nil
+	}
+	if snapshot, ok := f.snapshots[statsRange]; ok && snapshot != nil {
+		return snapshot, nil
+	}
+	return NewEmptyStatsSnapshot(statsRange, time.Now().UTC()), nil
 }
 
 type fakeUIStore struct {

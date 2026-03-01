@@ -7,6 +7,7 @@ Internal server-rendered admin panel for OIDC client management.
 - session-only auth (`admin_session` cookie)
 - CSRF-protected mutating HTML routes (`admin_csrf` cookie + hidden `csrf_token` form field)
 - overview dashboard (`GET /admin/`) with role-aware operational summary
+- statistics page (`GET /admin/stats`) with range-based daily charts
 - health / ops page (`GET /admin/health`) with dependency and maintenance status
 - users support section (`/admin/users`) for end-user lookup and security actions
 - passkey login via `/admin/auth/login/*`
@@ -23,6 +24,7 @@ Public:
 
 Protected (admin session required):
 - `GET /admin/`
+- `GET /admin/stats`
 - `GET /admin/health`
 - `GET /admin/audit`
 - `GET /admin/security`
@@ -83,6 +85,37 @@ Protected (admin session required):
   - recent audit
   - recent failures
   - recent client changes
+
+## Statistics (`GET /admin/stats`)
+- read-only operator dashboard (no mutating actions/forms)
+- supported ranges via query param `range`:
+  - `7d`
+  - `30d` (default)
+  - `90d`
+- range is constrained to the values above (no arbitrary date picker in MVP)
+- server-side aggregated snapshot source:
+  - `user_security_events` (auth/recovery/passkey activity + distinct active users)
+  - `users` (new users by `created_at`)
+  - `user_oidc_clients` (top clients + active client count by `last_seen_at`)
+- summary cards for selected range:
+  - new users
+  - login successes
+  - login failures
+  - recovery requests
+  - recovery successes
+  - passkeys added
+  - passkeys revoked
+  - active OIDC clients count
+  - unique users with activity
+- charts (daily, UTC-normalized, zero-filled missing days):
+  - logins over time (`login_success`, `login_failure`)
+  - recovery over time (`recovery_requested`, `recovery_success`, `recovery_failure`)
+  - new users over time
+  - passkey changes over time (`passkey_added`, `passkey_revoked`)
+  - top OIDC clients by recent activity (top 10)
+- rendering model:
+  - server-rendered HTML
+  - small client-side chart layer via Chart.js (no SPA/build pipeline changes)
 
 ## Health / Ops (`GET /admin/health`)
 - read-only operator page (session + host guard; no mutating actions)
@@ -288,6 +321,7 @@ Audit viewer (`GET /admin/audit`):
 - `web/templates/admin/layout.html`
 - `web/templates/admin/login.html`
 - `web/templates/admin/index.html`
+- `web/templates/admin/stats.html`
 - `web/templates/admin/health.html`
 - `web/templates/admin/audit.html`
 - `web/templates/admin/security.html`

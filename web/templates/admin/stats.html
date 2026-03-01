@@ -1,0 +1,227 @@
+{{define "content"}}
+<div class="stack">
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+      <div>
+        <h1 style="margin:0;">Statistics</h1>
+        <p class="hint" style="margin:6px 0 0;">Read-only operator dashboard with aggregated metrics for the selected period.</p>
+      </div>
+      <div class="hint">
+        <div>Range: <span class="mono">{{.Snapshot.Range}}</span> ({{.Snapshot.Days}} days)</div>
+        <div>Window: <span class="mono">{{.Snapshot.StartDate}}</span> - <span class="mono">{{.Snapshot.EndDate}}</span></div>
+        <div>Generated: <span class="mono">{{formatTime .Snapshot.GeneratedAt}}</span></div>
+      </div>
+    </div>
+    <div class="actions">
+      {{range .RangeLinks}}
+        <a class="btn {{if .Active}}{{else}}secondary{{end}}" data-range="{{.Value}}" data-active="{{if .Active}}1{{else}}0{{end}}" href="{{.URL}}">{{.Label}}</a>
+      {{end}}
+    </div>
+    {{if .Error}}
+      <div class="error" style="margin-top:12px;">{{.Error}}</div>
+    {{end}}
+  </div>
+
+  <div class="grid2">
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">New users</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.NewUsers}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Login successes</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.LoginSuccesses}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Login failures</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.LoginFailures}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Recovery requests</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.RecoveryRequests}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Recovery successes</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.RecoverySuccesses}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Passkeys added</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.PasskeysAdded}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Passkeys revoked</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.PasskeysRevoked}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Active OIDC clients</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.ActiveOIDCClientsCount}}</p>
+    </div>
+    <div class="panel" style="margin:0;">
+      <h2 style="margin-top:0;">Unique users with activity</h2>
+      <p class="mono" style="margin:0; font-size:28px; font-weight:700;">{{.Snapshot.Summary.UniqueUsersWithActivity}}</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Logins over time</h2>
+    <p class="hint">Daily login successes vs failures.</p>
+    <canvas id="chart-logins" height="120"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Recovery over time</h2>
+    <p class="hint">Daily recovery requests/successes/failures.</p>
+    <canvas id="chart-recovery" height="120"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">New users over time</h2>
+    <p class="hint">Daily count of new users.</p>
+    <canvas id="chart-new-users" height="120"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Passkey changes over time</h2>
+    <p class="hint">Daily passkey additions and revocations.</p>
+    <canvas id="chart-passkeys" height="120"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0;">Top OIDC clients by activity</h2>
+    <p class="hint">Top clients by distinct user activity (`user_oidc_clients.last_seen_at`) in selected range.</p>
+    <canvas id="chart-top-clients" height="110"></canvas>
+    <div class="table-wrap" style="margin-top:12px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Client ID</th>
+            <th>Activity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{if .Snapshot.TopClients}}
+            {{range .Snapshot.TopClients}}
+              <tr>
+                <td class="mono">{{.ClientID}}</td>
+                <td class="mono">{{.ActivityCount}}</td>
+              </tr>
+            {{end}}
+          {{else}}
+            <tr><td colspan="2">No OIDC client activity for selected period.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script id="stats-data" type="application/json">{{.ChartsJSON}}</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<script>
+(function () {
+  var payloadNode = document.getElementById("stats-data");
+  if (!payloadNode || typeof Chart === "undefined") {
+    return;
+  }
+
+  var payload = {};
+  try {
+    payload = JSON.parse(payloadNode.textContent || "{}");
+  } catch (_) {
+    return;
+  }
+
+  var labels = Array.isArray(payload.labels) ? payload.labels : [];
+  var loginSuccess = Array.isArray(payload.login_success) ? payload.login_success : [];
+  var loginFailure = Array.isArray(payload.login_failure) ? payload.login_failure : [];
+  var recoveryRequested = Array.isArray(payload.recovery_requested) ? payload.recovery_requested : [];
+  var recoverySuccess = Array.isArray(payload.recovery_success) ? payload.recovery_success : [];
+  var recoveryFailure = Array.isArray(payload.recovery_failure) ? payload.recovery_failure : [];
+  var newUsers = Array.isArray(payload.new_users) ? payload.new_users : [];
+  var passkeysAdded = Array.isArray(payload.passkeys_added) ? payload.passkeys_added : [];
+  var passkeysRevoked = Array.isArray(payload.passkeys_revoked) ? payload.passkeys_revoked : [];
+  var topClientLabels = Array.isArray(payload.top_client_labels) ? payload.top_client_labels : [];
+  var topClientValues = Array.isArray(payload.top_client_values) ? payload.top_client_values : [];
+
+  function options(yBeginAtZero) {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      scales: {
+        y: { beginAtZero: yBeginAtZero !== false }
+      },
+      plugins: {
+        legend: { display: true }
+      }
+    };
+  }
+
+  function chart(id, config) {
+    var node = document.getElementById(id);
+    if (!node) {
+      return;
+    }
+    new Chart(node, config);
+  }
+
+  chart("chart-logins", {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [
+        { label: "Login success", data: loginSuccess, borderColor: "#0a7f3f", backgroundColor: "rgba(10,127,63,0.2)", tension: 0.2 },
+        { label: "Login failure", data: loginFailure, borderColor: "#9b1c1c", backgroundColor: "rgba(155,28,28,0.2)", tension: 0.2 }
+      ]
+    },
+    options: options(true)
+  });
+
+  chart("chart-recovery", {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [
+        { label: "Requested", data: recoveryRequested, borderColor: "#1259b3", backgroundColor: "rgba(18,89,179,0.2)", tension: 0.2 },
+        { label: "Success", data: recoverySuccess, borderColor: "#0a7f3f", backgroundColor: "rgba(10,127,63,0.2)", tension: 0.2 },
+        { label: "Failure", data: recoveryFailure, borderColor: "#9b1c1c", backgroundColor: "rgba(155,28,28,0.2)", tension: 0.2 }
+      ]
+    },
+    options: options(true)
+  });
+
+  chart("chart-new-users", {
+    type: "bar",
+    data: {
+      labels: labels,
+      datasets: [
+        { label: "New users", data: newUsers, borderColor: "#1259b3", backgroundColor: "rgba(18,89,179,0.45)" }
+      ]
+    },
+    options: options(true)
+  });
+
+  chart("chart-passkeys", {
+    type: "bar",
+    data: {
+      labels: labels,
+      datasets: [
+        { label: "Passkeys added", data: passkeysAdded, borderColor: "#0a7f3f", backgroundColor: "rgba(10,127,63,0.45)" },
+        { label: "Passkeys revoked", data: passkeysRevoked, borderColor: "#9b1c1c", backgroundColor: "rgba(155,28,28,0.45)" }
+      ]
+    },
+    options: options(true)
+  });
+
+  chart("chart-top-clients", {
+    type: "bar",
+    data: {
+      labels: topClientLabels,
+      datasets: [
+        { label: "Activity", data: topClientValues, borderColor: "#1259b3", backgroundColor: "rgba(18,89,179,0.45)" }
+      ]
+    },
+    options: options(true)
+  });
+})();
+</script>
+{{end}}

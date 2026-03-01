@@ -269,6 +269,7 @@ Admin HTML UI routes (`/admin/*`):
 - `GET /admin/invite/:token`
 - `POST /admin/logout`
 - `GET /admin/`
+- `GET /admin/stats`
 - `GET /admin/health`
 - `GET /admin/audit`
 - `GET /admin/security`
@@ -328,6 +329,35 @@ Overview dashboard (`GET /admin/`):
 - owner-only blocks:
   - admin users summary (owners/admins/invites)
   - pending active invites list
+
+Statistics page (`GET /admin/stats`):
+- read-only operator dashboard with aggregated metrics and charts
+- supported range query values:
+  - `?range=7d`
+  - `?range=30d` (default)
+  - `?range=90d`
+- data is aggregated server-side for selected range from:
+  - `user_security_events` (login/recovery/passkey activity, unique users with activity)
+  - `users` (`created_at` for new users)
+  - `user_oidc_clients` (`last_seen_at` for top clients and active client count)
+- summary cards:
+  - new users
+  - login successes
+  - login failures
+  - recovery requests
+  - recovery successes
+  - passkeys added
+  - passkeys revoked
+  - active OIDC clients count
+  - unique users with activity
+- charts:
+  - logins over time
+  - recovery over time
+  - new users over time
+  - passkey changes over time
+  - top OIDC clients by activity
+- all daily series are UTC-based and zero-filled for missing days (`7/30/90` full window)
+- page is server-rendered; charts are rendered client-side with Chart.js (no SPA)
 
 Health / Ops page (`GET /admin/health`):
 - read-only operator page for quick status checks

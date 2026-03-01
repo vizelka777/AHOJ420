@@ -196,6 +196,7 @@ func main() {
 			UserSecurityEventsRetentionDays: retentionDaysFromEnv("USER_SECURITY_EVENTS_RETENTION_DAYS", maintenance.DefaultRetentionDays),
 		},
 	))
+	adminUIHandler.SetStatsProvider(adminui.NewStatsService(db, nil))
 	adminUIGroup := e.Group("/admin")
 	adminUIGroup.Use(admin.AdminRequestIDMiddleware())
 	adminUIGroup.Use(admin.AdminHostGuardMiddleware(adminHost))

@@ -113,6 +113,7 @@ type Handler struct {
 	auditStore   AdminAuditStore
 	auth         SessionAuth
 	health       SystemHealthProvider
+	stats        StatsProvider
 	avatarDelete func(ctx context.Context, avatarKey string) error
 	templatesDir string
 }
@@ -225,6 +226,21 @@ type healthPageData struct {
 	layoutData
 	Snapshot *SystemHealthSnapshot
 	Error    string
+}
+
+type statsRangeLink struct {
+	Value  StatsRange
+	Label  string
+	URL    string
+	Active bool
+}
+
+type statsPageData struct {
+	layoutData
+	Snapshot   *StatsSnapshot
+	RangeLinks []statsRangeLink
+	ChartsJSON string
+	Error      string
 }
 
 type clientDetailPageData struct {
@@ -559,6 +575,10 @@ func (h *Handler) SetHealthProvider(provider SystemHealthProvider) {
 	h.health = provider
 }
 
+func (h *Handler) SetStatsProvider(provider StatsProvider) {
+	h.stats = provider
+}
+
 func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/login", handler.LoginPage)
 	group.GET("/invite", handler.InviteAcceptPage)
@@ -567,6 +587,7 @@ func RegisterPublicRoutes(group *echo.Group, handler *Handler) {
 
 func RegisterProtectedRoutes(group *echo.Group, handler *Handler) {
 	group.GET("/", handler.Dashboard)
+	group.GET("/stats", handler.Stats)
 	group.GET("/health", handler.Health)
 	group.GET("/audit", handler.AuditLog)
 	group.GET("/security", handler.SecurityPage)
@@ -2360,6 +2381,44 @@ func (h *Handler) Logout(c echo.Context) error {
 	return c.Redirect(http.StatusFound, "/admin/login")
 }
 
+func (h *Handler) Stats(c echo.Context) error {
+	adminUser := h.currentAdmin(c)
+	selectedRange := ParseStatsRange(c.QueryParam("range"))
+	nowUTC := time.Now().UTC()
+
+	snapshot := NewEmptyStatsSnapshot(selectedRange, nowUTC)
+	pageErr := ""
+	if h.stats == nil {
+		pageErr = "Stats provider is not configured"
+	} else {
+		loadedSnapshot, err := h.stats.GetStatsSnapshot(c.Request().Context(), selectedRange)
+		if err != nil {
+			log.Printf("adminui stats snapshot failed error=%v", err)
+			pageErr = "Failed to collect full statistics snapshot"
+		}
+		if loadedSnapshot != nil {
+			snapshot = loadedSnapshot
+		}
+	}
+
+	chartsJSON, err := marshalStatsChartsJSON(snapshot)
+	if err != nil {
+		log.Printf("adminui stats charts marshal failed error=%v", err)
+		if pageErr == "" {
+			pageErr = "Failed to prepare chart payload"
+		}
+		chartsJSON = "{}"
+	}
+
+	return h.render(c, http.StatusOK, "stats.html", statsPageData{
+		layoutData: h.newLayoutData(c, adminUser, "Statistics"),
+		Snapshot:   snapshot,
+		RangeLinks: buildStatsRangeLinks(snapshot.Range),
+		ChartsJSON: chartsJSON,
+		Error:      pageErr,
+	})
+}
+
 func (h *Handler) Health(c echo.Context) error {
 	adminUser := h.currentAdmin(c)
 	if h.health == nil {
@@ -3582,6 +3641,104 @@ func usersListURL(page int, query string) string {
 		return "/admin/users"
 	}
 	return "/admin/users?" + encoded
+}
+
+type statsChartsPayload struct {
+	Labels            []string `json:"labels"`
+	LoginSuccess      []int    `json:"login_success"`
+	LoginFailure      []int    `json:"login_failure"`
+	RecoveryRequested []int    `json:"recovery_requested"`
+	RecoverySuccess   []int    `json:"recovery_success"`
+	RecoveryFailure   []int    `json:"recovery_failure"`
+	NewUsers          []int    `json:"new_users"`
+	PasskeysAdded     []int    `json:"passkeys_added"`
+	PasskeysRevoked   []int    `json:"passkeys_revoked"`
+	TopClientLabels   []string `json:"top_client_labels"`
+	TopClientValues   []int    `json:"top_client_values"`
+}
+
+func marshalStatsChartsJSON(snapshot *StatsSnapshot) (string, error) {
+	payload := buildStatsChartsPayload(snapshot)
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func buildStatsChartsPayload(snapshot *StatsSnapshot) statsChartsPayload {
+	payload := statsChartsPayload{
+		Labels:            []string{},
+		LoginSuccess:      []int{},
+		LoginFailure:      []int{},
+		RecoveryRequested: []int{},
+		RecoverySuccess:   []int{},
+		RecoveryFailure:   []int{},
+		NewUsers:          []int{},
+		PasskeysAdded:     []int{},
+		PasskeysRevoked:   []int{},
+		TopClientLabels:   []string{},
+		TopClientValues:   []int{},
+	}
+	if snapshot == nil {
+		return payload
+	}
+
+	for _, point := range snapshot.LoginSeries {
+		payload.Labels = append(payload.Labels, strings.TrimSpace(point.Date))
+		payload.LoginSuccess = append(payload.LoginSuccess, point.Success)
+		payload.LoginFailure = append(payload.LoginFailure, point.Failure)
+	}
+
+	for _, point := range snapshot.RecoverySeries {
+		payload.RecoveryRequested = append(payload.RecoveryRequested, point.Requested)
+		payload.RecoverySuccess = append(payload.RecoverySuccess, point.Success)
+		payload.RecoveryFailure = append(payload.RecoveryFailure, point.Failure)
+	}
+
+	for _, point := range snapshot.NewUsersSeries {
+		payload.NewUsers = append(payload.NewUsers, point.Value)
+	}
+
+	for _, point := range snapshot.PasskeySeries {
+		payload.PasskeysAdded = append(payload.PasskeysAdded, point.Added)
+		payload.PasskeysRevoked = append(payload.PasskeysRevoked, point.Revoked)
+	}
+
+	for _, point := range snapshot.TopClients {
+		payload.TopClientLabels = append(payload.TopClientLabels, strings.TrimSpace(point.ClientID))
+		payload.TopClientValues = append(payload.TopClientValues, point.ActivityCount)
+	}
+	return payload
+}
+
+func buildStatsRangeLinks(selected StatsRange) []statsRangeLink {
+	selected = ParseStatsRange(string(selected))
+	options := []StatsRange{
+		StatsRange7d,
+		StatsRange30d,
+		StatsRange90d,
+	}
+	links := make([]statsRangeLink, 0, len(options))
+	for _, option := range options {
+		links = append(links, statsRangeLink{
+			Value:  option,
+			Label:  option.String(),
+			URL:    statsRangeURL(option),
+			Active: option == selected,
+		})
+	}
+	return links
+}
+
+func statsRangeURL(statsRange StatsRange) string {
+	statsRange = ParseStatsRange(string(statsRange))
+	if statsRange == StatsRange30d {
+		return "/admin/stats"
+	}
+	params := url.Values{}
+	params.Set("range", statsRange.String())
+	return "/admin/stats?" + params.Encode()
 }
 
 func userDetailEventsURL(userID string, category string) string {
